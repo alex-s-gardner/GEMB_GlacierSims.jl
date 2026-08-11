@@ -1,0 +1,52 @@
+name: CI
+
+# Run the test suite on every push to main and on every pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. new pushes to a PR branch).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'   # lower bound from Project.toml [compat]
+          - '1'      # latest stable 1.x
+        os:
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+
+      - uses: julia-actions/cache@v2
+
+      # GEMB and GEMB_ClimateForcing are unregistered packages that the committed
+      # Manifest.toml resolves to local dev paths on the author's machine. Those paths
+      # don't exist on CI, so `Pkg.develop` them from their public git repos first —
+      # this rewrites the manifest entries to point at the CI checkouts before testing.
+      - name: Develop unregistered dependencies
+        run: |
+          julia --project=. -e '
+            using Pkg
+            Pkg.develop([
+              PackageSpec(url="https://github.com/alex-s-gardner/GEMB.jl"),
+              PackageSpec(url="https://github.com/alex-s-gardner/GEMB_ClimateForcing.jl"),
+            ])
+          '
+
+      - uses: julia-actions/julia-buildpkg@v1
+
+      - uses: julia-actions/julia-runtest@v1
