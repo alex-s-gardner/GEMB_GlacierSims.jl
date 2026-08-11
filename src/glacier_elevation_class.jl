@@ -1,0 +1,230 @@
+# Glacier elevation-class run file builder.
+#
+# Turns RGI glacier polygons, a Copernicus 30 m DEM mosaic, an ERA5-Land chunk map, and a
+# pre-read invariant RasterStack into a per-grid-cell table where each glacier cell carries a
+# 100 m glacier hypsometry vector (glacier area, km², per elevation bin).
+#
+# This is the reusable, global-free version of the script in `era5_example.jl`: every helper
+# takes its dependencies as arguments rather than reading module-level globals.
+
+"""
+    gemb_glacier_elevation_class_runfile(glacier_polygons, dem, chunk_map, invariant_parameters;
+                                         elevation_bin_edges = 0:100:10000,
+                                         glacier_cutoff = 0.0,
+                                         oversample_factor = 10,
+                                         dem_fetch_concurrency = 8)
+
+Build a per–grid-cell glacier elevation-class table.
+
+For every cell of the `chunk_map` grid whose fractional glacier cover exceeds `glacier_cutoff`,
+compute the glacier hypsometry — glacier area (km²) binned into `elevation_bin_edges` (m) — from
+the Copernicus DEM, and attach the fields of `invariant_parameters` and the chunk id.
+
+Arguments:
+- `glacier_polygons`: glacier outlines (e.g. RGI v7) as a GeoDataFrame / table with a geometry
+  column, in EPSG:4326.
+- `dem`: a lazy Copernicus 30 m DEM mosaic (e.g. `climate_model_invariant(model=:copernicus_dem_30m)`),
+  cropped per tile and read on demand.
+- `chunk_map`: the climate download chunk map (`climate_chunk_map(...)`); its grid defines the
+  output cells and supplies each cell's `:chunk_id`. Longitudes native 0–359.9°E.
+- `invariant_parameters`: a pre-read `RasterStack` of invariant fields (e.g. from
+  `era5_land_invariant(parameter=(:glm, :z, :lsm))`). Each layer becomes a column; regridded to
+  the internal glacier grid if its dims differ.
+
+Keywords:
+- `elevation_bin_edges`: monotone elevation bin edges (m); bin `i` spans
+  `[edges[i], edges[i+1])`. Stored as `"bin_edges"` colmetadata on `:glacier_hypsometry`.
+- `glacier_cutoff`: minimum fractional glacier cover for a cell to be included.
+- `oversample_factor`: factor by which the chunk-map grid is disaggregated before rasterizing
+  the glacier polygons, to estimate fractional cover.
+- `dem_fetch_concurrency`: max concurrent GDAL /vsicurl DEM reads (GDAL tolerates only bounded
+  concurrency).
+
+Returns the glacier-points DataFrame with columns `:chunk_id`, `:glacier_frac`, one column per
+`invariant_parameters` layer, `:geometry` (Point, EPSG:4326), and `:glacier_hypsometry`
+(`Vector{Float64}` per cell), with the internal `:index` column removed.
+"""
+function gemb_glacier_elevation_class_runfile(
+    glacier_polygons, dem, chunk_map, invariant_parameters;
+    elevation_bin_edges = 0:100:10000,
+    glacier_cutoff = 0.0,
+    oversample_factor = 10,
+    dem_fetch_concurrency = 8,
+)
+    bin_edges = elevation_bin_edges
+    n_bins = length(bin_edges) - 1
+    n_bins >= 1 || throw(ArgumentError("elevation_bin_edges must have at least two edges"))
+
+    # 1. Fractional glacier cover on the chunk-map grid.
+    #    Disaggregate, burn the polygons onto the fine grid, then average back to the coarse grid.
+    fine = Rasters.disaggregate(chunk_map, oversample_factor)
+    fine_binary = Raster(zeros(Float32, size(fine)), dims(fine); missingval=NaN32)
+    Rasters.rasterize!(fine_binary, glacier_polygons; fill=1.0f0, reducer=last, boundary=:center)
+    glaciers = Rasters.aggregate(mean, fine_binary, oversample_factor)
+
+    # 2. Regrid the invariant stack onto the glacier grid if it is not already aligned.
+    stack = _align_stack_to(invariant_parameters, glaciers)
+
+    # 3. Select glacier cells and assemble the DataFrame.
+    glacier_points = DataFrame()
+    glacier_points[!, :index] = findall(glaciers .> glacier_cutoff)
+    glacier_points[!, :chunk_id] = chunk_map[glacier_points.index]
+    glacier_points[!, :glacier_frac] = glaciers[glacier_points.index]
+    for k in keys(stack)
+        glacier_points[!, k] = stack[k][glacier_points.index]
+    end
+
+    # Point geometry from each cell's (lon, lat); Parquet cannot hold the CartesianIndex column,
+    # and downstream code reads lon/lat off the geometry (see `_cell_lonlat`).
+    pts = DimPoints(glaciers)
+    glacier_points[!, :geometry] =
+        [GeoDataFrames.GeoInterface.Point(pts[i]...) for i in glacier_points.index]
+    metadata!(glacier_points, "GEOINTERFACE:geometrycolumns", (:geometry,); style=:note)
+    metadata!(glacier_points, "GEOINTERFACE:crs", GeoDataFrames.GFT.EPSG(4326); style=:note)
+
+    sort!(glacier_points, :chunk_id)
+
+    # 4. Hypsometry column: bin i spans [bin_edges[i], bin_edges[i+1]).
+    glacier_points[!, :glacier_hypsometry] =
+        Vector{Union{Missing,Vector{Float64}}}(missing, nrow(glacier_points))
+    colmetadata!(glacier_points, :glacier_hypsometry, "bin_edges", collect(bin_edges); style=:note)
+
+    # 5. Spatial index over all polygons + grouping into 1° DEM tiles.
+    gcol = first(GeoDataFrames.getgeometrycolumns(glacier_polygons))
+    geoms = glacier_polygons[!, gcol]
+    gtree = STRtree(geoms)
+
+    # Climate grid cell size (Δlon, Δlat) in degrees, read from the glacier grid.
+    grid_size = (abs(step(dims(glaciers, X))), abs(step(dims(glaciers, Y))))
+
+    tiles = Dict{Tuple{Int,Int},Vector{Int}}()
+    for i in 1:nrow(glacier_points)
+        key = _tile_key(_cell_lonlat(glacier_points.geometry[i])...)
+        push!(get!(tiles, key, Int[]), i)
+    end
+    tilelist = collect(tiles)
+
+    # 6. One DEM fetch per tile, threaded over tiles. Writes target disjoint rows, so this is safe.
+    dem_pool = Base.Semaphore(dem_fetch_concurrency)
+    prog = Progress(length(tilelist); desc="Glacier hypsometry by tile: ", showspeed=true)
+    Threads.@threads for t in eachindex(tilelist)
+        tile_hypsometry!(glacier_points, tilelist[t].second, dem, geoms, gtree, glaciers,
+                         grid_size, bin_edges, n_bins, dem_pool)
+        next!(prog)
+    end
+    finish!(prog)
+
+    # 7. Drop the CartesianIndex column (not serializable) and return.
+    return select(glacier_points, Not(:index))
+end
+
+# Regrid an invariant RasterStack onto `grid`'s X/Y so cell selection by CartesianIndex is valid.
+# If the stack's X/Y dims already match `grid`, it is returned unchanged.
+function _align_stack_to(stack, grid)
+    gx, gy = dims(grid, X), dims(grid, Y)
+    if dims(stack, X) == gx && dims(stack, Y) == gy
+        return stack
+    end
+    return resample(stack; to=grid, method=:near)
+end
+
+# Longitude on the DEM's −180…180°E convention (climate grids are native 0–359.9°E).
+_dem_lon(lon) = float(wrap_lon(lon))
+
+# (lon, lat) of a cell, read off its Point geometry (native 0–359.9°E, same as the glacier grid).
+_cell_lonlat(pt) = (GeoDataFrames.GeoInterface.x(pt), GeoDataFrames.GeoInterface.y(pt))
+
+# 1° DEM tile SW integer corner (−180…180°E).
+_tile_key(lon, lat) = (floor(Int, _dem_lon(lon)), floor(Int, lat))
+
+# Bin lookup for monotone `bin_edges`; bin i spans [edges[i], edges[i+1]). Returns 0 when `z`
+# falls outside the covered range. `searchsortedlast` handles both uniform and non-uniform edges.
+@inline function _bin_index(z, bin_edges, n_bins)
+    b = searchsortedlast(bin_edges, z)
+    return 1 <= b <= n_bins ? b : 0
+end
+
+# Extent of the glacier-grid cell at CartesianIndex `I`, normalized to the DEM's −180…180°E
+# convention. The grid is regular, so we take the cell center ± half the grid step (its lookups
+# use Points sampling, so `intervalbounds` would collapse to zero width). A cell whose center is
+# east of 180° is shifted by −360° to line up with the Copernicus DEM.
+# NOTE: a cell straddling the antimeridian (center ≈ 180°) is not handled specially.
+function _glacier_cell_extent(I, glaciers)
+    xdim, ydim = dims(glaciers, X), dims(glaciers, Y)
+    hx, hy = abs(step(xdim)) / 2, abs(step(ydim)) / 2
+    xc, yc = xdim[I[1]], ydim[I[2]]
+    shift = _dem_lon(xc) - xc   # 0 west of 180°, −360 east of it
+    Extents.Extent(X = (xc - hx + shift, xc + hx + shift),
+                   Y = (yc - hy, yc + hy))
+end
+
+# Compute hypsometry for every glacier cell in `rows` (all sharing one 1° DEM tile) and write each
+# result into gp[r, :glacier_hypsometry]. Crops and reads the padded tile DEM once and reuses it.
+function tile_hypsometry!(gp, rows, dem, geoms, gtree, glaciers, grid_size, bin_edges, n_bins, dem_pool)
+    geomcol = gp.geometry
+    lonlats = [_cell_lonlat(geomcol[r]) for r in rows]   # decode each geometry once
+    lons = [_dem_lon(ll[1]) for ll in lonlats]
+    lats = [float(ll[2])    for ll in lonlats]
+    # Pad by one climate half-cell per axis so every cell's window (center ± half-cell) is fully
+    # covered by the fetched tile. `grid_size` is (Δlon, Δlat) in degrees. Clamp to the DEM's valid
+    # range: the pad is only margin, so clamping near the poles / antimeridian still covers every cell.
+    padx, pady = grid_size[1] / 2, grid_size[2] / 2
+    box = Extents.Extent(X = (clamp(minimum(lons) - padx, -180.0, 180.0),
+                              clamp(maximum(lons) + padx, -180.0, 180.0)),
+                         Y = (clamp(minimum(lats) - pady,  -90.0,  90.0),
+                              clamp(maximum(lats) + pady,  -90.0,  90.0)))
+
+    idx = query(gtree, box)
+    if isempty(idx)
+        for r in rows                      # no glaciers over this tile → all-zero hypsometry
+            gp[r, :glacier_hypsometry] = zeros(Float64, n_bins)
+        end
+        return
+    end
+    localgeoms = geoms[idx]
+
+    # Crop the passed DEM mosaic to the tile and read it into memory. GDAL's /vsicurl dataset open
+    # is not thread-safe under full concurrency, so cap concurrent reads with the semaphore; once
+    # materialized, everything downstream works on plain arrays outside the pool.
+    #
+    # Some cells flagged as glacier land sit where the Copernicus DEM publishes no tiles (it omits
+    # ocean tiles). Reading throws ArgumentError there; treat such a tile as having no DEM coverage
+    # → all-zero hypsometry, rather than crashing the whole @threads run.
+    Base.acquire(dem_pool)
+    tiledem = try
+        read(view(dem, X = (box.X[1] .. box.X[2]), Y = (box.Y[1] .. box.Y[2])))
+    catch e
+        (e isa ArgumentError && occursin("No Copernicus DEM tiles", e.msg)) || rethrow(e)
+        for r in rows
+            gp[r, :glacier_hypsometry] = zeros(Float64, n_bins)
+        end
+        return
+    finally
+        Base.release(dem_pool)
+    end
+
+    for r in rows
+        ext = _glacier_cell_extent(gp.index[r], glaciers)   # −180…180°E, half-step cell box
+        subdem = view(tiledem, X = (ext.X[1] .. ext.X[2]), Y = (ext.Y[1] .. ext.Y[2]))
+        # boolean glacier mask on the cell's DEM grid, from the pre-filtered polygons
+        submask = rasterize(last, localgeoms; to=subdem, fill=true, missingval=false,
+                            boundary=:center, progress=false, verbose=false)
+        # cellarea needs Intervals sampling; the DEM lookups come in as Points, so retag them.
+        # Area varies only with latitude, so we compute it over a single column (X(1:1)) and get
+        # per-row (Y) km²; index by j.
+        subint = set(subdem[X(1:1)],
+            X => DimensionalData.Lookups.Intervals(DimensionalData.Lookups.Center()),
+            Y => DimensionalData.Lookups.Intervals(DimensionalData.Lookups.Center()))
+        area_by_row = vec(parent(cellarea(subint))) ./ 1e6   # length ny(Y), m² → km²
+
+        D = parent(subdem); M = parent(submask)   # both nx × ny; iterate raw matrices
+        hyps = zeros(Float64, n_bins)
+        @inbounds for j in axes(D, 2), i in axes(D, 1)
+            (M[i, j] && isfinite(D[i, j])) || continue
+            b = _bin_index(D[i, j], bin_edges, n_bins); b == 0 && continue
+            hyps[b] += area_by_row[j]
+        end
+        gp[r, :glacier_hypsometry] = hyps
+    end
+    return
+end
