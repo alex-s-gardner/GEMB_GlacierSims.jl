@@ -35,11 +35,13 @@ jobs:
 
       # GEMB and GEMB_ClimateForcing are unregistered packages. The committed
       # Project/Manifest reference them by local dev paths (and a placeholder UUID for
-      # GEMB_ClimateForcing) that only exist on the author's machine. Drop those entries
-      # and re-add both from their public git repos so the resolver picks up the real
-      # UUIDs and builds a CI-valid manifest before testing.
+      # GEMB_ClimateForcing) that only exist on the author's machine. The stale manifest
+      # pins those local paths, so delete it first, drop the placeholder deps from the
+      # project, and re-add both from their public git repos so the resolver adopts the
+      # real UUIDs and builds a CI-valid manifest from scratch before testing.
       - name: Resolve unregistered dependencies from git
         run: |
+          rm -f Manifest.toml
           julia --project=. -e '
             using Pkg
             for p in ("GEMB_ClimateForcing", "GEMB")
