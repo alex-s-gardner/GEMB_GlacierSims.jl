@@ -33,15 +33,19 @@ jobs:
 
       - uses: julia-actions/cache@v2
 
-      # GEMB and GEMB_ClimateForcing are unregistered packages that the committed
-      # Manifest.toml resolves to local dev paths on the author's machine. Those paths
-      # don't exist on CI, so `Pkg.develop` them from their public git repos first —
-      # this rewrites the manifest entries to point at the CI checkouts before testing.
-      - name: Develop unregistered dependencies
+      # GEMB and GEMB_ClimateForcing are unregistered packages. The committed
+      # Project/Manifest reference them by local dev paths (and a placeholder UUID for
+      # GEMB_ClimateForcing) that only exist on the author's machine. Drop those entries
+      # and re-add both from their public git repos so the resolver picks up the real
+      # UUIDs and builds a CI-valid manifest before testing.
+      - name: Resolve unregistered dependencies from git
         run: |
           julia --project=. -e '
             using Pkg
-            Pkg.develop([
+            for p in ("GEMB_ClimateForcing", "GEMB")
+                try; Pkg.rm(p); catch err; @warn "rm $p" exception=err; end
+            end
+            Pkg.add([
               PackageSpec(url="https://github.com/alex-s-gardner/GEMB.jl"),
               PackageSpec(url="https://github.com/alex-s-gardner/GEMB_ClimateForcing.jl"),
             ])
