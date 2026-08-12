@@ -11,8 +11,9 @@
 #   3. Set environment variable: ENV["CDS_API_KEY"] = "your-key-here"
 #
 # NOTE: This example requires GEMB_ClimateForcing.jl to be installed.
-glacier_cutoff = 0.0;        # min fractional glacier cover for a cell to be included
-dem_fetch_concurrency = 8;   # max concurrent GDAL /vsicurl DEM fetches (1 = fully serial)
+
+# cached glacier elevation-class table, will only be built if it doesn't already exist
+gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "era5_land_glacier_elevation_classes.parquet") 
 
 using GEMB
 using Dates
@@ -22,23 +23,7 @@ using Rasters               # also re-exports DimensionalData (dims, .val)
 using GeoDataFrames
 using GeoParquet            # backend for GeoDataFrames.write(...parquet)
 using GEMB_GlacierSims
-
-# Check if GEMB_ClimateForcing is available
-try
-    using GEMB_ClimateForcing
-catch e
-    @error """
-    GEMB_ClimateForcing.jl not found!
-
-    To run this example, install GEMB_ClimateForcing.jl from GitHub:
-        using Pkg
-        Pkg.add(url="https://github.com/alex-s-gardner/GEMB_ClimateForcing.jl")
-
-    Then get a CDS API key from: https://cds.climate.copernicus.eu/api-how-to
-    And set: ENV["CDS_API_KEY"] = "your-key-here"
-    """
-    rethrow(e)
-end
+using GEMB_ClimateForcing
 
 # Get CDS API key (automatically reads from ENV or ~/.cdsapirc)
 cds_api_key = GEMB_ClimateForcing.get_cds_api_key()
@@ -46,45 +31,63 @@ cds_api_key = GEMB_ClimateForcing.get_cds_api_key()
 glacier_vector_file = get(ENV, "RGI_VECTOR_FILE",
     "/Users/gardnera/data/GlacierOutlines/RGI2000-v7.0-G-global-fix/rgi70_Global.gpkg")
 
-glacier_polygons = GeoDataFrames.read(glacier_vector_file)
-
-# Lazy Copernicus 30 m DEM mosaic; cropped per tile and read on demand inside the runfile.
-dem = climate_model_invariant(model = :copernicus_dem_30m)
-
-# ERA5-Land download chunk map (:geo strategy); its grid defines the output cells.
-geo_chunk_map = climate_chunk_map(:era5land; chunk_strategy=:geo, token=cds_api_key)
-
-# Invariant fields carried through as columns. `era5_land_invariant` (from GEMB_GlacierSims)
-# reads them and rewraps native 0–359.9°E longitudes to the (-180, 180] grid; the runfile
-# regrids the stack onto its internal glacier grid as needed.
-era5_land_invariants = era5_land_invariant(parameter=(:glm, :z, :lsm))
 
 # Build the per-grid-cell glacier elevation-class table. For every chunk-map cell with
 # fractional glacier cover above `glacier_cutoff`, this bins the ~30 m Copernicus DEM into a
-# 100 m glacier hypsometry vector (glacier area, km², per elevation bin), attaches the invariant
+# 100 m glacier hypsometry (glacier area, km², per elevation bin), attaches the invariant
 # fields and chunk id, and returns a GeoParquet-ready DataFrame with a Point geometry column.
-@time glacier_points = gemb_glacier_elevation_class_runfile(
-    glacier_polygons, dem, geo_chunk_map, era5_land_invariants;
-    elevation_bin_edges = 0:100:10000,
-    glacier_cutoff = glacier_cutoff,
-    oversample_factor = 10,
-    dem_fetch_concurrency = dem_fetch_concurrency,
-)
+# The hypsometry is stored flat as one scalar column per bin (`hyps_<lo>_<hi>`); this keeps the
+# Parquet columns 1-D so the cached file reads in ms rather than deserializing a nested list.
+if !isfile(gemb_elevation_classes_file)
 
-## Save glacier_points as a GeoParquet file
-glacier_points_file = joinpath(@__DIR__, "..", "data", "era5_land_glacier_elevation_classes.parquet")
-mkpath(dirname(glacier_points_file))
-GeoDataFrames.write(glacier_points_file, glacier_points)
-println("Saved $(nrow(glacier_points)) glacier points to $(glacier_points_file)")
+    println("Building glacier elevation-class table (this may take several hours)...")
 
+    glacier_polygons = GeoDataFrames.read(glacier_vector_file)
+
+    # Lazy Copernicus 30 m DEM mosaic; cropped per tile and read on demand inside the runfile.
+    dem = climate_model_invariant(model = :copernicus_dem_30m)
+
+    # ERA5-Land download chunk map (:geo strategy); its grid defines the output cells.
+    geo_chunk_map = climate_chunk_map(:era5land; chunk_strategy=:geo, token=cds_api_key)
+
+    # Invariant fields carried through as columns. `era5_land_invariant` (from GEMB_GlacierSims)
+    # reads them and rewraps native 0–359.9°E longitudes to the (-180, 180] grid; the runfile
+    # regrids the stack onto its internal glacier grid as needed.
+    era5_land_invariants = era5_land_invariant(parameter=(:glm, :z, :lsm, :cl))
+
+    glacier_elevation_classes = gemb_glacier_elevation_class_runfile(
+        glacier_polygons, dem, geo_chunk_map, era5_land_invariants;
+        elevation_bin_edges = 0:100:10000,
+        glacier_cutoff = 0.0,
+        oversample_factor = 10,
+        dem_fetch_concurrency = 8,
+    )
+
+    ## Save glacier_elevation_classes as a GeoParquet file
+    mkpath(dirname(gemb_elevation_classes_file))
+    GeoDataFrames.write(gemb_elevation_classes_file, glacier_elevation_classes)
+    println("Saved $(nrow(glacier_elevation_classes)) glacier points to $(gemb_elevation_classes_file)")
+else
+    println("Loading cached glacier elevation-class table from $(gemb_elevation_classes_file)")
+    glacier_elevation_classes = GeoDataFrames.read(gemb_elevation_classes_file)
+end
+
+# Add lat/lon and orthometric height:                          
+glacier_elevation_classes[!,:longitude] = GeoDataFrames.GeoInterface.x.(glacier_elevation_classes.geometry)
+glacier_elevation_classes[!,:latitude] = GeoDataFrames.GeoInterface.y.(glacier_elevation_classes.geometry)
+glacier_elevation_classes[!,:height_orthometric] = geopotential2height.(glacier_elevation_classes.z, glacier_elevation_classes[!,:longitude], glacier_elevation_classes[!,:latitude]; height_reference=:orthometric)      
+
+# Coordinates for one glacier cell to hand to `climate_forcing`, read off its Point geometry
+# (lon in (-180, 180], lat).
+r = eachrow(glacier_elevation_classes)[1]
 
 
 ## Download ERA5-Land forcing data
 
-# Download the full climate forcing time series for Summit Station, Greenland (72.58°N, 38.48°W)
-# from the Copernicus Climate Data Store; cached locally so re-runs skip the download.
-@time forcing_data = climate_forcing(:era5land, 72.58, -38.48;
-                                time_range=(DateTime(1979,1,1), DateTime(2025,12,31)),
+# Download the full climate forcing time series for the selected cell (lat, lon) from the
+# Copernicus Climate Data Store; cached locally so re-runs skip the download.
+@time forcing_data = climate_forcing(:era5land, r.latitude, r.longitude;
+                                time_range=(DateTime(1950,1,1), DateTime(2026,8,1)),
                                 token=cds_api_key,
                                 cache_path=joinpath(tempdir(), ".cache", "era5land"))
 
@@ -96,16 +99,18 @@ println("Saved $(nrow(glacier_points)) glacier points to $(glacier_points_file)"
     precip_scaling_method = nothing
 )
 
-# Convert the downloaded forcing into a GEMB ClimateForcing (automatic via package extension).
-cf = GEMB.ClimateForcing(forcing_data)
+
+# Build a repeating climatological year from the forcing, used to spin the model up.
+cf_spinup = forcing_climatology(forcing_data, (DateTime(1950,1,1), DateTime(1980,12,31)))
+
+
 
 ## Run GEMB
 
 # Model parameters; write output at daily frequency for the transient run.
-mp = ModelParameters(output_frequency=:daily)
+mp = ModelParameters(output_frequency=:weekly)
 
-# Build a repeating climatological year from the forcing, used to spin the model up.
-cf_spinup = forcing_climatology(cf)
+
 
 # Initialize the firn column (layer geometry, density, temperature) from the spinup climate.
 profile = initialize_profile(mp, cf_spinup)
