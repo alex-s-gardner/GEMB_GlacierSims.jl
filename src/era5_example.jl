@@ -13,7 +13,7 @@
 # NOTE: This example requires GEMB_ClimateForcing.jl to be installed.
 
 # cached glacier elevation-class table, will only be built if it doesn't already exist
-gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "era5_land_glacier_elevation_classes.parquet") 
+gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "era5_land_glacier_elevation_classes.parquet")
 
 using GEMB
 using Dates
@@ -24,6 +24,7 @@ using GeoDataFrames
 using GeoParquet            # backend for GeoDataFrames.write(...parquet)
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
+using DimensionalData
 
 # Get CDS API key (automatically reads from ENV or ~/.cdsapirc)
 cds_api_key = GEMB_ClimateForcing.get_cds_api_key()
@@ -100,24 +101,28 @@ r = eachrow(glacier_elevation_classes)[1]
 )
 
 
+cf = initialize_forcing(forcing_data)  # sanity check: all required fields present
+
 # Build a repeating climatological year from the forcing, used to spin the model up.
-cf_spinup = forcing_climatology(forcing_data, (DateTime(1950,1,1), DateTime(1980,12,31)))
+cf_spinup = forcing_climatology(cf, (DateTime(1950,1,1), DateTime(1980,12,31)))
 
 
 
 ## Run GEMB
 
 # Model parameters; write output at daily frequency for the transient run.
-mp = ModelParameters(output_frequency=:weekly)
 
+mp = initialize_parameters(output_frequency=:monthly)
 
 
 # Initialize the firn column (layer geometry, density, temperature) from the spinup climate.
 profile = initialize_profile(mp, cf_spinup)
 
 # Spin up on the climatology (keeping only the final state) until density converges or 100 iters.
-mp_spinup = ModelParameters(output_frequency=:last)
-@time profile_spunup = gemb_spinup(profile, cf_spinup, mp_spinup; max_iterations = 100, convergence_delta_density = 0.01)
+mp_spinup = initialize_parameters(output_frequency=:last)
+@time profile_spunup = gemb_spinup(profile, cf_spinup, mp_spinup; max_iterations = 1000, convergence_delta_density = 0.01)
+# gemb_spinup logs an "@info GEMB Spinup" provenance summary (climatology window,
+# cycles, convergence). The full provenance is also on `metadata(profile_spunup)`.
 
 # Run the transient simulation from the spun-up profile over the full forcing record.
 @time output = gemb(profile_spunup, cf, mp)
