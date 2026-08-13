@@ -172,6 +172,66 @@ _hyps_colnames(bin_edges) =
     [Symbol("hyps_" * lpad(Int(bin_edges[i]), 5, '0') * "_" * lpad(Int(bin_edges[i+1]), 5, '0'))
      for i in 1:length(bin_edges) - 1]
 
+# Inverse of the `hyps_<lo>_<hi>` naming: parse one column name back to its (lo, hi) edges (m).
+# Returns `nothing` for names that are not hypsometry columns.
+function _parse_hyps_colname(name)
+    s = string(name)
+    startswith(s, "hyps_") || return nothing
+    parts = split(s, '_')
+    length(parts) == 3 || return nothing
+    lo = tryparse(Int, parts[2]); hi = tryparse(Int, parts[3])
+    (lo === nothing || hi === nothing) && return nothing
+    return (lo, hi)
+end
+
+"""
+    hypsometry_bin_edges(df) -> Vector{Int}
+
+Recover the elevation bin edges (m) from the `hyps_<lo>_<hi>` columns of a glacier
+elevation-class table. This is the inverse of the flat-column encoding written by
+[`gemb_glacier_elevation_class_runfile`](@ref) and is the authoritative way to recover the
+binning after a GeoParquet round-trip (the `"hypsometry_bin_edges"` table metadata is not
+persisted by GeoParquet).
+
+The edges are read back from whichever `hyps_*` columns are present and sorted, so arbitrary
+(including non-uniform) upstream `elevation_bin_edges` are handled transparently. Throws if the
+recovered bins are not contiguous (each bin's `hi` must equal the next bin's `lo`).
+"""
+function hypsometry_bin_edges(df)
+    bins = sort!(filter(!isnothing, map(_parse_hyps_colname, names(df))))
+    isempty(bins) && throw(ArgumentError("no hyps_<lo>_<hi> columns found"))
+    for i in 1:length(bins) - 1
+        bins[i][2] == bins[i+1][1] ||
+            throw(ArgumentError("non-contiguous hypsometry bins: $(bins[i]) then $(bins[i+1])"))
+    end
+    return Int[bins[1][1]; last.(bins)]
+end
+
+"""
+    glacier_hypsometry(row; area_minimum = 0)
+
+Decode the populated hypsometry bins of a single glacier elevation-class `row` (one element of
+`eachrow(df)`). Returns a vector of `(; lo, hi, center, area)` named tuples — the elevation bin
+edges (m), the bin-center elevation (m), and the glacier area (km²) — for every bin whose area is
+strictly greater than `area_minimum`, sorted by elevation.
+
+This replaces hand-parsing the `hyps_<lo>_<hi>` column names downstream; the binning contract
+lives here alongside the encoder ([`gemb_glacier_elevation_class_runfile`](@ref)).
+"""
+function glacier_hypsometry(row; area_minimum = 0)
+    out = @NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}[]
+    for name in propertynames(row)
+        edges = _parse_hyps_colname(name)
+        edges === nothing && continue
+        area = row[name]
+        area > area_minimum || continue
+        lo, hi = edges
+        push!(out, (; lo, hi, center = (lo + hi) / 2, area = float(area)))
+    end
+    sort!(out; by = b -> b.center)
+    return out
+end
+
 # Extent of the glacier-grid cell at CartesianIndex `I`, normalized to the DEM's −180…180°E
 # convention. The grid is regular, so we take the cell center ± half the grid step (its lookups
 # use Points sampling, so `intervalbounds` would collapse to zero width). A cell whose center is

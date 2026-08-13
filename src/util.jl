@@ -31,6 +31,27 @@ Zarr grid — so keep 180.0 as 180.0 and only wrap longitudes strictly greater t
 """
 wrap_lon(lon) = lon > 180 ? lon - 360 : lon
 
+"""
+    forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=6.5, precip_scaling_method=nothing)
+
+Lapse-rate-adjust `forcing_data` by `delta_elevation` metres and convert it to a GEMB
+`ClimateForcing`, ready to hand to `initialize_profile` / `gemb`.
+
+This crosses the forcing→firn boundary once: [`climate_adjust_for_elevation`](@ref)
+(GEMB_ClimateForcing) operates on the `forcing_data` `DimStack`, then `initialize_forcing`
+(GEMB) converts the adjusted stack to a `ClimateForcing`. The adjustment always starts from
+the passed `forcing_data`, so calling this repeatedly with different `delta_elevation` values
+(e.g. once per glacier hypsometry bin) does not compound the deltas.
+
+- `delta_elevation`: `z_target − z_reanalysis` in metres (positive to cool/raise to a higher target).
+- `lapse_rate`: temperature lapse rate passed through to `climate_adjust_for_elevation` (K/km).
+- `precip_scaling_method`: precipitation scaling passed through to `climate_adjust_for_elevation`
+  (`nothing` leaves precipitation unchanged).
+"""
+forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=6.5, precip_scaling_method=nothing) =
+    initialize_forcing(climate_adjust_for_elevation(
+        forcing_data, delta_elevation; lapse_rate, precip_scaling_method))
+
 # Rewrap glm (the ERA5-Land invariant grid) to the SAME (-180, 180] convention as the Zarr grid.
 function _rewrap_era5_lon(ras, to)
     lon  = lookup(ras, X)

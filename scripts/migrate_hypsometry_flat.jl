@@ -14,7 +14,7 @@ using GeoParquet          # GeoParquet backend for GeoDataFrames read/write
 using DataFrames
 using GEMB_GlacierSims: _hyps_colnames
 
-const PARQUET = joinpath(@__DIR__, "..", "data", "era5_land_glacier_elevation_classes.parquet")
+const PARQUET = joinpath(@__DIR__, "..", "data", "era5land_glacier_elevation_classes.parquet")
 const BIN_EDGES = 0:100:10000          # must match the build (0:100:10000 → 100 bins)
 const N_BINS = length(BIN_EDGES) - 1
 
