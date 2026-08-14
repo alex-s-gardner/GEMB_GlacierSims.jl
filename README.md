@@ -48,7 +48,7 @@ profile = result.profile_spunup
 
 # Example post-processing
 using Statistics
-mean_albedo = mean(parent(output[:albedo_surface]))
+mean_albedo = mean(parent(output[:albedo_broadband]))
 println("Mean surface albedo: $mean_albedo")
 ```
 
