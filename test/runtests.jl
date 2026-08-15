@@ -342,6 +342,14 @@ end
         @test_throws ArgumentError append_glacier_cell_netcdf(path, other)
     end
 
+    @testset "threaded kwarg" begin
+        # The threaded path is accepted and documented. Whether it *agrees* with the serial path
+        # cannot be checked here (it needs real GEMB runs, so forcing, so network); that is what
+        # `scripts/check_threaded_equivalence.jl` asserts, bit-for-bit, on a real cell.
+        m = only(methods(gemb_glacier_cell))
+        @test :threaded in Base.kwarg_decl(m)
+    end
+
     # Note: end-to-end simulation tests need CDS API credentials and network access to the
     # Copernicus DEM, so the runfile builder and `gemb_glacier_cell` are exercised by
     # `src/era5_example.jl` rather than here.

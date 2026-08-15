@@ -253,6 +253,13 @@ or perturbations.
 - `force_restart = false`: append even when the restart's run parameters disagree with this
   run's. The seam then separates two differently-configured experiments, and the file's stored
   parameters are overwritten with the new ones.
+- `threaded = true`: run the (bin x delta x scaling) simulations on all available threads.
+  Each simulation is independent — `gemb`/`gemb_spinup` copy their state out of `profile` and
+  read `mp` (an immutable struct) without mutating any shared object — so the parallel result is
+  identical to the serial one, including bit-for-bit totals: the area-weighted sum is reduced in
+  a fixed index order after the tasks finish, not accumulated as they land. Set `false` to run
+  serially (useful when the caller is already saturating the machine by running many cells in
+  parallel, as grouping cells by `chunk_id` does). Thread count comes from `julia -t N`.
 """
 function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            delta_temperatures = [0.0],
@@ -263,7 +270,8 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            max_iterations::Int = 1000,
                            convergence_delta_density = 0.01,
                            restart = nothing,
-                           force_restart::Bool = false)
+                           force_restart::Bool = false,
+                           threaded::Bool = true)
 
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
@@ -310,60 +318,106 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     out_time = DateTime[]
     provenance = Dict{String,Any}()
 
-    for (i_ps, pscale) in enumerate(precipitation_scalings),
-        (i_dt, delta) in enumerate(delta_temperatures)
+    # The (bin x delta x scaling) simulations are mutually independent, so they are flattened
+    # into one task list and run on all threads. Flattening rather than threading the outer loop
+    # matters: bins per cell range from 1 to ~38 while perturbations are fixed at a handful, so
+    # threading either loop alone would leave threads idle on cells whose loop is shorter than
+    # the thread count. One flat list of n_bin*n_dt*n_ps tasks always has work for everyone.
+    tasks = [(i_bin, i_dt, i_ps) for i_ps in 1:n_ps, i_dt in 1:n_dt, i_bin in 1:n_bin]
+    tasks = vec(tasks)
+
+    # Each task writes only its own slot; nothing is accumulated in place. The area-weighted sum
+    # happens afterwards in a fixed order, so the totals do not depend on completion order and
+    # the threaded run reproduces the serial one exactly (floating-point addition is not
+    # associative, so an accumulate-as-they-land reduction would not).
+    #
+    # A task keeps only what the reduction needs — the per-variable flux vectors (Ti), the time
+    # axis, and the restart profile — never the full output stack. Serially that stack was
+    # transient, but held for every task at once it would be ~n_bin*n_dt*n_ps x (Z x Ti), which
+    # for a 38-bin cell is hundreds of ~200-layer x decades-of-steps arrays live simultaneously.
+    results = Vector{Union{Nothing,NamedTuple}}(nothing, length(tasks))
+
+    run_one = function (t)
+        i_bin, i_dt, i_ps = tasks[t]
+        bin    = cov.modeled[i_bin]
+        delta  = delta_temperatures[i_dt]
+        pscale = precipitation_scalings[i_ps]
 
         # Both adjustments act on the raw forcing DimStack and are exact identities at
         # delta = 0 / scaling = 1, so the unperturbed run is bit-for-bit the plain forcing.
+        # Rebuilt per task rather than hoisted per perturbation: the adjustment is cheap next
+        # to a spinup, and sharing one `adjusted` across bins would hand the same object to
+        # concurrent tasks.
         adjusted = precipitation_adjust(temperature_adjust(forcing_data, delta), pscale)
+        cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation; lapse_rate)
 
-        for (i_bin, bin) in enumerate(cov.modeled)
-            cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation; lapse_rate)
+        profile = restart === nothing ? nothing :
+                  get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
 
-            profile = restart === nothing ? nothing :
-                      get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
-
-            if profile === nothing
-                restart === nothing || @warn "No saved profile for this run; spinning up over the truncated forcing" bin=bin.center delta pscale
-                cf_spinup = forcing_climatology(cf, spinup_window)
-                profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
-                                      max_iterations, convergence_delta_density)
-            end
-
-            output = gemb(profile, cf, mp)
-
-            # `gemb` only warns when the forcing is shorter than one output period; that
-            # leaves an empty time axis, which would otherwise silently contribute nothing.
-            n_out = length(dims(output, Ti))
-            if n_out == 0
-                @warn "GEMB produced no output for this run; skipping bin" bin=bin.center delta pscale
-                continue
-            end
-
-            if isempty(out_time)
-                out_time = collect(dims(output, Ti))
-                for v in CELL_TOTAL_VARIABLES
-                    totals[v] = zeros(n_out, n_dt, n_ps)
-                end
-                merge!(provenance, _stack_provenance(output))
-            elseif collect(dims(output, Ti)) != out_time
-                throw(ErrorException("output time axis differs between bins of the same " *
-                                     "cell (bin $(bin.center)); cannot aggregate"))
-            end
-
-            # km² -> m², so flux [kg m-2] * area [m2] = mass [kg].
-            weight = cov.weights[i_bin] * 1e6
-            for v in CELL_MASS_VARIABLES
-                @views totals[v][:, i_dt, i_ps] .+= output[v] .* weight
-            end
-            @views totals[:mass_change][:, i_dt, i_ps] .+=
-                (output[:precipitation] .- output[:runoff] .+
-                 output[:evaporation_condensation]) .* weight
-
-            # Keep only the restart state; the full output (Z x Ti, ~200 layers x decades of
-            # steps) is far too large to hold for every bin of every perturbation.
-            profiles[i_bin, i_dt, i_ps] = gemb_profile(output)
+        if profile === nothing
+            restart === nothing || @warn "No saved profile for this run; spinning up over the truncated forcing" bin=bin.center delta pscale
+            cf_spinup = forcing_climatology(cf, spinup_window)
+            profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
+                                  max_iterations, convergence_delta_density)
         end
+
+        output = gemb(profile, cf, mp)
+
+        # `gemb` only warns when the forcing is shorter than one output period; that
+        # leaves an empty time axis, which would otherwise silently contribute nothing.
+        if length(dims(output, Ti)) == 0
+            @warn "GEMB produced no output for this run; skipping bin" bin=bin.center delta pscale
+            return nothing
+        end
+
+        # Extract the flux vectors and the restart profile here so `output` goes out of scope
+        # with the task rather than being retained until the reduction.
+        fluxes = Dict{Symbol,Vector{Float64}}(v => Vector{Float64}(output[v])
+                                             for v in CELL_MASS_VARIABLES)
+        return (; i_bin, i_dt, i_ps,
+                time = collect(dims(output, Ti)),
+                fluxes,
+                profile = gemb_profile(output),
+                provenance = _stack_provenance(output))
+    end
+
+    if threaded && Threads.nthreads() > 1 && length(tasks) > 1
+        Threads.@threads for t in eachindex(tasks)
+            results[t] = run_one(t)
+        end
+    else
+        for t in eachindex(tasks)
+            results[t] = run_one(t)
+        end
+    end
+
+    # Serial reduction in task order: allocate the totals from the first run that produced
+    # output, check every other run against that time axis, then area-weight.
+    for res in results
+        res === nothing && continue
+        if isempty(out_time)
+            out_time = res.time
+            for v in CELL_TOTAL_VARIABLES
+                totals[v] = zeros(length(out_time), n_dt, n_ps)
+            end
+            merge!(provenance, res.provenance)
+        elseif res.time != out_time
+            throw(ErrorException("output time axis differs between bins of the same " *
+                                 "cell (bin $(cov.modeled[res.i_bin].center)); cannot aggregate"))
+        end
+
+        # km² -> m², so flux [kg m-2] * area [m2] = mass [kg].
+        weight = cov.weights[res.i_bin] * 1e6
+        for v in CELL_MASS_VARIABLES
+            @views totals[v][:, res.i_dt, res.i_ps] .+= res.fluxes[v] .* weight
+        end
+        @views totals[:mass_change][:, res.i_dt, res.i_ps] .+=
+            (res.fluxes[:precipitation] .- res.fluxes[:runoff] .+
+             res.fluxes[:evaporation_condensation]) .* weight
+
+        # Keep only the restart state; the full output (Z x Ti, ~200 layers x decades of
+        # steps) is far too large to hold for every bin of every perturbation.
+        profiles[res.i_bin, res.i_dt, res.i_ps] = res.profile
     end
 
     isempty(out_time) && throw(ErrorException("no bin of this cell produced any output"))
