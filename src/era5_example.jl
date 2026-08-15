@@ -134,11 +134,12 @@ mp = initialize_parameters(output_frequency = :monthly);
 # with the unmodeled remainder folded into the nearest modeled bin so no area is dropped) happens
 # inside `gemb_glacier_cell`, so the ~47,000-cell screen does not pay for it.
 begin
-    cell_rows = collect(eachrow(glacier_elevation_classes))
-    qualifying = [i for i in eachindex(cell_rows)
-                  if glacier_area_total(cell_rows[i]) >= cell_area_minimum]
-    cell_limit === nothing || (qualifying = first(qualifying, cell_limit))
-    @info "Cells to run" total=length(cell_rows) qualifying=length(qualifying) runs_per_cell="bins x $(length(delta_temperatures)) x $(length(precipitation_scalings))"
+    # `view = true` keeps this a SubDataFrame over the cached table rather than copying the
+    # ~47,000 rows (and their hyps_* columns) into a second frame.
+    qualifying_cells = filter(r -> glacier_area_total(r) >= cell_area_minimum,
+                              glacier_elevation_classes; view = true)
+    cell_limit === nothing || (qualifying_cells = first(qualifying_cells, cell_limit))
+    @info "Cells to run" total=nrow(glacier_elevation_classes) qualifying=nrow(qualifying_cells) runs_per_cell="bins x $(length(delta_temperatures)) x $(length(precipitation_scalings))"
 end;
 
 # One NetCDF per cell, named by chunk id and cell center so a file is traceable to its cell.
@@ -148,8 +149,7 @@ cell_output_path(r) = joinpath(output_dir,
     "gemb_cell_" * lpad(r.chunk_id, 6, '0') * "_" *
     _degrees_tag(r.latitude) * "_" * _degrees_tag(wrap_lon(r.longitude)) * ".nc")
 
-for i in qualifying
-    r = cell_rows[i]
+for (i, r) in enumerate(eachrow(qualifying_cells))
     path = cell_output_path(r)
 
     # One failing cell (a CDS timeout, an infeasible column grid) must not abort the sweep.
