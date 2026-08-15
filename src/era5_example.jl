@@ -1,7 +1,11 @@
-# Example of running GEMB with ERA5 reanalysis data using GEMB_ClimateForcing.jl
+# Batch GEMB run over glacier grid cells, forced with ERA5-Land via GEMB_ClimateForcing.jl.
 #
-# This example uses the GEMB_ClimateForcing.jl package to automatically download
-# and format ERA5-Land climate data.
+# For every glacier grid cell holding at least `cell_area_minimum` of glacier ice, this runs
+# GEMB over the full outer product of prescribed temperature deltas and precipitation scalings,
+# for the hypsometry bins covering at least `hypsometry_coverage` of the cell's glacier area.
+# The per-bin mass fluxes are area-weighted into per-cell mass totals (kg) and written to one
+# CF-compliant NetCDF per cell, alongside the final firn profile of every run so the record can
+# be extended when new forcing appears without repeating the spinup.
 #
 # Setup (required before running):
 #   1. Install GEMB_ClimateForcing from GitHub:
@@ -15,8 +19,31 @@ begin
     # cached glacier elevation-class table, will only be built if it doesn't already exist
     climate_model = :era5land
 
-    # Skip hypsometry bins holding less than this glacier area (km²) when looping over elevation classes.
-    glacier_area_minimum = 0
+    # --- sweep configuration -----------------------------------------------------------------
+    # Prescribed perturbations, run as a full outer product. Note the cost: each cell runs
+    # (bins x deltas x scalings) GEMB simulations, each with its own spinup.
+    delta_temperatures     = [0.0, 1.0, 2.0]        # air temperature offsets (K)
+    precipitation_scalings = [0.8, 1.0, 1.2]        # precipitation multipliers (1)
+
+    # Fraction of each cell's glacier area the modeled hypsometry bins must cover. Bins are
+    # taken largest-area first; the area of the unmodeled remainder is folded into the nearest
+    # modeled bin, so the full cell area always contributes to the mass totals.
+    hypsometry_coverage = 0.95
+
+    # Skip grid cells holding less than this total glacier area (km²).
+    cell_area_minimum = 1.0
+
+    # Restrict the sweep to the first N qualifying cells (`nothing` runs all of them). Start
+    # small: a global sweep is many thousands of cells x the perturbation grid.
+    cell_limit = 1
+
+    # Extending an existing cell file requires that its stored run parameters (every
+    # `ModelParameters` field, the hypsometry coverage, the lapse rate) match this sweep's;
+    # otherwise the append is refused, because it would splice two different experiments into
+    # one record. Set `true` to append across such a change anyway — the file's stored
+    # parameters are then overwritten and the pre-seam record no longer reflects them. Changing
+    # a model parameter normally means the cells should be rebuilt from scratch instead.
+    force_restart = false
 
     using GEMB
     using Dates
@@ -29,8 +56,14 @@ begin
     using GEMB_ClimateForcing
     using DimensionalData
     using Logging
+    import NCDatasets              # to read the per-cell output files back for plotting
+
+    # Set after the imports above: `DateTime` comes from Dates.
+    forcing_time_range = (DateTime(1950, 1, 1), DateTime(2026, 8, 1))
 
     gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "$(climate_model)_glacier_elevation_classes.parquet")
+    output_dir = joinpath(@__DIR__, "..", "data", "gemb_runs", string(climate_model))
+    forcing_cache = joinpath(tempdir(), ".cache", "$(climate_model)")
 
     #disable_logging(Logging.Info)
 
@@ -89,69 +122,109 @@ begin
     glacier_elevation_classes[!,:latitude] = GeoDataFrames.GeoInterface.y.(glacier_elevation_classes.geometry)
 end;
 
-# Coordinates for one glacier cell to hand to `climate_forcing`, read off its Point geometry
-# (lon in (-180, 180], lat).
+## Sweep every qualifying glacier grid cell
+
+# Model parameters, shared by every run. Monthly output keeps the per-cell files small over a
+# 76-year record; `gemb_spinup` overrides the frequency to :last internally, so no separate
+# spinup parameters are needed.
+mp = initialize_parameters(output_frequency = :monthly);
+
+# Cells holding enough glacier ice to be worth running. `glacier_area_total` sums the flat
+# hyps_<lo>_<hi> columns; the bin selection itself (largest-area-first to `hypsometry_coverage`,
+# with the unmodeled remainder folded into the nearest modeled bin so no area is dropped) happens
+# inside `gemb_glacier_cell`, so the ~47,000-cell screen does not pay for it.
 begin
-    r = eachrow(glacier_elevation_classes)[3]
+    cell_rows = collect(eachrow(glacier_elevation_classes))
+    qualifying = [i for i in eachindex(cell_rows)
+                  if glacier_area_total(cell_rows[i]) >= cell_area_minimum]
+    cell_limit === nothing || (qualifying = first(qualifying, cell_limit))
+    @info "Cells to run" total=length(cell_rows) qualifying=length(qualifying) runs_per_cell="bins x $(length(delta_temperatures)) x $(length(precipitation_scalings))"
+end;
 
+# One NetCDF per cell, named by chunk id and cell center so a file is traceable to its cell.
+# Degrees go into the name with '.' -> 'p' and '-' -> 'm' so the filename stays shell-safe.
+_degrees_tag(x) = replace(string(round(x, digits = 3)), '.' => 'p', '-' => 'm')
+cell_output_path(r) = joinpath(output_dir,
+    "gemb_cell_" * lpad(r.chunk_id, 6, '0') * "_" *
+    _degrees_tag(r.latitude) * "_" * _degrees_tag(wrap_lon(r.longitude)) * ".nc")
 
-    ## Download ERA5-Land forcing data
+for i in qualifying
+    r = cell_rows[i]
+    path = cell_output_path(r)
 
-    # Download the full climate forcing time series for the selected cell (lat, lon) from the
-    # Copernicus Climate Data Store; cached locally so re-runs skip the download. The returned
-    # stack is self-describing: its metadata carries the cell's absolute (orthometric) surface
-    # elevation, derived from the ERA5-Land geopotential invariant. We use it as the reference
-    # the per-bin lapse adjustment raises from, so the adjustment records an absolute target
-    # elevation (= bin_center) that flows through to the GEMB output and the plot header banner.
-    forcing_data = climate_forcing(climate_model, r.latitude, r.longitude;
-                                    time_range=(DateTime(1950,1,1), DateTime(2026,8,1)),
-                                    token=cds_api_key,
-                                    cache_path=joinpath(tempdir(), ".cache", "$(climate_model)"));
+    # One failing cell (a CDS timeout, an infeasible column grid) must not abort the sweep.
+    try
+        # An existing file carries the firn state and last time of the previous run; when present
+        # the cell resumes from it over only the newer forcing and skips the spinup entirely.
+        restart = read_glacier_cell_restart(path)
 
-    forcing_elevation = metadata(forcing_data)["elevation"]   # ERA5-Land cell surface elevation (m)
+        # Download the full forcing time series for this cell from the Copernicus Climate Data
+        # Store; cached locally so re-runs skip the download. The returned stack is
+        # self-describing: its metadata carries the cell's absolute (orthometric) surface
+        # elevation, which is the reference the per-bin lapse adjustment raises from.
+        forcing_data = climate_forcing(climate_model, r.latitude, r.longitude;
+                                       time_range = forcing_time_range,
+                                       token = cds_api_key,
+                                       cache_path = forcing_cache)
 
+        # Runs (bins x deltas x scalings) simulations and area-weights the per-bin mass fluxes
+        # (kg m-2) by the glacier area attributed to each bin, giving per-cell masses (kg).
+        run = gemb_glacier_cell(r, forcing_data, mp;
+                                delta_temperatures, precipitation_scalings,
+                                coverage = hypsometry_coverage,
+                                restart, force_restart)
 
-    ## Run GEMB once per populated glacier elevation bin
+        if restart === nothing
+            write_glacier_cell_netcdf(path, run;
+                                      institution = "NASA Jet Propulsion Laboratory")
+        else
+            append_glacier_cell_netcdf(path, run)
+        end
 
-    # Populated hypsometry bins for this cell, decoded from the flat hyps_<lo>_<hi> columns by the
-    # package (edges/center/area already parsed; bins below the area threshold dropped).
-    bins = glacier_hypsometry(r; area_minimum = glacier_area_minimum);
-
-    # Collect one GEMB output per elevation bin above the area threshold, keyed by bin-center elevation (m).
-    bin_outputs = Dict{Float64, Any}();
-
-    for bin in bins
-        bin_center = bin.center                          # target elevation (m)
-
-        # Lapse-rate-adjust the (once-downloaded) forcing to this bin's center, relative to the
-        # forcing's own surface elevation, and convert it to a ClimateForcing. Adjusting from the
-        # original `forcing_data` each time keeps the elevation deltas from compounding across bins.
-        cf = forcing_at_elevation(forcing_data, bin_center - forcing_elevation)
-
-        # Build a repeating climatological year from the forcing, used to spin the model up.
-        cf_spinup = forcing_climatology(cf, (DateTime(1950,1,1), DateTime(1980,12,31)))
-
-        # Model parameters; write output at monthly frequency for the transient run.
-        mp = initialize_parameters(output_frequency=:monthly)
-
-        # Initialize the firn column (layer geometry, density, temperature) from the spinup climate.
-        # `initialize_profile` returns a possibly-adjusted `mp` (shrunken column limits when
-        # `depth_autoadjust` fires for an ice column); thread it through spinup AND the transient run.
-        (initial_profile, initial_mp) = initialize_profile(mp, cf_spinup)
-
-        # Spin up on the climatology (keeping only the final state) until density converges or 1000 iters.
-        # gemb_spinup internally forces output_frequency=:last, so no separate :last params are needed.
-        profile_spunup = gemb_spinup(initial_profile, cf_spinup, initial_mp; max_iterations = 1000, convergence_delta_density = 0.01)
-        
-        # Run the transient simulation from the spun-up profile over the full forcing record.
-        output = gemb(profile_spunup, cf, initial_mp)
-
-        bin_outputs[bin_center] = output
-        @info "Ran GEMB bin" bin_center area=bin.area elevation_delta=(bin_center - forcing_elevation)
+        @info "Wrote cell" path bins=length(run.bins) area_km2=sum(run.weights) steps=length(run.time)
+    catch e
+        e isa InterruptException && rethrow()
+        # ERA5-Land is land-only, so a cell whose reanalysis grid point falls on water (common
+        # for coastal and island glaciers) has no forcing at all. Those cells are unrunnable
+        # rather than failed, so skip them quietly instead of logging an error per cell.
+        if e isa ForcingUnavailable
+            @info "Skipping cell: no land forcing at this reanalysis grid point" cell=i lat=r.latitude lon=r.longitude
+            continue
+        end
+        # A run-parameter change is a property of this sweep's configuration, not of one cell,
+        # so it would fail identically for every remaining cell. Abort rather than log it
+        # thousands of times; the message says how to proceed deliberately.
+        e isa RestartParameterMismatch && rethrow()
+        # An existing file that already spans the forcing is up to date, not broken; re-running
+        # the sweep before new forcing is published hits this for every completed cell.
+        if e isa ForcingUpToDate
+            @info "Cell already up to date" cell=i path restart_time=e.restart_time
+            continue
+        end
+        @error "Cell failed; continuing" cell=i path exception=(e, catch_backtrace())
     end
 end
 
-# Quick-look plot of the standard GEMB output fields for the highest-elevation bin that ran.
-if !isempty(bin_outputs)
-    gemb_plot_output(bin_outputs[maximum(keys(bin_outputs))])
+# Quick-look plot of the per-cell mass totals for the first cell written: cumulative mass change
+# for every prescribed (temperature delta, precipitation scaling) combination.
+begin
+    files = isdir(output_dir) ? filter(endswith(".nc"), readdir(output_dir; join = true)) : String[]
+    if !isempty(files)
+        NCDatasets.NCDataset(first(files), "r") do ds
+            # `datetime2decyear` takes the whole vector; GEMB and GEMB_ClimateForcing both
+            # export it, so qualify which one.
+            years = GEMB.datetime2decyear(collect(DateTime, ds["time"][:]))
+            fig = Figure(size = (900, 500))
+            ax = Axis(fig[1, 1]; xlabel = "year", ylabel = "cumulative mass change (Gt)",
+                      title = basename(first(files)))
+            for (j, dT) in enumerate(ds["delta_temperature"][:]),
+                (k, ps) in enumerate(ds["precipitation_scaling"][:])
+                # 1 Gt = 1e12 kg.
+                lines!(ax, years, cumsum(ds["mass_change"][:, j, k]) .* 1e-12;
+                       label = "ΔT=$(dT) K, P×$(ps)")
+            end
+            axislegend(ax; position = :lb, framevisible = false)
+            display(fig)
+        end
+    end
 end
