@@ -118,8 +118,8 @@ Read the restart state written by [`write_glacier_cell_netcdf`](@ref). Returns `
 file does not exist, so a driver can fall through to a cold start.
 
 Returns `(; time, profiles, bin_centers, delta_temperatures, precipitation_scalings, parameters)`
-where `profiles` maps `(i_bin, i_delta, i_scaling)` to the 7-layer profile `DimStack` that `gemb`
-accepts, truncated to that run's real column length. `time` is the last output time in the
+where `profiles` maps `(i_bin, i_delta, i_scaling)` to the profile `DimStack` that `gemb`
+accepts (the layers in [`PROFILE_VARIABLES`](@ref)), truncated to that run's real column length. `time` is the last output time in the
 file, i.e. the point the continuation must start after. `parameters` is the file's stored run
 configuration ([`run_parameters`](@ref)), which `gemb_glacier_cell` checks the continuation
 against.
@@ -139,6 +139,16 @@ function read_glacier_cell_restart(path::AbstractString)
 
         valid = g["valid_layers"][:, :, :]
         profiles = Dict{Tuple{Int,Int,Int},DimStack}()
+
+        # Files written before a state layer was added to `PROFILE_VARIABLES` are missing it
+        # here. Reading on would hand `gemb` an incomplete profile and fail deep in the first
+        # timestep with a bare `FieldError`, so name the gap and the remedy instead.
+        missing_vars = [v for v in PROFILE_VARIABLES if !haskey(g, string(v))]
+        isempty(missing_vars) ||
+            throw(ArgumentError("the restart group in $path is missing " *
+                                join(missing_vars, ", ") * "; it predates those layers " *
+                                "becoming part of the saved state and cannot be continued. " *
+                                "Delete the file to rebuild the cell from scratch."))
 
         # One hyperslab per variable rather than one per (variable, bin, delta, scaling): the
         # runs are all padded to the same `layer` dimension, so the whole array reads at once
@@ -326,6 +336,22 @@ function _write_coordinates!(ds, run::GlacierCellRun, n_layer::Int)
         isempty(standard_name) || (v.attrib["standard_name"] = standard_name)
         v[] = value
     end
+
+    # A property of the cell, not of the perturbation grid, so it is a scalar alongside
+    # `forcing_elevation`. `NaN` (the fill) when the forcing was left ambient — a cell with no
+    # published k must be distinguishable from one corrected by exactly 1.0.
+    dk = NCDatasets.defVar(ds, "glacier_decoupling_factor", Float64, (); fillvalue = NC_FILL)
+    dk.attrib["units"] = "1"
+    dk.attrib["long_name"] = "on-glacier air temperature decoupling factor"
+    dk.attrib["comment"] =
+        "Effective Shaw et al. (2025) factor k applied to this cell's forcing, weighted by the " *
+        "non-glacier fraction as 1 - (1 - k)*(1 - glm) and applied after the elevation " *
+        "adjustment. Absent (fill) when no correction was applied — either it was disabled or " *
+        "the cell has no published k (RGI regions 05 and 19 are not covered by the dataset). " *
+        "The global attribute of the same name records the same setting as the identity 1.0 " *
+        "rather than a fill, because it is compared numerically on restart and a fill would " *
+        "never equal itself."
+    dk[] = run.decoupling_factor === nothing ? NC_FILL : run.decoupling_factor
     return nothing
 end
 

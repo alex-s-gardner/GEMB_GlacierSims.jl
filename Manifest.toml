@@ -822,13 +822,13 @@ version = "1.1.0"
     WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 [[deps.GEMB_ClimateForcing]]
-deps = ["ArchGDAL", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "NCDatasets", "NetworkOptions", "OpenSSL", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
+deps = ["ArchGDAL", "CodecZlib", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
 path = "/Users/gardnera/Documents/GitHub/GEMB_ClimateForcing.jl"
 uuid = "a64e60a8-608f-46bc-88f4-efdcc7581069"
 version = "0.1.0"
 
 [[deps.GEMB_GlacierSims]]
-deps = ["CairoMakie", "DataFrames", "Dates", "DimensionalData", "GEMB", "GEMB_ClimateForcing", "GLMakie", "GeoDataFrames", "GeoParquet", "Makie", "ProgressMeter", "Proj", "Rasters", "SortTileRecursiveTree", "Statistics"]
+deps = ["CairoMakie", "DataFrames", "Dates", "DimensionalData", "GEMB", "GEMB_ClimateForcing", "GLMakie", "GeoDataFrames", "GeoParquet", "Makie", "NCDatasets", "ProgressMeter", "Proj", "Rasters", "SortTileRecursiveTree", "Statistics"]
 path = "."
 uuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 version = "0.1.0"
