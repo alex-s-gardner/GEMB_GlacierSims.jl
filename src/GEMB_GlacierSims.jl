@@ -24,7 +24,7 @@ export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypso
 include("glacier_run.jl")
 export glacier_hypsometry_coverage, glacier_area_total, gemb_glacier_cell, GlacierCellRun
 export forcing_is_complete, ForcingUpToDate, ForcingUnavailable, RestartParameterMismatch
-export run_parameters, cell_decoupling_factor
+export run_parameters, cell_decoupling_factor, decoupling_factor_label
 export CELL_MASS_VARIABLES, CELL_TOTAL_VARIABLES, PROFILE_VARIABLES
 
 include("netcdf_output.jl")

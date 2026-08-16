@@ -30,6 +30,7 @@ function _fake_profile(n::Int, seed::Float64)
 end
 
 function _fake_run(; time, deltas, scalings, bins, weights, lengths,
+                   decoupling_factor = nothing,
                    parameters = Dict{String,Any}("hypsometry_coverage" => 0.95,
                                                  "temperature_lapse_rate" => 6.5,
                                                  "model_albedo_ice" => 0.48,
@@ -48,7 +49,7 @@ function _fake_run(; time, deltas, scalings, bins, weights, lengths,
         profiles[i, j, k] = _fake_profile(n, 100.0 * i + 10.0 * j + k)
     end
     return GlacierCellRun(
-        72.5, -38.25, 1234.5, 42, 0.87,
+        72.5, -38.25, 1234.5, decoupling_factor, 42, 0.87,
         collect(Float64, deltas), collect(Float64, scalings),
         [(; lo = Int(c) - 50, hi = Int(c) + 50, center = Float64(c), area = w)
          for (c, w) in zip(bins, weights)],
@@ -78,6 +79,7 @@ end
         @test isdefined(GEMB_GlacierSims, :run_parameters)
         @test isdefined(GEMB_GlacierSims, :read_glacier_cell_parameters)
         @test isdefined(GEMB_GlacierSims, :cell_decoupling_factor)
+        @test isdefined(GEMB_GlacierSims, :decoupling_factor_label)
     end
 
     @testset "cell_decoupling_factor" begin
@@ -145,6 +147,47 @@ end
         @test resolve(ocean, true) === nothing
 
         @test :glacier_decoupling in Base.kwarg_decl(only(methods(gemb_glacier_cell)))
+    end
+
+    @testset "decoupling factor provenance" begin
+        time = collect(DateTime(2000, 1, 31):Month(1):DateTime(2000, 3, 31))
+        kw = (; time, deltas = [0.0], scalings = [1.0], bins = [1150], weights = [10.3],
+              lengths = [12])
+        dir = mktempdir()
+
+        # An applied factor is written as a scalar variable, like `forcing_elevation` — it is a
+        # property of the cell, not of the perturbation grid.
+        applied = joinpath(dir, "applied.nc")
+        write_glacier_cell_netcdf(applied, _fake_run(; kw..., decoupling_factor = 0.7742))
+        NCDatasets.NCDataset(applied, "r") do ds
+            @test ds["glacier_decoupling_factor"][] ≈ 0.7742
+            @test ds["glacier_decoupling_factor"].attrib["units"] == "1"
+            @test isempty(NCDatasets.dimnames(ds["glacier_decoupling_factor"]))
+        end
+
+        # No correction reads back as `missing` (the fill), so a cell left on ambient forcing is
+        # distinguishable from one corrected by exactly 1.0 — which the parameter attribute,
+        # compared numerically on restart, cannot express.
+        ambient = joinpath(dir, "ambient.nc")
+        write_glacier_cell_netcdf(ambient, _fake_run(; kw..., decoupling_factor = nothing))
+        NCDatasets.NCDataset(ambient, "r") do ds
+            @test ismissing(ds["glacier_decoupling_factor"][])
+        end
+
+        # The field is on the struct itself, so a caller can read it back off the run.
+        @test _fake_run(; kw..., decoupling_factor = 0.8).decoupling_factor == 0.8
+        @test _fake_run(; kw...).decoupling_factor === nothing
+    end
+
+    @testset "decoupling_factor_label" begin
+        # The label a plot header carries. Absent — not "k=1.0" — when no correction was applied:
+        # a k on every figure of an uncorrected sweep is noise, and the absence is what
+        # distinguishes ambient forcing from a cell the correction happened to leave alone.
+        @test decoupling_factor_label(nothing) == ""
+        @test decoupling_factor_label(0.7742) == "k=0.774"
+        @test decoupling_factor_label(0.8) == "k=0.8"
+        # Rounded for display, so a long-tailed k does not widen the header.
+        @test decoupling_factor_label(0.77424242) == "k=0.774"
     end
 
     @testset "glacier_hypsometry_coverage" begin

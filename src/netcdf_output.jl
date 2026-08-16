@@ -207,11 +207,6 @@ function _write_globals!(ds, run::GlacierCellRun; institution, references)
         "hypsometry_coverage of the cell total; the area of unselected bins was added to " *
         "the nearest selected bin by center elevation"
     ds.attrib["temperature_lapse_rate_units"] = "K km-1"
-    ds.attrib["glacier_decoupling_factor_comment"] =
-        "Shaw et al. (2025) on-glacier air temperature decoupling factor k, applied after the " *
-        "elevation adjustment and weighted by the cell's non-glacier fraction as " *
-        "1 - (1 - k)*(1 - glm). 1.0 means no correction was applied — either it was disabled or " *
-        "the cell has no published k (RGI regions 05 and 19 are not covered by the dataset)."
     ismissing(run.chunk_id) || (ds.attrib["chunk_id"] = run.chunk_id)
     ismissing(run.glacier_frac) || (ds.attrib["glacier_fraction"] = run.glacier_frac)
 
@@ -341,6 +336,22 @@ function _write_coordinates!(ds, run::GlacierCellRun, n_layer::Int)
         isempty(standard_name) || (v.attrib["standard_name"] = standard_name)
         v[] = value
     end
+
+    # A property of the cell, not of the perturbation grid, so it is a scalar alongside
+    # `forcing_elevation`. `NaN` (the fill) when the forcing was left ambient — a cell with no
+    # published k must be distinguishable from one corrected by exactly 1.0.
+    dk = NCDatasets.defVar(ds, "glacier_decoupling_factor", Float64, (); fillvalue = NC_FILL)
+    dk.attrib["units"] = "1"
+    dk.attrib["long_name"] = "on-glacier air temperature decoupling factor"
+    dk.attrib["comment"] =
+        "Effective Shaw et al. (2025) factor k applied to this cell's forcing, weighted by the " *
+        "non-glacier fraction as 1 - (1 - k)*(1 - glm) and applied after the elevation " *
+        "adjustment. Absent (fill) when no correction was applied — either it was disabled or " *
+        "the cell has no published k (RGI regions 05 and 19 are not covered by the dataset). " *
+        "The global attribute of the same name records the same setting as the identity 1.0 " *
+        "rather than a fill, because it is compared numerically on restart and a fill would " *
+        "never equal itself."
+    dk[] = run.decoupling_factor === nothing ? NC_FILL : run.decoupling_factor
     return nothing
 end
 

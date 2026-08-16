@@ -159,22 +159,37 @@ begin
     @info "Cells to run" total=nrow(glacier_elevation_classes) qualifying=nrow(qualifying_cells) runs_per_cell="bins x $(length(delta_temperatures)) x $(length(precipitation_scalings))"
 end;
 
-# One NetCDF per cell, named by chunk id and cell center so a file is traceable to its cell.
-# Degrees go into the name with '.' -> 'p' and '-' -> 'm' so the filename stays shell-safe.
-_degrees_tag(x) = replace(string(round(x, digits = 3)), '.' => 'p', '-' => 'm')
+# One NetCDF per cell, named `latXX.XX_lonXXX.XX.nc` by cell center so a file is traceable to
+# its cell and sorts geographically. Fixed width — two integer digits of latitude, three of
+# longitude, two decimals of each — so names line up in a listing and a negative degree does not
+# shift the columns. Two decimals resolve any reanalysis grid finer than ~1 km, so distinct
+# cells cannot collide on one name.
+# Rounded to 2 dp *before* the integer part is split off, so a value just under a degree
+# (52.997) renders as 53.00 rather than 52.100.
+function _degrees_tag(x, intdigits)
+    r = round(abs(x), digits = 2)
+    whole, frac = floor(Int, r), round(Int, 100 * (r - floor(r)))
+    return (x < 0 ? "-" : "") * lpad(whole, intdigits, '0') * "." * lpad(frac, 2, '0')
+end
 cell_output_path(r) = joinpath(output_dir,
-    "gemb_cell_" * lpad(r.chunk_id, 6, '0') * "_" *
-    _degrees_tag(r.latitude) * "_" * _degrees_tag(wrap_lon(r.longitude)) * ".nc")
+    "lat" * _degrees_tag(r.latitude, 2) * "_" *
+    "lon" * _degrees_tag(wrap_lon(r.longitude), 3) * ".nc")
 
 # `on_output` hook for `verbose_plotting`: one full GEMB diagnostic panel per simulation, titled
 # with the cell and the perturbation it belongs to so the figures stay distinguishable. Built per
 # cell so the closure carries that cell's identity; `gemb_plot_output` needs a Makie backend,
 # which the `using CairoMakie` above provides.
-verbose_plotter(i, r) = function (output; bin, delta, pscale)
+#
+# The decoupling factor is part of the title only when one was applied: a `k=1.0` on every figure
+# of an uncorrected sweep is noise, and its absence is what distinguishes ambient forcing from a
+# cell the correction happened to leave alone.
+verbose_plotter(i, r) = function (output; bin, delta, pscale, decoupling_factor)
+    k = decoupling_factor_label(decoupling_factor)
     display(gemb_plot_output(output; datelims = (DateTime(2020, 1, 1), DateTime(2026, 8, 1)),
         title = "cell $i (chunk $(r.chunk_id), $(round(r.latitude, digits = 3))°N, " *
                 "$(round(wrap_lon(r.longitude), digits = 3))°E) — " *
-                "bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)"))
+                "bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)" *
+                (isempty(k) ? "" : ", $k")))
 end
 
 for (i, r) in enumerate(eachrow(qualifying_cells))

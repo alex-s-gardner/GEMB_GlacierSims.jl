@@ -84,9 +84,13 @@ totals over the full perturbation grid, plus the per-run final firn profiles for
 - `weights`: glacier area (km²) attributed to each modeled bin, including the area of
   unmodeled bins reassigned to their nearest modeled bin. `sum(weights)` is the cell's total
   glacier area, since the reassignment drops none of it.
+- `decoupling_factor`: the effective on-glacier air temperature decoupling factor `k` applied to
+  every run of this cell ([`cell_decoupling_factor`](@ref)), or `nothing` when the forcing was
+  left ambient. Like `forcing_elevation` this is a property of the cell rather than of the
+  perturbation grid, so it is carried as a scalar and written as one.
 - `parameters`: the settings that define how the cell was run ([`run_parameters`](@ref)),
-  written as global attributes and checked against on restart. Includes `hypsometry_coverage`
-  and `temperature_lapse_rate`.
+  written as global attributes and checked against on restart. Includes `hypsometry_coverage`,
+  `temperature_lapse_rate` and `glacier_decoupling_factor`.
 - `provenance`: the `spinup_*`/`climatology_*` keys `gemb` attached to the output. Recorded but
   *not* checked on restart — a resumed run performs no spinup, so these are expected to differ.
 """
@@ -94,6 +98,7 @@ struct GlacierCellRun
     latitude::Float64
     longitude::Float64
     forcing_elevation::Float64
+    decoupling_factor::Union{Float64,Nothing}
     chunk_id::Union{Int,Missing}
     glacier_frac::Union{Float64,Missing}
     delta_temperatures::Vector{Float64}
@@ -225,6 +230,19 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
 end
 
 """
+    decoupling_factor_label(k; digits = 3) -> String
+
+Compact label for a decoupling factor, for a plot header or a log line: `"k=0.774"`, or `""` when
+`k` is `nothing`.
+
+Empty rather than `"k=1.0"` for no correction: a factor printed on every figure of an uncorrected
+sweep is noise, and its *absence* is what distinguishes ambient forcing from a cell the correction
+happened to leave alone.
+"""
+decoupling_factor_label(k::Nothing; digits::Int = 3) = ""
+decoupling_factor_label(k::Real; digits::Int = 3) = "k=$(round(k; digits))"
+
+"""
     ForcingUpToDate(restart_time, new_steps)
 
 Thrown by [`gemb_glacier_cell`](@ref) when a cell's saved output already spans the available
@@ -322,8 +340,8 @@ or perturbations.
   a fixed index order after the tasks finish, not accumulated as they land. Set `false` to run
   serially (useful when the caller is already saturating the machine by running many cells in
   parallel, as grouping cells by `chunk_id` does). Thread count comes from `julia -t N`.
-- `on_output = nothing`: called as `on_output(output; bin, delta, pscale)` with each
-  simulation's full output `DimStack`, for inspection (e.g. `gemb_plot_output`) or diagnostics.
+- `on_output = nothing`: called as `on_output(output; bin, delta, pscale, decoupling_factor)` with
+  each simulation's full output `DimStack`, for inspection (e.g. `gemb_plot_output`) or diagnostics.
   The stack is otherwise dropped as soon as its flux vectors are extracted, so this is the only
   place it can be reached; the callback must not retain it, or the memory the per-task extraction
   avoids is held after all. Called from inside the task, so with `threaded = true` it runs
@@ -448,8 +466,10 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         end
 
         # The caller's only window onto the full stack: below this point only the flux vectors
-        # and the restart profile survive.
-        on_output === nothing || on_output(output; bin, delta, pscale)
+        # and the restart profile survive. `decoupling_factor` is constant across the sweep but
+        # passed anyway, so a hook can label a figure without reaching back for the cell.
+        on_output === nothing ||
+            on_output(output; bin, delta, pscale, decoupling_factor)
 
         # Extract the flux vectors and the restart profile here so `output` goes out of scope
         # with the task rather than being retained until the reduction.
@@ -506,7 +526,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     lon, lat = _cell_lonlat(row.geometry)
 
     return GlacierCellRun(
-        Float64(lat), Float64(wrap_lon(lon)), forcing_elevation,
+        Float64(lat), Float64(wrap_lon(lon)), forcing_elevation, decoupling_factor,
         hasproperty(row, :chunk_id) ? Int(row.chunk_id) : missing,
         hasproperty(row, :glacier_frac) ? Float64(row.glacier_frac) : missing,
         delta_temperatures, precipitation_scalings,
