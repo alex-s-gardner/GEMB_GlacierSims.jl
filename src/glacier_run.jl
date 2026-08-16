@@ -20,10 +20,14 @@ const CELL_MASS_VARIABLES = (:melt, :runoff, :refreeze, :evaporation_condensatio
 # boundary; `evaporation_condensation` is positive for mass gain.
 const CELL_MASS_CHANGE_FORMULA = "precipitation - runoff + evaporation_condensation"
 
-# The 7 layers that constitute a complete GEMB restart state (`gemb` reads exactly these,
-# `GEMB.jl/src/gemb_driver.jl`).
+# The layers that constitute a complete GEMB restart state (`gemb` reads exactly these,
+# `GEMB.jl/src/gemb_driver.jl`). Every one is required: `gemb` indexes them by name off the
+# profile, so a missing layer is a `FieldError` on the first timestep, not a silent default.
+# `age` is part of the state even though no physics reads it — it is the column's only clock,
+# and dropping it from the round-trip would restart every continuation's age at whatever the
+# saved column happened to hold.
 const PROFILE_VARIABLES = (:dz, :temperature, :density, :water, :grain_radius,
-                          :grain_dendricity, :grain_sphericity)
+                          :grain_dendricity, :grain_sphericity, :age)
 
 # Everything carried as a per-cell total: the area-weighted fluxes plus the budget assembled
 # from them. Keys of `GlacierCellRun.totals` and the mass variables in the NetCDF output.
@@ -34,7 +38,8 @@ const CELL_TOTAL_VARIABLES = (CELL_MASS_VARIABLES..., :mass_change)
 const MIN_FORCING_STEPS = 2
 
 """
-    run_parameters(mp::ModelParameters; coverage, lapse_rate) -> Dict{String,Any}
+    run_parameters(mp::ModelParameters; coverage, lapse_rate, decoupling_factor = nothing)
+        -> Dict{String,Any}
 
 The settings that define *how* a cell is run, as NetCDF global attributes.
 
@@ -49,9 +54,15 @@ continuation: the output time axis, the `spinup_*`/`climatology_*` provenance (a
 performs no spinup at all, and a longer forcing record shifts the climatology window), `history`,
 and the `institution`/`references` labels.
 """
-function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real)
+function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real,
+                        decoupling_factor = nothing)
     params = Dict{String,Any}("hypsometry_coverage" => Float64(coverage),
-                              "temperature_lapse_rate" => Float64(lapse_rate))
+                              "temperature_lapse_rate" => Float64(lapse_rate),
+                              # 1.0 (the identity) rather than an absent key when no correction
+                              # was applied, so switching the correction on or off is visible as
+                              # a parameter change on restart rather than an unverifiable gap.
+                              "glacier_decoupling_factor" =>
+                                  decoupling_factor === nothing ? 1.0 : Float64(decoupling_factor))
     for field in propertynames(mp)
         field === :dt_divisors && continue
         params["model_" * string(field)] = getproperty(mp, field)
@@ -170,6 +181,50 @@ function glacier_hypsometry_coverage(row; coverage::Real = 0.95)
 end
 
 """
+    cell_decoupling_factor(row; max_distance = 10.0)
+
+Effective on-glacier air temperature decoupling factor `k` for a glacier grid cell, or `nothing`
+when the cell has no published `k`.
+
+`k` comes from the Shaw et al. (2025) per-glacier table via `GEMB_ClimateForcing.glacier_decoupling`,
+looked up by nearest glacier centroid to the cell center (within `max_distance` km). It corrects an
+*ambient* (off-glacier) temperature to on-glacier conditions, so it only applies to the part of the
+reanalysis cell that is not already glacier: ERA5-Land's `:glm` glacier mask says what fraction of
+the cell its land-surface scheme already treats as ice, and that fraction needs no correction.
+The published `k` is therefore weighted by the non-glacier fraction `1 - glm`,
+
+    k_eff = 1 - (1 - k) * (1 - glm)
+
+which is the full correction where the cell carries no glacier (`glm = 0`) and the identity where
+the cell is entirely glacier (`glm = 1`). A cell with no `:glm` column, or a `missing` value, is
+treated as `glm = 0` — the uncorrected reanalysis assumption, hence the full correction.
+
+Returns `(; k, k_published, glm, rgi_id, distance)`, or `nothing` when the table has no glacier
+within `max_distance` — RGI regions 05 (Greenland periphery) and 19 (Antarctic) are absent from it
+entirely, and those cells are then run on ambient forcing rather than failing.
+"""
+function cell_decoupling_factor(row; max_distance::Real = 10.0)
+    lon, lat = _cell_lonlat(row.geometry)
+
+    # Positional lookups error rather than return a sentinel when nothing is close enough (or the
+    # RGI region is uncovered). No `k` is a run-on-ambient-forcing outcome, not a failure.
+    found = try
+        glacier_decoupling(Float64(lat), wrap_lon(Float64(lon)); max_distance)
+    catch e
+        e isa InterruptException && rethrow()
+        return nothing
+    end
+
+    glm_raw = hasproperty(row, :glm) ? row.glm : missing
+    glm = (glm_raw === missing || !isfinite(Float64(glm_raw))) ? 0.0 :
+          clamp(Float64(glm_raw), 0.0, 1.0)
+
+    # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
+    k = 1 - (1 - found.k) * (1 - glm)
+    return (; k, k_published = found.k, glm, rgi_id = found.rgi_id, distance = found.distance)
+end
+
+"""
     ForcingUpToDate(restart_time, new_steps)
 
 Thrown by [`gemb_glacier_cell`](@ref) when a cell's saved output already spans the available
@@ -233,7 +288,8 @@ elevation the per-bin lapse adjustment raises from).
 Per (delta, scaling, bin) the forcing chain is
 
     adjusted = precipitation_adjust(temperature_adjust(forcing_data, delta), scaling)
-    cf       = forcing_at_elevation(adjusted, bin.center - forcing_elevation; lapse_rate)
+    cf       = forcing_at_elevation(adjusted, bin.center - forcing_elevation;
+                                    lapse_rate, decoupling_factor)
 
 Each adjustment starts from the original `forcing_data`, so deltas never compound across bins
 or perturbations.
@@ -243,6 +299,12 @@ or perturbations.
 - `precipitation_scalings`: prescribed precipitation multipliers (dimensionless).
 - `coverage = 0.95`: fraction of cell glacier area the modeled bins must cover.
 - `lapse_rate = 6.5`: temperature lapse rate (K/km) for the per-bin elevation adjustment.
+- `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
+  Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
+  ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
+  requires. A cell with no `k` in the table (RGI regions 05 and 19 are not covered) is run on
+  ambient forcing with no correction at all. Set `false` to skip the lookup entirely; pass a
+  `Real` to prescribe `k` directly, bypassing both the table and the `glm` weighting.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
   year used for spinup. Defaults to the first 30 complete years of the forcing.
 - `max_iterations`, `convergence_delta_density`: passed to `gemb_spinup`.
@@ -260,22 +322,36 @@ or perturbations.
   a fixed index order after the tasks finish, not accumulated as they land. Set `false` to run
   serially (useful when the caller is already saturating the machine by running many cells in
   parallel, as grouping cells by `chunk_id` does). Thread count comes from `julia -t N`.
+- `on_output = nothing`: called as `on_output(output; bin, delta, pscale)` with each
+  simulation's full output `DimStack`, for inspection (e.g. `gemb_plot_output`) or diagnostics.
+  The stack is otherwise dropped as soon as its flux vectors are extracted, so this is the only
+  place it can be reached; the callback must not retain it, or the memory the per-task extraction
+  avoids is held after all. Called from inside the task, so with `threaded = true` it runs
+  concurrently on an unspecified thread and in an unspecified order — make it thread-safe, or
+  pass `threaded = false` alongside it (plotting backends generally are not).
 """
 function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            delta_temperatures = [0.0],
                            precipitation_scalings = [1.0],
                            coverage::Real = 0.95,
                            lapse_rate::Real = 6.5,
+                           glacier_decoupling = true,
                            spinup_window = nothing,
                            max_iterations::Int = 1000,
                            convergence_delta_density = 0.01,
                            restart = nothing,
                            force_restart::Bool = false,
-                           threaded::Bool = true)
+                           threaded::Bool = true,
+                           on_output = nothing)
 
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
-    parameters = run_parameters(mp; coverage, lapse_rate)
+
+    # One lookup per cell, not per (bin x delta x scaling): `k` is a property of the glacier, not
+    # of the perturbation or the elevation band. `nothing` here means every run stays ambient.
+    decoupling_factor = _resolve_decoupling_factor(row, glacier_decoupling)
+
+    parameters = run_parameters(mp; coverage, lapse_rate, decoupling_factor)
 
     cov = glacier_hypsometry_coverage(row; coverage)
     isempty(cov.modeled) &&
@@ -349,7 +425,8 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         # to a spinup, and sharing one `adjusted` across bins would hand the same object to
         # concurrent tasks.
         adjusted = precipitation_adjust(temperature_adjust(forcing_data, delta), pscale)
-        cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation; lapse_rate)
+        cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation;
+                                  lapse_rate, decoupling_factor)
 
         profile = restart === nothing ? nothing :
                   get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
@@ -369,6 +446,10 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
             @warn "GEMB produced no output for this run; skipping bin" bin=bin.center delta pscale
             return nothing
         end
+
+        # The caller's only window onto the full stack: below this point only the flux vectors
+        # and the restart profile survive.
+        on_output === nothing || on_output(output; bin, delta, pscale)
 
         # Extract the flux vectors and the restart profile here so `output` goes out of scope
         # with the task rather than being retained until the reduction.
@@ -432,6 +513,28 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         cov.modeled, cov.weights,
         out_time, totals, profiles, parameters, provenance,
     )
+end
+
+# Resolve the `glacier_decoupling` keyword to the `k` handed to every run of this cell, or
+# `nothing` for ambient forcing. `false` skips the lookup; a `Real` is taken as `k` verbatim (no
+# `glm` weighting — the caller has prescribed the effective factor); `true` looks `k` up and
+# weights it by the cell's non-glacier fraction. A cell absent from the table gets no correction
+# at all, which is why this is not an error.
+_resolve_decoupling_factor(row, glacier_decoupling::Bool) =
+    glacier_decoupling ? _lookup_decoupling_factor(row) : nothing
+_resolve_decoupling_factor(row, glacier_decoupling::Real) = Float64(glacier_decoupling)
+_resolve_decoupling_factor(row, glacier_decoupling::Nothing) = nothing
+
+function _lookup_decoupling_factor(row)
+    found = cell_decoupling_factor(row)
+    if found === nothing
+        @info "No Shaw et al. (2025) decoupling factor for this cell; running on ambient forcing"
+        return nothing
+    end
+    @info "Applying glacier decoupling weighted by the non-glacier fraction" k=found.k k_published=found.k_published glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
+    # An entirely glaciated cell weights k to exactly 1.0, which is the identity — skip the
+    # adjustment rather than paying for a no-op pass over the whole forcing record.
+    return found.k >= 1 ? nothing : found.k
 end
 
 # Spinup/climatology provenance carried on the output stack by `gemb` (`_profile_provenance`).

@@ -22,8 +22,8 @@ begin
     # --- sweep configuration -----------------------------------------------------------------
     # Prescribed perturbations, run as a full outer product. Note the cost: each cell runs
     # (bins x deltas x scalings) GEMB simulations, each with its own spinup.
-    delta_temperatures     = [0.0, 1.0, 2.0]        # air temperature offsets (K)
-    precipitation_scalings = [0.8, 1.0, 1.2]        # precipitation multipliers (1)
+    delta_temperatures     = [0.0]        # air temperature offsets (K)
+    precipitation_scalings = [1.0]        # precipitation multipliers (1)
 
     # Fraction of each cell's glacier area the modeled hypsometry bins must cover. Bins are
     # taken largest-area first; the area of the unmodeled remainder is folded into the nearest
@@ -33,9 +33,19 @@ begin
     # Skip grid cells holding less than this total glacier area (km²).
     cell_area_minimum = 1.0
 
+    # Correct the ambient reanalysis air temperature to on-glacier conditions with the Shaw et al.
+    # (2025) decoupling factor `k`, weighted by the fraction of the cell ERA5-Land does *not*
+    # already treat as ice (`1 - glm`) — the glaciated fraction needs no correction. A cell with no
+    # published `k` (RGI regions 05 and 19 are not covered by the dataset) is run on ambient
+    # forcing with no correction. `false` disables the lookup; a number prescribes `k` directly.
+    #
+    # NOTE: not named `glacier_decoupling` — that is the lookup function GEMB_ClimateForcing
+    # exports, and a global of the same name would clash with the import in `Main`.
+    apply_glacier_decoupling = true
+
     # Restrict the sweep to the first N qualifying cells (`nothing` runs all of them). Start
     # small: a global sweep is many thousands of cells x the perturbation grid.
-    cell_limit = 1
+    cell_limit = 100
 
     # Extending an existing cell file requires that its stored run parameters (every
     # `ModelParameters` field, the hypsometry coverage, the lapse rate) match this sweep's;
@@ -44,6 +54,12 @@ begin
     # parameters are then overwritten and the pre-seam record no longer reflects them. Changing
     # a model parameter normally means the cells should be rebuilt from scratch instead.
     force_restart = false
+
+    # Display a full `gemb_plot_output` panel for every individual simulation as it finishes —
+    # one figure per (bin x delta x scaling), so a single cell can produce dozens. Diagnostic
+    # only: keep `cell_limit` small when this is on, and note that it forces the per-cell
+    # simulations to run serially (Makie is not thread-safe).
+    verbose_plotting = true
 
     using GEMB
     using Dates
@@ -62,7 +78,8 @@ begin
     forcing_time_range = (DateTime(1950, 1, 1), DateTime(2026, 8, 1))
 
     gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "$(climate_model)_glacier_elevation_classes.parquet")
-    output_dir = joinpath(@__DIR__, "..", "data", "gemb_runs", string(climate_model))
+    #output_dir = joinpath(@__DIR__, "..", "data", "gemb_runs", string(climate_model))
+    output_dir = joinpath("/Users/gardnera/data/gemb/gemb_runs/run_001", string(climate_model))
     forcing_cache = joinpath(tempdir(), ".cache", "$(climate_model)")
 
     #disable_logging(Logging.Info)
@@ -127,7 +144,7 @@ end;
 # Model parameters, shared by every run. Monthly output keeps the per-cell files small over a
 # 76-year record; `gemb_spinup` overrides the frequency to :last internally, so no separate
 # spinup parameters are needed.
-mp = initialize_parameters(output_frequency = :monthly);
+mp = initialize_parameters(output_frequency = :daily);
 
 # Cells holding enough glacier ice to be worth running. `glacier_area_total` sums the flat
 # hyps_<lo>_<hi> columns; the bin selection itself (largest-area-first to `hypsometry_coverage`,
@@ -149,7 +166,19 @@ cell_output_path(r) = joinpath(output_dir,
     "gemb_cell_" * lpad(r.chunk_id, 6, '0') * "_" *
     _degrees_tag(r.latitude) * "_" * _degrees_tag(wrap_lon(r.longitude)) * ".nc")
 
+# `on_output` hook for `verbose_plotting`: one full GEMB diagnostic panel per simulation, titled
+# with the cell and the perturbation it belongs to so the figures stay distinguishable. Built per
+# cell so the closure carries that cell's identity; `gemb_plot_output` needs a Makie backend,
+# which the `using CairoMakie` above provides.
+verbose_plotter(i, r) = function (output; bin, delta, pscale)
+    display(gemb_plot_output(output; datelims = (DateTime(2020, 1, 1), DateTime(2026, 8, 1)),
+        title = "cell $i (chunk $(r.chunk_id), $(round(r.latitude, digits = 3))°N, " *
+                "$(round(wrap_lon(r.longitude), digits = 3))°E) — " *
+                "bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)"))
+end
+
 for (i, r) in enumerate(eachrow(qualifying_cells))
+
     path = cell_output_path(r)
 
     # One failing cell (a CDS timeout, an infeasible column grid) must not abort the sweep.
@@ -169,10 +198,17 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
 
         # Runs (bins x deltas x scalings) simulations and area-weights the per-bin mass fluxes
         # (kg m-2) by the glacier area attributed to each bin, giving per-cell masses (kg).
+        # `gemb_glacier_cell` drops each simulation's output stack as soon as it has the flux
+        # vectors, so verbose plotting hooks in there rather than working from `run`. Serial
+        # because the hook is called from inside the simulation task and Makie is not
+        # thread-safe.
         run = gemb_glacier_cell(r, forcing_data, mp;
                                 delta_temperatures, precipitation_scalings,
                                 coverage = hypsometry_coverage,
-                                restart, force_restart)
+                                glacier_decoupling = apply_glacier_decoupling,
+                                restart, force_restart,
+                                threaded = !verbose_plotting,
+                                on_output = verbose_plotting ? verbose_plotter(i, r) : nothing)
 
         if restart === nothing
             write_glacier_cell_netcdf(path, run;
@@ -201,7 +237,7 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
             @info "Cell already up to date" cell=i path restart_time=e.restart_time
             continue
         end
-        @error "Cell failed; continuing" cell=i path exception=(e, catch_backtrace())
+        @warn "Cell failed; continuing" cell=i path exception=(e, catch_backtrace())
     end
 end
 

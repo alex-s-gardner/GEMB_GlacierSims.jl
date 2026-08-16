@@ -1,8 +1,10 @@
 using GEMB_GlacierSims
 using Test
 using DataFrames
+using GeoDataFrames
 using Dates
 using DimensionalData
+import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
 using NCDatasets
 
@@ -75,6 +77,74 @@ end
         @test isdefined(GEMB_GlacierSims, :RestartParameterMismatch)
         @test isdefined(GEMB_GlacierSims, :run_parameters)
         @test isdefined(GEMB_GlacierSims, :read_glacier_cell_parameters)
+        @test isdefined(GEMB_GlacierSims, :cell_decoupling_factor)
+    end
+
+    @testset "cell_decoupling_factor" begin
+        # Reads the vendored Shaw et al. (2025) table shipped with GEMB_ClimateForcing, so this
+        # is offline. Haut Glacier d'Arolla (RGI60-11.02810) is ~0.5 km from this point.
+        cell(lon, lat, glm...) = first(eachrow(DataFrame(
+            :geometry => [GeoDataFrames.GeoInterface.Point(lon, lat)],
+            (isempty(glm) ? () : (:glm => [only(glm)],))...)))
+
+        full = cell_decoupling_factor(cell(7.53, 45.97, 0.0))
+        @test full.rgi_id == "RGI60-11.02810"
+        @test full.distance < 1.0
+        # A cell ERA5-Land treats as ice-free gets the published k unweighted.
+        @test full.k == full.k_published
+        @test 0 < full.k < 1
+
+        k_pub = full.k_published
+
+        # The weighting is linear in the non-glacier fraction and exact at both ends: no glacier
+        # in the cell is the full correction, an all-glacier cell is the identity.
+        @test cell_decoupling_factor(cell(7.53, 45.97, 1.0)).k == 1.0
+        @test cell_decoupling_factor(cell(7.53, 45.97, 0.5)).k ≈ 1 - (1 - k_pub) * 0.5
+        @test cell_decoupling_factor(cell(7.53, 45.97, 0.25)).k ≈ 1 - (1 - k_pub) * 0.75
+
+        # No `glm` at all — a missing value, or a table without the column — is the uncorrected
+        # reanalysis assumption (glm = 0), hence the full correction rather than a skip.
+        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).k == k_pub
+        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).k == k_pub
+        @test cell_decoupling_factor(cell(7.53, 45.97)).k == k_pub
+
+        # Cell longitudes are native 0–359.9°E on the climate grid; the lookup wraps them, so
+        # both conventions must find the same glacier.
+        @test cell_decoupling_factor(cell(-145.0, 60.5, 0.0)).rgi_id ==
+              cell_decoupling_factor(cell(215.0, 60.5, 0.0)).rgi_id
+
+        # No published k is a run-on-ambient-forcing outcome, not a failure: RGI region 19 is
+        # absent from the dataset, and open ocean has no glacier within max_distance.
+        @test cell_decoupling_factor(cell(0.0, -78.0, 0.0)) === nothing
+        @test cell_decoupling_factor(cell(-30.0, 20.0, 0.0)) === nothing
+
+        # `max_distance` bounds the nearest-centroid match, so tightening it past the real
+        # distance turns a hit into a no-correction cell.
+        @test cell_decoupling_factor(cell(7.53, 45.97, 0.0); max_distance = 0.1) === nothing
+    end
+
+    @testset "glacier_decoupling keyword resolution" begin
+        cell(glm) = first(eachrow(DataFrame(
+            geometry = [GeoDataFrames.GeoInterface.Point(7.53, 45.97)], glm = [glm])))
+        resolve = GEMB_GlacierSims._resolve_decoupling_factor
+
+        # `false` skips the lookup entirely; `true` looks k up and weights it by 1 - glm.
+        @test resolve(cell(0.0), false) === nothing
+        @test resolve(cell(0.0), true) == cell_decoupling_factor(cell(0.0)).k
+
+        # An entirely glaciated cell weights to exactly 1.0 — the identity — so the adjustment
+        # is skipped rather than run as a no-op pass over the whole forcing record.
+        @test resolve(cell(1.0), true) === nothing
+
+        # A prescribed `k` bypasses both the table and the glm weighting.
+        @test resolve(cell(1.0), 0.6) === 0.6
+
+        # A cell with no published k is run on ambient forcing.
+        ocean = first(eachrow(DataFrame(
+            geometry = [GeoDataFrames.GeoInterface.Point(-30.0, 20.0)], glm = [0.0])))
+        @test resolve(ocean, true) === nothing
+
+        @test :glacier_decoupling in Base.kwarg_decl(only(methods(gemb_glacier_cell)))
     end
 
     @testset "glacier_hypsometry_coverage" begin
@@ -158,7 +228,13 @@ end
         @test p["model_albedo_ice"] == mp.albedo_ice
         @test p["model_densification_method"] === mp.densification_method
         @test !haskey(p, "model_dt_divisors")
-        @test length(p) == length(propertynames(mp)) - 1 + 2
+        @test length(p) == length(propertynames(mp)) - 1 + 3
+
+        # No decoupling is recorded as the identity, not as an absent key, so switching the
+        # correction on or off is a visible parameter change on restart.
+        @test p["glacier_decoupling_factor"] == 1.0
+        @test run_parameters(mp; coverage = 0.95, lapse_rate = 6.5,
+                             decoupling_factor = 0.8)["glacier_decoupling_factor"] == 0.8
 
         # Provenance that legitimately changes between a run and its continuation is not part of
         # the parameter set, so extending a record never trips the check on it.
@@ -228,6 +304,85 @@ end
             @test occursin("extended through", ds.attrib["history"])
             @test occursin("created by", ds.attrib["history"])
         end
+    end
+
+    @testset "PROFILE_VARIABLES is the complete GEMB state" begin
+        # The roster is what the restart group stores, so a layer missing from it is silently
+        # dropped on write and then a bare `FieldError` inside `gemb` on continuation. Pin it
+        # against a real initialized profile rather than a hand-copied list, so a state layer
+        # added in GEMB.jl fails here instead of at the first restart months later.
+        n = 10
+        t = collect(DateTime(2000, 1, 1):Day(1):DateTime(2000, 1, n))
+        cf = GEMB.initialize_forcing(t, fill(250.0, n), fill(85000.0, n), fill(3.0, n),
+                                     fill(5.0, n), fill(0.0, n), fill(180.0, n), fill(50.0, n);
+                                     temperature_observation_height = 2.0,
+                                     wind_observation_height = 10.0)
+        profile = GEMB.initialize_profile(initialize_parameters(), cf)
+
+        # Set equality both ways: no state layer is unsaved, and nothing is listed that a
+        # profile does not actually carry.
+        @test Set(GEMB_GlacierSims.PROFILE_VARIABLES) == Set(keys(profile))
+
+        # `age` specifically — the column's only clock, and the layer this roster was missing.
+        @test :age in GEMB_GlacierSims.PROFILE_VARIABLES
+
+        # Every listed layer has CF attributes, which `_write_restart_group!` writes unguarded.
+        for v in GEMB_GlacierSims.PROFILE_VARIABLES
+            @test haskey(GEMB.cf_attributes(v; time_axis = false), "units")
+        end
+    end
+
+    @testset "restart group predating a state layer" begin
+        # Files written before `age` joined the roster have no `age` variable. Continuing one
+        # would hand `gemb` an incomplete profile; the read must say so and name the remedy.
+        dir = mktempdir()
+        path = joinpath(dir, "cell.nc")
+        write_glacier_cell_netcdf(path, _fake_run(; time = collect(DateTime(2000, 1, 31):Month(1):DateTime(2000, 3, 31)),
+                                                  deltas = [0.0], scalings = [1.0],
+                                                  bins = [1150], weights = [10.3],
+                                                  lengths = [12]))
+        # Drop `age` to emulate an old file. NCDatasets cannot delete a variable, so rewrite
+        # the restart group without it by copying the file through a fresh dataset.
+        old = joinpath(dir, "old.nc")
+        NCDatasets.NCDataset(path, "r") do src
+            NCDatasets.NCDataset(old, "c") do dst
+                # All dims fixed-length, including `time`: an unlimited dimension starts empty
+                # in the copy, so a whole-array assignment would not match. The read path only
+                # needs `time`'s length and last value, not its extensibility.
+                for (d, l) in src.dim
+                    NCDatasets.defDim(dst, d, l)
+                end
+                for (k, v) in src.attrib
+                    dst.attrib[k] = v
+                end
+                for name in keys(src)
+                    v = NCDatasets.defVar(dst, name, eltype(src[name].var),
+                                          NCDatasets.dimnames(src[name]))
+                    v.var[:] = src[name].var[:]
+                end
+                g_src = src.group["restart"]
+                g_dst = NCDatasets.defGroup(dst, "restart")
+                for name in keys(g_src)
+                    name == "age" && continue          # the layer the old writer never stored
+                    v = NCDatasets.defVar(g_dst, name, eltype(g_src[name].var),
+                                          NCDatasets.dimnames(g_src[name]))
+                    v.var[:] = g_src[name].var[:]
+                end
+            end
+        end
+
+        err = try
+            read_glacier_cell_restart(old)
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("age", err.msg)
+        @test occursin("cannot be continued", err.msg)
+        @test occursin("Delete the file", err.msg)
+
+        # A file written by the current writer reads back fine.
+        @test read_glacier_cell_restart(path) !== nothing
     end
 
     @testset "NetCDF write and restart round-trip" begin

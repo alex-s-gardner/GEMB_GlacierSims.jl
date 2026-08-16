@@ -118,8 +118,8 @@ Read the restart state written by [`write_glacier_cell_netcdf`](@ref). Returns `
 file does not exist, so a driver can fall through to a cold start.
 
 Returns `(; time, profiles, bin_centers, delta_temperatures, precipitation_scalings, parameters)`
-where `profiles` maps `(i_bin, i_delta, i_scaling)` to the 7-layer profile `DimStack` that `gemb`
-accepts, truncated to that run's real column length. `time` is the last output time in the
+where `profiles` maps `(i_bin, i_delta, i_scaling)` to the profile `DimStack` that `gemb`
+accepts (the layers in [`PROFILE_VARIABLES`](@ref)), truncated to that run's real column length. `time` is the last output time in the
 file, i.e. the point the continuation must start after. `parameters` is the file's stored run
 configuration ([`run_parameters`](@ref)), which `gemb_glacier_cell` checks the continuation
 against.
@@ -139,6 +139,16 @@ function read_glacier_cell_restart(path::AbstractString)
 
         valid = g["valid_layers"][:, :, :]
         profiles = Dict{Tuple{Int,Int,Int},DimStack}()
+
+        # Files written before a state layer was added to `PROFILE_VARIABLES` are missing it
+        # here. Reading on would hand `gemb` an incomplete profile and fail deep in the first
+        # timestep with a bare `FieldError`, so name the gap and the remedy instead.
+        missing_vars = [v for v in PROFILE_VARIABLES if !haskey(g, string(v))]
+        isempty(missing_vars) ||
+            throw(ArgumentError("the restart group in $path is missing " *
+                                join(missing_vars, ", ") * "; it predates those layers " *
+                                "becoming part of the saved state and cannot be continued. " *
+                                "Delete the file to rebuild the cell from scratch."))
 
         # One hyperslab per variable rather than one per (variable, bin, delta, scaling): the
         # runs are all padded to the same `layer` dimension, so the whole array reads at once
@@ -197,6 +207,11 @@ function _write_globals!(ds, run::GlacierCellRun; institution, references)
         "hypsometry_coverage of the cell total; the area of unselected bins was added to " *
         "the nearest selected bin by center elevation"
     ds.attrib["temperature_lapse_rate_units"] = "K km-1"
+    ds.attrib["glacier_decoupling_factor_comment"] =
+        "Shaw et al. (2025) on-glacier air temperature decoupling factor k, applied after the " *
+        "elevation adjustment and weighted by the cell's non-glacier fraction as " *
+        "1 - (1 - k)*(1 - glm). 1.0 means no correction was applied — either it was disabled or " *
+        "the cell has no published k (RGI regions 05 and 19 are not covered by the dataset)."
     ismissing(run.chunk_id) || (ds.attrib["chunk_id"] = run.chunk_id)
     ismissing(run.glacier_frac) || (ds.attrib["glacier_fraction"] = run.glacier_frac)
 
