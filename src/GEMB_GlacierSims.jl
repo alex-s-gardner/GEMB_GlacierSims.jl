@@ -24,12 +24,13 @@ export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypso
 include("glacier_run.jl")
 export glacier_hypsometry_coverage, glacier_area_total, gemb_glacier_cell, GlacierCellRun
 export forcing_is_complete, ForcingUpToDate, ForcingUnavailable, RestartParameterMismatch
-export run_parameters, cell_decoupling_factor, decoupling_factor_label
+export run_parameters, run_parameter_differences
+export cell_decoupling_factor, resolve_decoupling_factor, decoupling_factor_label
 export CELL_MASS_VARIABLES, CELL_TOTAL_VARIABLES, PROFILE_VARIABLES
 
 include("netcdf_output.jl")
 export write_glacier_cell_netcdf, append_glacier_cell_netcdf, read_glacier_cell_restart
-export read_glacier_cell_parameters
+export read_glacier_cell_parameters, read_glacier_cell_status
 
 
 end # module

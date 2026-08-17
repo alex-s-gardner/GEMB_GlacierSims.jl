@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "1d016f24b8ac3308cedc09fb7070fdf716ffce9d"
+project_hash = "258d2122917c0ea754c53b49b29c79e91c155152"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -810,7 +810,7 @@ version = "304.1200.400+0"
 deps = ["DataInterpolations", "Dates", "DimensionalData", "FillArrays", "JSON", "Statistics"]
 path = "/Users/gardnera/Documents/GitHub/GEMB.jl"
 uuid = "658e70de-abe2-4db6-8b40-f6dcda98d853"
-version = "1.1.0"
+version = "2.0.0"
 
     [deps.GEMB.extensions]
     GEMBMakieExt = "Makie"
@@ -822,7 +822,7 @@ version = "1.1.0"
     WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 [[deps.GEMB_ClimateForcing]]
-deps = ["ArchGDAL", "CodecZlib", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
+deps = ["ArchGDAL", "CodecZlib", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "Mmap", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
 path = "/Users/gardnera/Documents/GitHub/GEMB_ClimateForcing.jl"
 uuid = "a64e60a8-608f-46bc-88f4-efdcc7581069"
 version = "0.1.0"

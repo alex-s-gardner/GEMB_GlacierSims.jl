@@ -78,6 +78,9 @@ end
         @test isdefined(GEMB_GlacierSims, :RestartParameterMismatch)
         @test isdefined(GEMB_GlacierSims, :run_parameters)
         @test isdefined(GEMB_GlacierSims, :read_glacier_cell_parameters)
+        @test isdefined(GEMB_GlacierSims, :read_glacier_cell_status)
+        @test isdefined(GEMB_GlacierSims, :run_parameter_differences)
+        @test isdefined(GEMB_GlacierSims, :resolve_decoupling_factor)
         @test isdefined(GEMB_GlacierSims, :cell_decoupling_factor)
         @test isdefined(GEMB_GlacierSims, :decoupling_factor_label)
     end
@@ -128,7 +131,7 @@ end
     @testset "glacier_decoupling keyword resolution" begin
         cell(glm) = first(eachrow(DataFrame(
             geometry = [GeoDataFrames.GeoInterface.Point(7.53, 45.97)], glm = [glm])))
-        resolve = GEMB_GlacierSims._resolve_decoupling_factor
+        resolve = resolve_decoupling_factor
 
         # `false` skips the lookup entirely; `true` looks k up and weights it by 1 - glm.
         @test resolve(cell(0.0), false) === nothing
@@ -287,6 +290,57 @@ end
         p2 = run_parameters(initialize_parameters(output_frequency = :monthly, albedo_ice = 0.4);
                             coverage = 0.95, lapse_rate = 6.5)
         @test p2["model_albedo_ice"] == 0.4
+    end
+
+    @testset "run_parameter_differences" begin
+        # Compared in the NetCDF-encoded form, so a stored `"Arthern"` matches a requested
+        # `:Arthern` and a stored `"false"` matches a requested `false`.
+        saved = Dict{String,Any}("model_albedo_ice" => 0.48,
+                                 "model_densification_method" => "Arthern",
+                                 "model_shortwave_subsurface_absorption" => "false")
+        @test isempty(run_parameter_differences(saved,
+            Dict{String,Any}("model_albedo_ice" => 0.48,
+                             "model_densification_method" => :Arthern,
+                             "model_shortwave_subsurface_absorption" => false)))
+
+        # Only keys present in both are compared: a file written by an older `run_parameters`
+        # carries fewer of them, which is a gap rather than a disagreement.
+        @test isempty(run_parameter_differences(saved, Dict{String,Any}("brand_new_key" => 1.0)))
+
+        d = run_parameter_differences(saved, Dict{String,Any}("model_albedo_ice" => 0.40,
+                                                             "model_densification_method" => :Ligtenberg))
+        @test d["model_albedo_ice"] == (0.48, 0.40)
+        @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
+    end
+
+    @testset "read_glacier_cell_status" begin
+        # The cheap pre-flight read: everything `read_glacier_cell_restart` returns except the
+        # firn state, so a driver can decide whether a cell needs any work before downloading
+        # forcing or paging in the restart slab.
+        t = collect(DateTime(2000, 1, 31):Month(1):DateTime(2000, 6, 30))
+        dir = mktempdir()
+        path = joinpath(dir, "cell.nc")
+        write_glacier_cell_netcdf(path, _fake_run(; time = t, deltas = [0.0, 1.0],
+                                                 scalings = [1.0], bins = [1150],
+                                                 weights = [10.3], lengths = [12]))
+
+        status = read_glacier_cell_status(path)
+        @test status.time == last(t)
+        @test status.bin_centers == [1150.0]
+        @test status.delta_temperatures == [0.0, 1.0]
+        @test status.precipitation_scalings == [1.0]
+        @test status.parameters["hypsometry_coverage"] == 0.95
+        @test !haskey(status, :profiles)
+
+        # The fields it shares with the restart reader must agree, or the pre-flight check would
+        # validate something other than what the run then checks.
+        restart = read_glacier_cell_restart(path)
+        for k in (:time, :bin_centers, :delta_temperatures, :precipitation_scalings, :parameters)
+            @test getproperty(status, k) == getproperty(restart, k)
+        end
+
+        # A cold start is `nothing` rather than an error, so a driver can fall through to it.
+        @test read_glacier_cell_status(joinpath(dir, "absent.nc")) === nothing
     end
 
     @testset "restart parameter validation" begin

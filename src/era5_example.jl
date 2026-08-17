@@ -33,6 +33,12 @@ begin
     # Skip grid cells holding less than this total glacier area (km²).
     cell_area_minimum = 1.0
 
+    # Temperature lapse rate (K km-1) for the per-bin elevation adjustment. Stated here rather
+    # than left to `gemb_glacier_cell`'s default because the up-front check below has to build the
+    # same `run_parameters` the run will, and a default that differs between the two would report
+    # every existing cell as a parameter change.
+    lapse_rate = 6.5
+
     # Correct the ambient reanalysis air temperature to on-glacier conditions with the Shaw et al.
     # (2025) decoupling factor `k`, weighted by the fraction of the cell ERA5-Land does *not*
     # already treat as ice (`1 - glm`) — the glaciated fraction needs no correction. A cell with no
@@ -43,9 +49,9 @@ begin
     # exports, and a global of the same name would clash with the import in `Main`.
     apply_glacier_decoupling = true
 
-    # Restrict the sweep to the first N qualifying cells (`nothing` runs all of them). Start
+    # Restrict the sweep to the first N qualifying cells (`nothing` or `Inf` runs all of them). Start
     # small: a global sweep is many thousands of cells x the perturbation grid.
-    cell_limit = 100
+    cell_limit = Inf
 
     # Extending an existing cell file requires that its stored run parameters (every
     # `ModelParameters` field, the hypsometry coverage, the lapse rate) match this sweep's;
@@ -59,7 +65,7 @@ begin
     # one figure per (bin x delta x scaling), so a single cell can produce dozens. Diagnostic
     # only: keep `cell_limit` small when this is on, and note that it forces the per-cell
     # simulations to run serially (Makie is not thread-safe).
-    verbose_plotting = true
+    verbose_plotting = false
 
     using GEMB
     using Dates
@@ -155,7 +161,10 @@ begin
     # ~47,000 rows (and their hyps_* columns) into a second frame.
     qualifying_cells = filter(r -> glacier_area_total(r) >= cell_area_minimum,
                               glacier_elevation_classes; view = true)
-    cell_limit === nothing || (qualifying_cells = first(qualifying_cells, cell_limit))
+    # `view = true` again, so truncating the selection does not materialize the rows either.
+    if !(cell_limit === nothing || isinf(cell_limit))
+        qualifying_cells = first(qualifying_cells, Int(cell_limit); view = true)
+    end
     @info "Cells to run" total=nrow(glacier_elevation_classes) qualifying=nrow(qualifying_cells) runs_per_cell="bins x $(length(delta_temperatures)) x $(length(precipitation_scalings))"
 end;
 
@@ -226,9 +235,9 @@ end
 verbose_plotter(i, r) = function (output; bin, delta, pscale, decoupling_factor)
     k = decoupling_factor_label(decoupling_factor)
     display(gemb_plot_output(output; datelims = (DateTime(2020, 1, 1), DateTime(2026, 8, 1)),
-        title = "cell $i (chunk $(r.chunk_id), $(round(r.latitude, digits = 3))°N, " *
+        title = "GEMB simulation: ($(round(r.latitude, digits = 3))°N, " *
                 "$(round(wrap_lon(r.longitude), digits = 3))°E) — " *
-                "bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)" *
+                "hyps bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)" *
                 (isempty(k) ? "" : ", $k")))
 end
 
@@ -238,16 +247,77 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
 
     # One failing cell (a CDS timeout, an infeasible column grid) must not abort the sweep.
     try
+        # --- pre-flight on the existing cell file -------------------------------------------
+        # Re-running a sweep is the common case (extend the record as forcing is published, or
+        # resume an interrupted run), and for most cells the answer is "nothing to do". Deciding
+        # that from the file alone — before any network I/O — is what makes a re-run cheap: the
+        # forcing download is by far the dominant per-cell cost, and even a cache hit re-reads and
+        # re-converts the whole multi-decade series.
+        #
+        # `read_glacier_cell_status` deliberately does *not* read the firn state; that slab is tens
+        # of MB per cell and is only needed once the cell is known to need work.
+        status = read_glacier_cell_status(path)
+
+        # `k` is a per-cell property (looked up by position), so it is part of the parameter set
+        # the check compares and has to be resolved before it. Resolved here rather than inside
+        # `gemb_glacier_cell` — which is why the run below is passed this value instead of
+        # `apply_glacier_decoupling` — because the two must agree, or the check would validate a
+        # different experiment than the one that runs. `resolve_decoupling_factor` is idempotent,
+        # so handing its own output back resolves to itself.
+        decoupling_factor = resolve_decoupling_factor(r, apply_glacier_decoupling)
+
+        # The forcing window still to fetch. `nothing` status means a cold start over the whole
+        # record; otherwise only forcing after the file's last output time can contribute, so the
+        # request starts there — this is the saving, since the fetched window shrinks from decades
+        # to whatever has been published since the last run.
+        request_range = forcing_time_range
+
+        # Overlap the saved record by this much rather than starting exactly at its last output
+        # time. Two reasons, both about the window not being empty: the last *output* time is the
+        # end of an accumulation interval and can fall after the last forcing step it consumed, and
+        # `climate_forcing` reports a window containing no steps as a bare error rather than as
+        # "nothing new". With the overlap the window always contains already-consumed steps,
+        # `gemb_glacier_cell` drops everything at or before the saved time, and an unadvanced
+        # forcing record surfaces as `ForcingUpToDate` — a benign, quietly skipped outcome.
+        restart_overlap = Day(2)
+
+        if status !== nothing
+            requested_parameters = run_parameters(mp; coverage = hypsometry_coverage,
+                                                  lapse_rate, decoupling_factor)
+
+            # Fail on a parameter change here rather than after the download. The run grid
+            # (bin centers, deltas, scalings) is structural and still checked inside
+            # `gemb_glacier_cell`, which has the bin selection in hand.
+            differences = run_parameter_differences(status.parameters, requested_parameters)
+            if !isempty(differences) && !force_restart
+                throw(RestartParameterMismatch(differences))
+            end
+
+            # Nothing newer than the file has been *asked* for, so there is nothing to fetch and
+            # no reason to open the store at all. The forcing record itself may also be shorter
+            # than the request, which only becomes visible once it is read — that case surfaces
+            # as `ForcingUpToDate` from `gemb_glacier_cell` below.
+            if status.time >= last(forcing_time_range)
+                @info "Cell already spans the requested forcing; skipping" cell=i path last_time=status.time requested_through=last(forcing_time_range)
+                continue
+            end
+
+            request_range = (max(first(forcing_time_range), status.time - restart_overlap),
+                             last(forcing_time_range))
+            @info "Extending existing cell" cell=i path last_time=status.time fetching=request_range
+        end
+
         # An existing file carries the firn state and last time of the previous run; when present
         # the cell resumes from it over only the newer forcing and skips the spinup entirely.
-        restart = read_glacier_cell_restart(path)
+        # Read only now that the cell is known to need work — this is the expensive read.
+        restart = status === nothing ? nothing : read_glacier_cell_restart(path)
 
-        # Download the full forcing time series for this cell from the Copernicus Climate Data
-        # Store; cached locally so re-runs skip the download. The returned stack is
-        # self-describing: its metadata carries the cell's absolute (orthometric) surface
-        # elevation, which is the reference the per-bin lapse adjustment raises from.
+        # Download the forcing time series for this cell from the Copernicus Climate Data Store;
+        # cached locally so re-runs skip the download. The returned stack is self-describing: its
+        # metadata carries the cell's absolute (orthometric) surface elevation, which is the
+        # reference the per-bin lapse adjustment raises from.
         forcing_data = climate_forcing(climate_model, r.latitude, r.longitude;
-                                       time_range = forcing_time_range,
+                                       time_range = request_range,
                                        token = cds_api_key,
                                        cache_path = forcing_cache)
 
@@ -259,8 +329,8 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # thread-safe.
         run = gemb_glacier_cell(r, forcing_data, mp;
                                 delta_temperatures, precipitation_scalings,
-                                coverage = hypsometry_coverage,
-                                glacier_decoupling = apply_glacier_decoupling,
+                                coverage = hypsometry_coverage, lapse_rate,
+                                glacier_decoupling = decoupling_factor,
                                 restart, force_restart,
                                 threaded = !verbose_plotting,
                                 on_output = verbose_plotting ? verbose_plotter(i, r) : nothing)
@@ -286,6 +356,12 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # so it would fail identically for every remaining cell. Abort rather than log it
         # thousands of times; the message says how to proceed deliberately.
         e isa RestartParameterMismatch && rethrow()
+        # Same reasoning for a broken driver: a typo, an undefined name, or a stale session whose
+        # loaded GEMB_GlacierSims predates a function used above is a property of the script, not
+        # of the cell. Swallowed per cell it turns into thousands of identical "Cell failed"
+        # warnings and looks like the *data* is bad — abort on the first one so the real error is
+        # what gets read. Requires `using Revise` (or a restart) after editing the package.
+        (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
         # An existing file that already spans the forcing is up to date, not broken; re-running
         # the sweep before new forcing is published hits this for every completed cell.
         if e isa ForcingUpToDate

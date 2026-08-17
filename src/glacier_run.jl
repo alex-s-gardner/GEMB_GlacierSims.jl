@@ -367,7 +367,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
 
     # One lookup per cell, not per (bin x delta x scaling): `k` is a property of the glacier, not
     # of the perturbation or the elevation band. `nothing` here means every run stays ambient.
-    decoupling_factor = _resolve_decoupling_factor(row, glacier_decoupling)
+    decoupling_factor = resolve_decoupling_factor(row, glacier_decoupling)
 
     parameters = run_parameters(mp; coverage, lapse_rate, decoupling_factor)
 
@@ -535,15 +535,25 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     )
 end
 
-# Resolve the `glacier_decoupling` keyword to the `k` handed to every run of this cell, or
-# `nothing` for ambient forcing. `false` skips the lookup; a `Real` is taken as `k` verbatim (no
-# `glm` weighting — the caller has prescribed the effective factor); `true` looks `k` up and
-# weights it by the cell's non-glacier fraction. A cell absent from the table gets no correction
-# at all, which is why this is not an error.
-_resolve_decoupling_factor(row, glacier_decoupling::Bool) =
+"""
+    resolve_decoupling_factor(row, glacier_decoupling) -> Float64 or nothing
+
+Resolve the `glacier_decoupling` keyword of [`gemb_glacier_cell`](@ref) to the `k` handed to every
+run of this cell, or `nothing` for ambient forcing. `false` skips the lookup; a `Real` is taken as
+`k` verbatim (no `glm` weighting — the caller has prescribed the effective factor); `true` looks
+`k` up and weights it by the cell's non-glacier fraction ([`cell_decoupling_factor`](@ref)). A cell
+absent from the table gets no correction at all, which is why this is not an error.
+
+Public because it is idempotent — passing its result back as `glacier_decoupling` resolves to
+itself — so a driver can resolve `k` once per cell, build [`run_parameters`](@ref) from it to check
+an existing file *before* fetching any forcing, and then hand the same value to the run. Calling it
+per cell rather than per sweep matters: `k` is looked up by position, so it is a property of the
+cell.
+"""
+resolve_decoupling_factor(row, glacier_decoupling::Bool) =
     glacier_decoupling ? _lookup_decoupling_factor(row) : nothing
-_resolve_decoupling_factor(row, glacier_decoupling::Real) = Float64(glacier_decoupling)
-_resolve_decoupling_factor(row, glacier_decoupling::Nothing) = nothing
+resolve_decoupling_factor(row, glacier_decoupling::Real) = Float64(glacier_decoupling)
+resolve_decoupling_factor(row, glacier_decoupling::Nothing) = nothing
 
 function _lookup_decoupling_factor(row)
     found = cell_decoupling_factor(row)
@@ -620,9 +630,34 @@ function Base.showerror(io::IO, e::RestartParameterMismatch)
               "anyway and overwrite the file's stored parameters.")
 end
 
-# Compare the stored run parameters against this run's. Only keys present in both are compared:
-# a file written by an older version simply carries fewer of them, and that is a reason to note
-# the gap, not to refuse the append.
+"""
+    run_parameter_differences(saved, requested) -> Dict{String,Tuple{Any,Any}}
+
+Where a file's stored run parameters disagree with a requested run's, as
+`key => (saved, requested)`. `saved` is what [`read_glacier_cell_parameters`](@ref) (or the
+`parameters` field of [`read_glacier_cell_restart`](@ref)) returned; `requested` is a
+[`run_parameters`](@ref) dict.
+
+Only keys present in both are compared: a file written by an older version of `run_parameters`
+simply carries fewer of them, and that is a reason to note the gap rather than to refuse an append.
+Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
+or `Bool`.
+
+This is what [`gemb_glacier_cell`](@ref) checks a restart against, exposed so a driver can make the
+same comparison up front — before paying for a forcing download — and get the same verdict.
+"""
+function run_parameter_differences(saved, requested)
+    differences = Dict{String,Tuple{Any,Any}}()
+    for (key, value) in requested
+        haskey(saved, key) || continue
+        _encode_attribute(saved[key]) == _encode_attribute(value) && continue
+        differences[key] = (saved[key], value)
+    end
+    return differences
+end
+
+# Compare the stored run parameters against this run's, and refuse the append on a disagreement
+# unless the caller has forced it.
 function _validate_restart_parameters(restart, parameters; force_restart::Bool)
     saved = restart.parameters
     if isempty(saved)
@@ -631,14 +666,7 @@ function _validate_restart_parameters(restart, parameters; force_restart::Bool)
         return nothing
     end
 
-    differences = Dict{String,Tuple{Any,Any}}()
-    for (key, requested) in parameters
-        haskey(saved, key) || continue
-        # Values round-trip through NetCDF attributes, which hold no `Symbol` or `Bool`, so
-        # compare the encoded forms the file actually stores.
-        _encode_attribute(saved[key]) == _encode_attribute(requested) && continue
-        differences[key] = (saved[key], requested)
-    end
+    differences = run_parameter_differences(saved, parameters)
 
     missing_keys = setdiff(keys(parameters), keys(saved))
     isempty(missing_keys) ||

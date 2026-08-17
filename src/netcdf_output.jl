@@ -112,6 +112,35 @@ function append_glacier_cell_netcdf(path::AbstractString, run::GlacierCellRun)
 end
 
 """
+    read_glacier_cell_status(path) -> NamedTuple or nothing
+
+What an existing cell file already covers, without reading the firn state. Returns `nothing` if
+the file does not exist, so a driver can fall through to a cold start.
+
+Returns `(; time, bin_centers, delta_temperatures, precipitation_scalings, parameters)` — the same
+fields as [`read_glacier_cell_restart`](@ref) minus `profiles`. `time` is the last output time in
+the file, i.e. the point a continuation must start after.
+
+This exists to be cheap: the restart group is a `(layer x bin x delta x scaling)` slab per profile
+variable, which for a 38-bin cell is tens of MB, and a driver deciding whether a cell needs any
+work at all does not need it. Reading only the coordinates and attributes makes the up-front check
+— do the run parameters still match, and is there any new forcing to fetch — cost a file open.
+"""
+function read_glacier_cell_status(path::AbstractString)
+    isfile(path) || return nothing
+
+    NCDatasets.NCDataset(path, "r") do ds
+        n_time = length(ds["time"])
+        n_time == 0 && return nothing        # created but never filled; treat as no record
+        return (; time = _nc_decode_time(ds["time"][n_time]),
+                bin_centers = collect(Float64, ds["bin_center"][:]),
+                delta_temperatures = collect(Float64, ds["delta_temperature"][:]),
+                precipitation_scalings = collect(Float64, ds["precipitation_scaling"][:]),
+                parameters = _read_run_parameters(ds))
+    end
+end
+
+"""
     read_glacier_cell_restart(path) -> NamedTuple or nothing
 
 Read the restart state written by [`write_glacier_cell_netcdf`](@ref). Returns `nothing` if the
