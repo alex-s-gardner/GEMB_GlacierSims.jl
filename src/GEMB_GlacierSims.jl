@@ -13,6 +13,10 @@ using SortTileRecursiveTree
 using ProgressMeter
 using Statistics
 using Dates
+using Extents
+import GeoInterface
+import GeometryOps as GO
+import Tables
 import NCDatasets
 
 include("util.jl")
@@ -31,6 +35,10 @@ export CELL_MASS_VARIABLES, CELL_TOTAL_VARIABLES, PROFILE_VARIABLES
 include("netcdf_output.jl")
 export write_glacier_cell_netcdf, append_glacier_cell_netcdf, read_glacier_cell_restart
 export read_glacier_cell_parameters, read_glacier_cell_status
+
+include("climate_parameters.jl")
+export derive_climate_parameters, grid_cells_in_region
+export derive_decoupling_factor, derive_lapse_rate
 
 
 end # module

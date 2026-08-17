@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "258d2122917c0ea754c53b49b29c79e91c155152"
+project_hash = "41677aca4cdf68d380aca51506c5521cb467f6b3"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -822,13 +822,13 @@ version = "2.0.0"
     WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 [[deps.GEMB_ClimateForcing]]
-deps = ["ArchGDAL", "CodecZlib", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "Mmap", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
+deps = ["ArchGDAL", "Base64", "CodecZlib", "Dates", "DimensionalData", "Downloads", "HTTP", "JSON3", "Mmap", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
 path = "/Users/gardnera/Documents/GitHub/GEMB_ClimateForcing.jl"
 uuid = "a64e60a8-608f-46bc-88f4-efdcc7581069"
 version = "0.1.0"
 
 [[deps.GEMB_GlacierSims]]
-deps = ["CairoMakie", "DataFrames", "Dates", "DimensionalData", "GEMB", "GEMB_ClimateForcing", "GLMakie", "GeoDataFrames", "GeoParquet", "Makie", "NCDatasets", "ProgressMeter", "Proj", "Rasters", "SortTileRecursiveTree", "Statistics"]
+deps = ["CairoMakie", "DataFrames", "Dates", "DimensionalData", "Extents", "GEMB", "GEMB_ClimateForcing", "GLMakie", "GeoDataFrames", "GeoInterface", "GeoParquet", "GeometryOps", "Makie", "NCDatasets", "ProgressMeter", "Proj", "Rasters", "SortTileRecursiveTree", "Statistics", "Tables"]
 path = "."
 uuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
 version = "0.1.0"

@@ -4,6 +4,7 @@ using DataFrames
 using GeoDataFrames
 using Dates
 using DimensionalData
+using Statistics
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
 using NCDatasets
@@ -27,6 +28,66 @@ function _fake_profile(n::Int, seed::Float64)
                                        for i in 1:n], (zdim,))
                         for (j, v) in enumerate(GEMB_GlacierSims.PROFILE_VARIABLES))
     return DimStack(layers)
+end
+
+const _CP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
+
+# Synthetic climate forcing shaped exactly like `climate_forcing` output: the seven layers on a `Ti`
+# axis, with the metadata keys `forcing_is_complete` and the band pass read.
+function _cp_forcing(lat, lon, elevation, temperature)
+    n = length(temperature)
+    ti = Ti(_CP_TIME[1:n])
+    const_layers = (pressure_air = 8e4, vapor_pressure = 300.0, wind_speed = 3.0,
+                    precipitation = 0.1, shortwave_downward = 100.0, longwave_downward = 250.0)
+    layers = merge(
+        (temperature_air = DimArray(collect(Float64, temperature), (ti,);
+                                    metadata = Dict("units" => "K")),),
+        NamedTuple(v => DimArray(fill(Float64(x), n), (ti,)) for (v, x) in pairs(const_layers)))
+    return DimStack(layers; metadata = Dict{String,Any}(
+        "latitude" => Float64(lat), "longitude" => Float64(lon),
+        "elevation" => Float64(elevation), "dataset" => "synthetic",
+        "temperature_observation_height" => 2.0, "wind_observation_height" => 10.0))
+end
+
+# Multi-cell elevation-class table for the regional derivation. Each cell is
+# `(; lon, lat, z, glm, bands)` where `bands` maps a bin center to its glacier area (km²).
+function _cp_table(cells)
+    df = DataFrame()
+    # Every bin the runfile writes, so the table has the full flat schema a real one does and
+    # `glacier_hypsometry` decodes it the same way.
+    all_names = GEMB_GlacierSims._hyps_colnames(0:100:10_000)
+    for c in cells
+        d = Dict{Symbol,Any}(:geometry => GeoDataFrames.GeoInterface.Point(c.lon, c.lat),
+                             :glm => c.glm, :latitude => Float64(c.lat),
+                             :longitude => Float64(c.lon), :chunk_id => 1)
+        for nm in all_names
+            d[nm] = 0.0
+        end
+        for (center, area) in c.bands
+            d[only(GEMB_GlacierSims._hyps_colnames([center - 50, center + 50]))] = Float64(area)
+        end
+        push!(df, d; cols = :union)
+    end
+    return df
+end
+
+# A loader closure over `cells`, returning each cell's forcing by its coordinates. `temperature`
+# maps a cell to its temperature vector, so a testset controls the physics it wants to recover.
+function _cp_loader(cells, temperature)
+    # Signature matches `climate_forcing`'s, which is the contract `forcing_loader` promises;
+    # everything but the coordinates is ignored here.
+    return function (_model, lat, lon; time_range = nothing, token = nothing, cache_path = nothing)
+        i = findfirst(c -> c.lat == lat && c.lon == lon, cells)
+        i === nothing && throw(ArgumentError("no synthetic cell at ($lat, $lon)"))
+        c = cells[i]
+        return _cp_forcing(lat, lon, c.z, temperature(c))
+    end
+end
+
+# Square region polygon, in the (-180, 180] convention a real region file uses.
+function _cp_region(x0, y0, x1, y1)
+    GI = GeoDataFrames.GeoInterface
+    return GI.Polygon([GI.LinearRing([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)])])
 end
 
 function _fake_run(; time, deltas, scalings, bins, weights, lengths,
@@ -96,22 +157,31 @@ end
         @test full.rgi_id == "RGI60-11.02810"
         @test full.distance < 1.0
         # A cell ERA5-Land treats as ice-free gets the published k unweighted.
-        @test full.k == full.k_published
-        @test 0 < full.k < 1
+        @test full.decoupling_factor == full.decoupling_factor_published
+        @test 0 < full.decoupling_factor < 1
 
-        k_pub = full.k_published
+        k_pub = full.decoupling_factor_published
 
         # The weighting is linear in the non-glacier fraction and exact at both ends: no glacier
         # in the cell is the full correction, an all-glacier cell is the identity.
-        @test cell_decoupling_factor(cell(7.53, 45.97, 1.0)).k == 1.0
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.5)).k ≈ 1 - (1 - k_pub) * 0.5
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.25)).k ≈ 1 - (1 - k_pub) * 0.75
+        @test cell_decoupling_factor(cell(7.53, 45.97, 1.0)).decoupling_factor == 1.0
+        @test cell_decoupling_factor(cell(7.53, 45.97, 0.5)).decoupling_factor ≈
+              1 - (1 - k_pub) * 0.5
+        @test cell_decoupling_factor(cell(7.53, 45.97, 0.25)).decoupling_factor ≈
+              1 - (1 - k_pub) * 0.75
 
-        # No `glm` at all — a missing value, or a table without the column — is the uncorrected
-        # reanalysis assumption (glm = 0), hence the full correction rather than a skip.
-        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).k == k_pub
-        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).k == k_pub
-        @test cell_decoupling_factor(cell(7.53, 45.97)).k == k_pub
+        # A `missing` or `NaN` glm is a real data gap, so it falls back to the uncorrected
+        # reanalysis assumption (glm = 0) and gets the full correction.
+        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).decoupling_factor == k_pub
+        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).decoupling_factor == k_pub
+
+        # A table with no `:glm` column at all is schema drift, not a data gap: it cannot weight
+        # the correction, and silently applying the unweighted factor to every cell in a sweep is
+        # the bug this replaces. `scripts/migrate_invariant_colnames.jl` renames `glm_frac`.
+        @test_throws ArgumentError cell_decoupling_factor(cell(7.53, 45.97))
+        glm_frac_only = first(eachrow(DataFrame(
+            geometry = [GeoDataFrames.GeoInterface.Point(7.53, 45.97)], glm_frac = [0.5])))
+        @test_throws ArgumentError cell_decoupling_factor(glm_frac_only)
 
         # Cell longitudes are native 0–359.9°E on the climate grid; the lookup wraps them, so
         # both conventions must find the same glacier.
@@ -135,7 +205,7 @@ end
 
         # `false` skips the lookup entirely; `true` looks k up and weights it by 1 - glm.
         @test resolve(cell(0.0), false) === nothing
-        @test resolve(cell(0.0), true) == cell_decoupling_factor(cell(0.0)).k
+        @test resolve(cell(0.0), true) == cell_decoupling_factor(cell(0.0)).decoupling_factor
 
         # An entirely glaciated cell weights to exactly 1.0 — the identity — so the adjustment
         # is skipped rather than run as a no-op pass over the whole forcing record.
@@ -600,6 +670,324 @@ end
         # `scripts/check_threaded_equivalence.jl` asserts, bit-for-bit, on a real cell.
         m = only(methods(gemb_glacier_cell))
         @test :threaded in Base.kwarg_decl(m)
+    end
+
+    @testset "grid_cells_in_region" begin
+        GI = GeoDataFrames.GeoInterface
+
+        # Three cells: one inside the square, one outside, one on its boundary.
+        table = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.2, bands = [(1050, 5.0)]),
+                           (lon = 20.0, lat = 46.0, z = 1000.0, glm = 0.2, bands = [(1050, 5.0)]),
+                           (lon = 11.0, lat = 46.0, z = 1000.0, glm = 0.2, bands = [(1050, 5.0)])])
+        sel = grid_cells_in_region(table, _cp_region(9.5, 45.5, 11.5, 46.5))
+        # A view, not a copy: the real table is ~47k rows x ~100 hyps columns.
+        @test sel isa SubDataFrame
+        @test sort(collect(sel.longitude)) == [10.0, 11.0]
+
+        # `GO.contains` is strictly interior, so a cell centered exactly on the region's edge is
+        # excluded. Worth pinning: it decides which side of a shared border a cell lands on when a
+        # domain is tiled into adjacent regions, so no cell is derived twice.
+        @test sort(collect(grid_cells_in_region(table,
+                                                _cp_region(9.5, 45.5, 11.0, 46.5)).longitude)) ==
+              [10.0]
+
+        # No shape assumption: a MultiPolygon and a plain vector of polygons both work, and a cell
+        # is kept if it falls in *any* of the parts.
+        parts = [_cp_region(9.5, 45.5, 10.5, 46.5), _cp_region(19.5, 45.5, 20.5, 46.5)]
+        @test sort(collect(grid_cells_in_region(table, parts).longitude)) == [10.0, 20.0]
+        @test sort(collect(grid_cells_in_region(table, GI.MultiPolygon(parts)).longitude)) ==
+              [10.0, 20.0]
+
+        # A region table (what `GeoDataFrames.read` of a region file gives) is accepted too.
+        @test nrow(grid_cells_in_region(table, DataFrame(geometry = parts))) == 2
+
+        # The wrap trap: cell centers are stored in native 0-359.9°E, region polygons in
+        # (-180, 180]. 350°E is -10°, and must be found by a polygon around -10.
+        west = _cp_table([(lon = 350.0, lat = 46.0, z = 1000.0, glm = 0.2, bands = [(1050, 5.0)])])
+        @test nrow(grid_cells_in_region(west, _cp_region(-10.5, 45.5, -9.5, 46.5))) == 1
+
+        # `area_minimum` screens on total glacier area before the geometric test.
+        @test nrow(grid_cells_in_region(table, _cp_region(9.5, 45.5, 11.5, 46.5);
+                                        area_minimum = 6.0)) == 0
+
+        # A non-geometry argument, and an antimeridian-spanning region, both throw rather than
+        # silently selecting the wrong cells.
+        @test_throws ArgumentError grid_cells_in_region(table, "not a polygon")
+        @test_throws ArgumentError grid_cells_in_region(table, [nothing, nothing])
+        @test_throws ArgumentError grid_cells_in_region(table, DataFrame(geometry = []))
+        @test_throws ArgumentError grid_cells_in_region(table, _cp_region(-170.0, 45.0, 170.0, 46.0))
+    end
+
+    @testset "derive_climate_parameters" begin
+        # Four cells spanning 1000-2500 m with a range of glacier fractions, one populated
+        # hypsometry band each, inside one square region.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0,  bands = [(1050, 10.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5,  bands = [(1550, 10.0)]),
+                 (lon = 10.2, lat = 46.0, z = 2000.0, glm = 1.0,  bands = [(2050, 10.0)]),
+                 (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.25, bands = [(2550, 10.0)])]
+        table = _cp_table(cells)
+        region = _cp_region(9.5, 45.5, 10.5, 46.5)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+
+        k_true = 0.7
+        gamma_true = 5.0        # K/km, ambient
+        # Ambient temperature at sea level, high enough that every cell stays above melting: the
+        # estimator assumes the ambient excess is linear in elevation, and it is only linear while
+        # no cell clips at the melting point.
+        t0 = 292.0
+        ambient(c) = t0 - gamma_true * c.z / 1000.0
+        # The decoupling ERA5-Land has *already* applied: a glm=1 cell it runs as ice is fully
+        # decoupled, a glm=0 cell it runs as bare ground is left ambient.
+        function observed(c)
+            a = ambient(c)
+            k_applied = 1 - c.glm * (1 - k_true)
+            return fill(a + (k_applied - 1) * max(a - 273.15, 0.0), length(_CP_TIME))
+        end
+
+        p = derive_climate_parameters(:synthetic, time_range, table, region;
+                                      token = nothing, cache_path = nothing,
+                                      forcing_loader = _cp_loader(cells, observed),
+                                      band_batch = 2)
+
+        @testset "decoupling factor" begin
+            # The forward model is inverted exactly, so the fit recovers the truth to roundoff.
+            @test p.decoupling.scalar ≈ k_true atol = 1e-9
+            @test all(k -> isapprox(k, k_true, atol = 1e-9), p.decoupling.native)
+            @test all(≈(1.0), filter(!isnan, p.decoupling.r2))
+            @test all(p.decoupling.fitted)
+            @test p.decoupling.n_cells == fill(4, length(p.time))
+            # The monthly climatology covers all 12 months even though the record is one January
+            # day; unfitted months fall back to the identity.
+            @test length(p.decoupling.monthly) == 12
+            @test p.decoupling.monthly[1] ≈ k_true atol = 1e-9
+            @test all(≈(1.0), p.decoupling.monthly[2:12])
+        end
+
+        @testset "lapse rate" begin
+            # The ON-GLACIER lapse rate, which is not the ambient one. Above melting the decoupling
+            # maps T -> 273.15 + k(T - 273.15), so it compresses the profile and the on-glacier
+            # slope is k*Γ.
+            @test p.lapse_rate.scalar ≈ k_true * gamma_true atol = 1e-8
+            @test all(g -> isapprox(g, k_true * gamma_true, atol = 1e-8), p.lapse_rate.native)
+            @test all(p.lapse_rate.fitted)
+            # Elevation spread is the fit diagnostic: the population sd of 1000..2500 m.
+            @test all(s -> isapprox(s, 559.0169943749474, atol = 1e-9),
+                      p.lapse_rate.elevation_spread)
+            @test p.lapse_rate.monthly[1] ≈ k_true * gamma_true atol = 1e-8
+            @test all(≈(6.5), p.lapse_rate.monthly[2:12])
+        end
+
+        @testset "band forcing" begin
+            bands = collect(p.band_forcing)
+            @test length(bands) == length(p.band_forcing) == 4
+            # Bands ascend, and each is centered on its bin.
+            @test [b.center for b in bands] == [1050.0, 1550.0, 2050.0, 2550.0]
+            @test [b.lo for b in bands] == [1000, 1500, 2000, 2500]
+            @test [b.n_cells for b in bands] == [1, 1, 1, 1]
+
+            # Area conservation: no glacier area is dropped or double-counted.
+            @test sum(b.area for b in bands) ≈
+                  sum(glacier_area_total(r) for r in eachrow(p.grid_cells))
+
+            for b in bands
+                # `metadata["elevation"] == center` is the contract `gemb_glacier_cell` enforces:
+                # the stack is already *at* the band, so `forcing_at_elevation(f, 0)` is identity.
+                @test DimensionalData.metadata(b.forcing)["elevation"] == b.center
+                @test forcing_is_complete(b.forcing)
+                @test issetequal(keys(b.forcing), GEMB_GlacierSims._FORCING_VARIABLES)
+                @test collect(dims(b.forcing, Ti)) == p.time
+                # Cell-specific metadata would be a lie on a regional average.
+                @test !haskey(DimensionalData.metadata(b.forcing), "latitude")
+                @test DimensionalData.metadata(b.forcing)["glacier_area"] == b.area
+                # Each band here sits 50 m above its own single contributing cell, so every band
+                # reports the same small extrapolation. Measured against the cells that actually
+                # feed the band, not the region's highest, so `band_batch` cannot change it.
+                @test DimensionalData.metadata(
+                    b.forcing)["extrapolation_above_reanalysis"] == 50.0
+            end
+
+            # Band temperature decreases with elevation.
+            @test issorted([mean(b.forcing[:temperature_air]) for b in bands], rev = true)
+
+            # Each band here draws on exactly one cell whose own elevation is 50 m below the band
+            # center, so the band temperature is that cell's forcing lapsed 50 m and then given the
+            # decoupling it still needs — a value that can be written out by hand.
+            for (b, c) in zip(bands, cells)
+                lapsed = observed(c)[1] - k_true * gamma_true * (b.center - c.z) / 1000.0
+                still_needed = 1 - (1 - k_true) * (1 - c.glm)
+                expected = lapsed + (still_needed - 1) * max(lapsed - 273.15, 0.0)
+                @test mean(b.forcing[:temperature_air]) ≈ expected atol = 1e-8
+                # Precipitation is area-averaged unadjusted: the downstream sweep solves for its
+                # correction factor, which is the whole point of producing this forcing.
+                @test all(≈(0.1), b.forcing[:precipitation])
+            end
+        end
+
+        @testset "laziness" begin
+            # `band_batch` trades passes over the warm cache against peak memory, and must not
+            # change the answer. `0` means one pass holding every band.
+            p0 = derive_climate_parameters(:synthetic, time_range, table, region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(cells, observed),
+                                           band_batch = 0)
+            b0, b2 = collect(p0.band_forcing), collect(p.band_forcing)
+            @test [x.center for x in b0] == [x.center for x in b2]
+            @test [x.area for x in b0] == [x.area for x in b2]
+            @test all(isequal(x.forcing[:temperature_air], y.forcing[:temperature_air])
+                      for (x, y) in zip(b0, b2))
+
+            # A counting loader proves the laziness is real rather than incidental.
+            loads = Ref(0)
+            counting = let inner = _cp_loader(cells, observed)
+                (args...; kwargs...) -> (loads[] += 1; inner(args...; kwargs...))
+            end
+            pc = derive_climate_parameters(:synthetic, time_range, table, region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = counting, band_batch = 2)
+            # The fit pass loads all 4 cells. No band has been requested yet, so nothing more.
+            @test loads[] == 4
+            first(pc.band_forcing)
+            # Asking for one band accumulates its whole batch, and no more than that. Each cell
+            # here holds ice in exactly one band, so a 2-band batch loads only the 2 cells that
+            # contribute to it — a cell with no area in the current bands is skipped *before* its
+            # forcing is fetched, which is what keeps a region of mostly-irrelevant cells cheap.
+            @test loads[] == 4 + 2
+            # Iteration is stateless, so a fresh pass re-accumulates from the first batch rather
+            # than resuming: two batches of two bands, two contributing cells each.
+            loads[] = 0
+            collect(pc.band_forcing)
+            @test loads[] == 2 * 2
+        end
+
+        @testset "provenance" begin
+            @test p.provenance["n_grid_cells_in_region"] == 4
+            @test p.provenance["n_grid_cells_used"] == 4
+            @test p.provenance["n_bands"] == 4
+            @test p.provenance["adjustment_order"] == "lapse_then_decouple"
+            # Area-weighted mean of equal-area cells at 1000..2500 m.
+            @test p.provenance["mean_elevation"] ≈ 1750.0
+        end
+
+        @testset "unusable cells" begin
+            # ERA5-Land is land-only, so a cell center can land on water and come back all-NaN.
+            # Those cells are skipped, not fatal — the sweep's `ForcingUnavailable` policy.
+            wet(c) = c.z == 1500.0 ? fill(NaN, length(_CP_TIME)) : observed(c)
+            pw = derive_climate_parameters(:synthetic, time_range, table, region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(cells, wet),
+                                           band_batch = 0)
+            @test nrow(pw.grid_cells) == 3
+            # It is the 1500 m cell that was dropped, not an arbitrary one.
+            @test 10.1 ∉ pw.grid_cells.longitude
+            @test pw.provenance["n_grid_cells_used"] == 3
+            # The dropped cell's band goes with it, so area still balances over what remains.
+            @test sum(b.area for b in pw.band_forcing) ≈
+                  sum(glacier_area_total(r) for r in eachrow(pw.grid_cells))
+
+            # Every cell unusable is an error, not an empty result.
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, _ -> fill(NaN, length(_CP_TIME))))
+
+            # A region containing no cells at all, likewise.
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, table, _cp_region(0.0, 0.0, 1.0, 1.0);
+                token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed))
+        end
+
+        @testset "degenerate fits fall back to no-ops" begin
+            # Four parameters need four cells, and the `glm x z` interaction needs spread in both
+            # regressors. Below that the timestep must get the bit-exact identity, never a garbage
+            # extrapolation — `k = 1` is a true no-op and 6.5 K/km is this package's default.
+            thin = cells[1:3]
+            pt = derive_climate_parameters(:synthetic, time_range, _cp_table(thin), region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(thin, observed))
+            @test all(==(1.0), pt.decoupling.native)
+            @test !any(pt.decoupling.fitted)
+            @test pt.decoupling.scalar == 1.0
+
+            # A region only marginally above melting cannot identify `k` either, and this is the
+            # case real forcing actually produces: `k` is a *ratio* of fitted excesses, so a small
+            # denominator fits noise and then pins at a clamp bound, which reads as a confident
+            # value. Found on real Alpine winter forcing, where a 0.1 K excess "fitted" k = 0.2.
+            # A ~0.2 K excess is below `_MIN_AMBIENT_EXCESS` and must get the identity instead.
+            marginal(c) = fill(273.35 - 0.05 * (c.z - 1000.0) / 1000.0, length(_CP_TIME))
+            pm = derive_climate_parameters(:synthetic, time_range, table, region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(cells, marginal))
+            @test all(==(1.0), pm.decoupling.native)
+            @test !any(pm.decoupling.fitted)
+            # The genuine melt-season case is well above the threshold and still fits.
+            @test all(p.decoupling.fitted)
+            @test !any(p.decoupling.clamped)
+
+            # All cells below melting: the warm excess is identically zero, so it carries no
+            # information about `k` at all. The lapse rate is still identifiable there, and with no
+            # decoupling to undo it is simply the ambient one.
+            frozen(c) = fill(250.0 - gamma_true * c.z / 1000.0, length(_CP_TIME))
+            pf = derive_climate_parameters(:synthetic, time_range, table, region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(cells, frozen))
+            @test all(==(1.0), pf.decoupling.native)
+            @test all(g -> isapprox(g, gamma_true, atol = 1e-8), pf.lapse_rate.native)
+
+            # Every cell at one elevation: no slope is identifiable however many cells there are.
+            flat = [(; c..., z = 1500.0) for c in cells]
+            pl = derive_climate_parameters(:synthetic, time_range, _cp_table(flat), region;
+                                           token = nothing, cache_path = nothing,
+                                           forcing_loader = _cp_loader(flat, observed))
+            @test all(==(6.5), pl.lapse_rate.native)
+            @test !any(pl.lapse_rate.fitted)
+            @test all(isnan, pl.lapse_rate.elevation_spread)
+        end
+
+        @testset "fitted factor is clamped" begin
+            # A fitted factor outside `decoupling_factor_bounds` is clamped, not passed through:
+            # `climate_adjust_for_glacier` requires (0, 1], and a thin or noisy sample can fit
+            # outside it. Here the glaciated cells are *warmer* than ambient, which implies k > 1.
+            function inverted(c)
+                a = ambient(c)
+                return fill(a + c.glm * 0.5 * max(a - 273.15, 0.0), length(_CP_TIME))
+            end
+            pi_ = derive_climate_parameters(:synthetic, time_range, table, region;
+                                            token = nothing, cache_path = nothing,
+                                            forcing_loader = _cp_loader(cells, inverted))
+            @test all(==(1.0), pi_.decoupling.native)
+
+            # A tighter upper bound bites on the recovered 0.7, and says so: a clamped value is
+            # otherwise indistinguishable from a confident one in `native`, which is exactly how a
+            # bogus seasonal cycle reached `monthly` on real forcing.
+            pb = @test_logs (:warn, r"clamp bounds") match_mode = :any derive_climate_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed),
+                decoupling_factor_bounds = (0.8, 1.0))
+            @test all(==(0.8), pb.decoupling.native)
+            @test all(pb.decoupling.clamped)
+
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed),
+                decoupling_factor_bounds = (0.5, 1.5))
+        end
+
+        @testset "argument validation" begin
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed), band_batch = -1)
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed), min_cells = 1)
+
+            # The `:glm` column is what the decoupling fit regresses against, so a table built
+            # before the current invariant column naming must fail loudly.
+            stale = select(table, Not(:glm))
+            stale.glm_frac = [c.glm for c in cells]
+            @test_throws ArgumentError derive_climate_parameters(
+                :synthetic, time_range, stale, region; token = nothing, cache_path = nothing,
+                forcing_loader = _cp_loader(cells, observed))
+        end
     end
 
     # Note: end-to-end simulation tests need CDS API credentials and network access to the
