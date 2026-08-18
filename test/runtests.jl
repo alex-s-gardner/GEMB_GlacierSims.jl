@@ -7,6 +7,7 @@ using DimensionalData
 using Statistics
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
+using GEMB_ClimateForcing: climate_adjust_for_elevation
 using NCDatasets
 
 # One-row glacier elevation-class table from bin-center => area (km²) pairs, using the same
@@ -303,6 +304,47 @@ end
         @test_throws ArgumentError glacier_hypsometry_coverage(_hyps_row(1000 => 1.0); coverage = 1.5)
     end
 
+    @testset "glacier_area_total and glacier_area_column" begin
+        df = DataFrame(
+            Symbol(only(GEMB_GlacierSims._hyps_colnames([1000, 1100]))) => [10.0, 1.0, 0.0],
+            Symbol(only(GEMB_GlacierSims._hyps_colnames([1100, 1200]))) => [8.0, 2.0, 0.0],
+            # A non-hypsometry column must not be summed into a cell's glacier area, which is why
+            # the sum tests column names through `_parse_hyps_colname` rather than a `hyps_` prefix.
+            :glm => [0.4, 0.6, 0.1])
+
+        # The column form and the row form agree — they are the same screen at two granularities,
+        # so a table screened one way and a cell checked the other cannot disagree.
+        @test glacier_area_column(df) == [18.0, 3.0, 0.0]
+        @test [glacier_area_total(r) for r in eachrow(df)] == [18.0, 3.0, 0.0]
+
+        # With the total cached as a column, both read it instead of summing. This is the point of
+        # the column: the screen becomes a scalar read per row rather than a 100-column sum.
+        cached = copy(df)
+        cached[!, GEMB_GlacierSims.GLACIER_AREA_COLUMN] = [18.0, 3.0, 0.0]
+        @test glacier_area_column(cached) == [18.0, 3.0, 0.0]
+        @test [glacier_area_total(r) for r in eachrow(cached)] == [18.0, 3.0, 0.0]
+
+        # The cached column is authoritative when present, not merely consistent with the bins —
+        # that is what makes it a fast path rather than a redundant check. A table whose cache
+        # disagrees returns the cache, so the migration verifies the values it writes.
+        stale = copy(df)
+        stale[!, GEMB_GlacierSims.GLACIER_AREA_COLUMN] = [99.0, 99.0, 99.0]
+        @test glacier_area_column(stale) == [99.0, 99.0, 99.0]
+        @test glacier_area_total(first(eachrow(stale))) == 99.0
+
+        # A view screens against its own rows, so `grid_cells_in_region`'s column-wise area screen
+        # composes with an already-filtered table.
+        sub = view(df, [2, 1], :)
+        @test glacier_area_column(sub) == [3.0, 18.0]
+
+        # An Int column (a table built with integer areas) still returns Float64, so the screen
+        # comparison and the stored NetCDF weights are the same type either way.
+        ints = DataFrame(Symbol(only(GEMB_GlacierSims._hyps_colnames([1000, 1100]))) => [3, 4])
+        @test glacier_area_column(ints) == [3.0, 4.0]
+        @test glacier_area_column(ints) isa Vector{Float64}
+        @test glacier_area_total(first(eachrow(ints))) === 3.0
+    end
+
     @testset "forcing_is_complete" begin
         # ERA5-Land is land-only, so a cell whose grid point falls on water comes back all-NaN
         # with a NaN reference elevation. `gemb_glacier_cell` must reject that before GEMB
@@ -345,7 +387,34 @@ end
         @test p["model_albedo_ice"] == mp.albedo_ice
         @test p["model_densification_method"] === mp.densification_method
         @test !haskey(p, "model_dt_divisors")
-        @test length(p) == length(propertynames(mp)) - 1 + 3
+        for field in GEMB.DERIVED_PARAMETERS
+            @test !haskey(p, "model_" * string(field))
+        end
+        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3
+
+        # A monthly cycle is stored as the 12-element vector, not flattened to a scalar or a
+        # string: NetCDF holds a numeric attribute vector natively, so the restart check compares
+        # it elementwise. Given as `Int`s it must land as the same parameter as the float form,
+        # or a cycle written one way and requested the other reads as a parameter change.
+        monthly = round.(6.5 .+ 0.5 .* sin.(2π .* (1:12) ./ 12), digits = 3)
+        pm = run_parameters(mp; coverage = 0.95, lapse_rate = monthly)
+        @test pm["temperature_lapse_rate"] == monthly
+        @test run_parameters(mp; coverage = 0.95,
+                             lapse_rate = collect(1:12))["temperature_lapse_rate"] ==
+              collect(Float64, 1:12)
+
+        # A per-timestep rate is refused at the point the caller can act on it. Its length tracks
+        # the forcing record, so it could not be recorded as a parameter a continuation matches —
+        # every append would read as a parameter change with no way to store it that does not.
+        err = try
+            run_parameters(mp; coverage = 0.95, lapse_rate = fill(6.5, 100))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("12-element monthly", err.msg)
+        @test occursin("continuation", err.msg)
 
         # No decoupling is recorded as the identity, not as an absent key, so switching the
         # correction on or off is a visible parameter change on restart.
@@ -382,6 +451,25 @@ end
                                                              "model_densification_method" => :Ligtenberg))
         @test d["model_albedo_ice"] == (0.48, 0.40)
         @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
+
+        # A monthly lapse-rate cycle compares elementwise, so a stored integer cycle matches the
+        # float form and a single changed month is a disagreement. Without vector encoding these
+        # would compare by print formatting, where `Any[...]` and `Float64[...]` differ while the
+        # values do not.
+        cycle = collect(Float64, 1:12)
+        @test isempty(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => cycle),
+            Dict{String,Any}("temperature_lapse_rate" => collect(1:12))))
+        changed = copy(cycle); changed[7] = 9.0
+        @test haskey(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => cycle),
+            Dict{String,Any}("temperature_lapse_rate" => changed)), "temperature_lapse_rate")
+
+        # A scalar and a monthly cycle are different configurations even when every month equals
+        # the scalar — one is a request for a constant rate, the other for a seasonal one.
+        @test haskey(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => 6.5),
+            Dict{String,Any}("temperature_lapse_rate" => fill(6.5, 12))), "temperature_lapse_rate")
     end
 
     @testset "read_glacier_cell_status" begin
@@ -431,6 +519,22 @@ end
         @test stored["model_shortwave_subsurface_absorption"] == "false"
         @test read_glacier_cell_parameters(joinpath(dir, "absent.nc")) === nothing
 
+        # A monthly lapse-rate cycle survives the file as numbers, so the restart check compares
+        # it to the requested cycle elementwise. This is the round trip the in-memory
+        # `run_parameter_differences` tests assume: without it the cycle would come back
+        # stringified and every continuation would read as a parameter change.
+        cycle_path = joinpath(dir, "cycle.nc")
+        cycle = round.(6.5 .+ 0.5 .* sin.(2π .* (1:12) ./ 12), digits = 3)
+        cycle_params = run_parameters(initialize_parameters(); coverage = 0.95,
+                                     lapse_rate = cycle)
+        write_glacier_cell_netcdf(cycle_path,
+                                  _fake_run(; time = t1, kw..., parameters = cycle_params))
+        cycle_restart = read_glacier_cell_restart(cycle_path)
+        @test cycle_restart.parameters["temperature_lapse_rate"] == cycle
+        @test isempty(run_parameter_differences(cycle_restart.parameters, cycle_params))
+        @test GEMB_GlacierSims._validate_restart_parameters(
+            cycle_restart, cycle_params; force_restart = false) === nothing
+
         restart = read_glacier_cell_restart(path)
         @test restart.parameters["model_albedo_ice"] == 0.48
 
@@ -476,9 +580,10 @@ end
 
     @testset "PROFILE_VARIABLES is the complete GEMB state" begin
         # The roster is what the restart group stores, so a layer missing from it is silently
-        # dropped on write and then a bare `FieldError` inside `gemb` on continuation. Pin it
-        # against a real initialized profile rather than a hand-copied list, so a state layer
-        # added in GEMB.jl fails here instead of at the first restart months later.
+        # dropped on write and then rejected inside `gemb` on continuation. It is an alias of
+        # `GEMB.RESTART_LAYERS`, and this pins that alias against a real initialized profile —
+        # so the assertion still fails here if GEMB's constant and GEMB's state diverge, rather
+        # than at the first restart months later.
         n = 10
         t = collect(DateTime(2000, 1, 1):Day(1):DateTime(2000, 1, n))
         cf = GEMB.initialize_forcing(t, fill(250.0, n), fill(85000.0, n), fill(3.0, n),
@@ -619,7 +724,93 @@ end
             end
         end
 
+        # The spinup a column descends from comes back on the profile's *stack* metadata, which is
+        # where `gemb` reads provenance from. Without it a continuation would report
+        # `spinup_performed => false` and no climatology window, and the appended file would claim
+        # a record that was spun up never was.
+        for key in [(1, 1, 1), (2, 2, 1)]
+            pm = DimensionalData.metadata(restart.profiles[key])
+            @test pm["spinup_cycles"] == 37
+            @test pm["climatology_window_start"] == "1950-01-01T00:00:00"
+            # Encoded form, matching the file — re-encoding it is idempotent, so the window a
+            # record was spun up on reads identically however many times it is appended to.
+            @test pm["spinup_converged"] == "false"
+            # Only provenance is restored: the run parameters are checked separately and a
+            # `latitude` on the profile would be a claim `gemb` does not make about a column.
+            @test !haskey(pm, "hypsometry_coverage")
+            @test !haskey(pm, "latitude")
+        end
+
+        # And it survives a second hop: provenance read off a file and re-attached to a profile is
+        # what `gemb` copies onto the next output, which the appender then writes back.
+        @test GEMB_GlacierSims._stack_provenance(first(values(restart.profiles)))["spinup_cycles"] == 37
+
+        # The file-level provenance is returned alongside the profiles, because the climatology
+        # window is needed exactly when a bin has *no* profile to read it from.
+        @test restart.provenance["climatology_window_start"] == "1950-01-01T00:00:00"
+
         @test read_glacier_cell_restart(joinpath(dir, "absent.nc")) === nothing
+    end
+
+    @testset "spinup window inheritance" begin
+        # A cold start derives the window from the record: the first 30 complete years.
+        t = collect(DateTime(1960, 1, 1):Day(1):DateTime(1994, 12, 31))
+        cold = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test GEMB_GlacierSims._default_spinup_window(cold) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # A continuation inherits the window its record was spun up on, parsed back from the
+        # strings NetCDF stored (it has no date attribute type). This is the whole point: a
+        # restart does not re-spin up, so a fallback bin must use the file's climatology rather
+        # than the continuation's own few years of fetched forcing.
+        saved = (; provenance = Dict{String,Any}(
+            "climatology_window_start" => "1960-01-01T00:00:00",
+            "climatology_window_stop" => "1989-12-31T00:00:00"))
+        @test GEMB_GlacierSims._restart_spinup_window(saved) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # Read from the restart, not from a saved profile — on a single-bin cell the fallback case
+        # is also the case where `profiles` is empty, so a profile-sourced window would vanish
+        # precisely when it is needed.
+        @test GEMB_GlacierSims._restart_spinup_window(
+            (; saved..., profiles = Dict{Tuple{Int,Int,Int},DimStack}())) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # A file predating provenance, or one whose window will not parse, yields `nothing` so the
+        # caller derives a window instead of failing.
+        @test GEMB_GlacierSims._restart_spinup_window((; provenance = Dict{String,Any}())) === nothing
+        @test GEMB_GlacierSims._restart_spinup_window((; parameters = Dict{String,Any}())) === nothing
+        @test GEMB_GlacierSims._restart_spinup_window((; provenance = Dict{String,Any}(
+            "climatology_window_start" => "not a date",
+            "climatology_window_stop" => "1989-12-31T00:00:00"))) === nothing
+    end
+
+    @testset "SpinupWindowUnavailable" begin
+        # A window whose years were never fetched must say so. Silently averaging whatever the
+        # window does select would spin one bin up on a different climate than the rest of the
+        # record — the failure this exception exists to make visible.
+        t = collect(DateTime(1995, 1, 1):Day(1):DateTime(1999, 12, 31))
+        cf = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        window = (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+        err = try
+            GEMB_GlacierSims._spinup_climatology(cf, window)
+            nothing
+        catch e
+            e
+        end
+        @test err isa SpinupWindowUnavailable
+        @test err.window == window
+        @test err.n_selected == 0
+        @test err.extent == (first(t), last(t))
+        # The message names the window to fetch, since that is the remedy.
+        @test occursin("1960-01-01T00:00:00", sprint(showerror, err))
+
+        # A partial year is refused too, and this is why the test is a span rather than a count:
+        # `forcing_climatology` calls whichever years hold the most steps "complete", so six
+        # months of daily data would average into a 182-step "climatological year" without
+        # complaint.
+        partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
+        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial)
     end
 
     @testset "NetCDF append" begin
@@ -671,6 +862,24 @@ end
         # `scripts/check_threaded_equivalence.jl` asserts, bit-for-bit, on a real cell.
         m = only(methods(gemb_glacier_cell))
         @test :threaded in Base.kwarg_decl(m)
+    end
+
+    @testset "monthly lapse rate reaches the forcing" begin
+        # `gemb_glacier_cell` forwards `lapse_rate` to `forcing_at_elevation` untouched, so a
+        # monthly cycle must lapse each step by its own month's rate. Checked on the forcing
+        # rather than through a run — the latter needs real GEMB, so network — and against a
+        # January-only fixture, where the cycle's first entry is the only one that applies.
+        f = _cp_forcing(45.0, 7.0, 1000.0, fill(260.0, 6))
+        cycle = collect(Float64, 1:12)
+        raise(lr) = climate_adjust_for_elevation(f, 500.0; lapse_rate = lr)
+        @test all(≈(260.0 - cycle[1] * 0.5), raise(cycle)[:temperature_air])
+
+        # And the scalar path is unchanged: a constant cycle equals the scalar of that value.
+        @test raise(fill(6.5, 12))[:temperature_air] == raise(6.5)[:temperature_air]
+
+        # The signature no longer pins `lapse_rate` to a scalar, which is what let the monthly
+        # form through in the first place.
+        @test :lapse_rate in Base.kwarg_decl(only(methods(gemb_glacier_cell)))
     end
 
     @testset "grid_cells_in_region" begin

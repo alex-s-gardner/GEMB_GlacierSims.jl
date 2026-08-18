@@ -48,7 +48,9 @@ Keywords:
 Returns the glacier-points DataFrame with columns `:chunk_id`, `:glacier_frac`, one column per
 `invariant_parameters` layer, `:geometry` (Point, EPSG:4326), and one scalar `Float64` column per
 elevation bin named `hyps_<lo>_<hi>` (m edges, zero-padded to 5 digits; the glacier area in km² for
-that bin). The `:index` column is removed. The binning is recoverable from the `hyps_*` column
+that bin). A `:glacier_area_km2` column carries each cell's total over those bins, so screening a
+table by area is a scalar read per row rather than a 100-column sum ([`glacier_area_total`](@ref)).
+The `:index` column is removed. The binning is recoverable from the `hyps_*` column
 names; the edges are also set as `"hypsometry_bin_edges"` table metadata (not persisted by GeoParquet).
 """
 function gemb_glacier_elevation_class_runfile(
@@ -129,6 +131,11 @@ function gemb_glacier_elevation_class_runfile(
     for (b, name) in enumerate(_hyps_colnames(bin_edges))
         glacier_points[!, name] = H[:, b]
     end
+    # The per-cell total, cached as its own column. Screening a global table for a minimum area is
+    # one pass over ~47,000 rows, and reading a scalar per row rather than summing 100 columns is
+    # the difference between ~1.8 s and ~2 ms (`glacier_area_total`). Summed over the results
+    # matrix in bin order so the value matches `glacier_area_column`'s column-order sum exactly.
+    glacier_points[!, GLACIER_AREA_COLUMN] = vec(sum(H; dims = 2))
     # Column names (hyps_<lo>_<hi>) are the authoritative record of the binning. GeoParquet only
     # serializes geo metadata, so this table metadata is convenience for the in-memory table and
     # will NOT survive a write/read round-trip — recover the edges from the column names instead.
@@ -207,6 +214,11 @@ function hypsometry_bin_edges(df)
     return Int[bins[1][1]; last.(bins)]
 end
 
+# One decoded hypsometry bin: elevation edges (m), bin-center elevation (m), glacier area (km²).
+# Named once so `glacier_hypsometry`'s accumulator and `GlacierCellRun.bins` — the struct that stores
+# what this decoder returned — cannot spell the same type differently.
+const HypsometryBin = @NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}
+
 """
     glacier_hypsometry(row; area_minimum = 0)
 
@@ -219,7 +231,7 @@ This replaces hand-parsing the `hyps_<lo>_<hi>` column names downstream; the bin
 lives here alongside the encoder ([`gemb_glacier_elevation_class_runfile`](@ref)).
 """
 function glacier_hypsometry(row; area_minimum = 0)
-    out = @NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}[]
+    out = HypsometryBin[]
     for name in propertynames(row)
         edges = _parse_hyps_colname(name)
         edges === nothing && continue

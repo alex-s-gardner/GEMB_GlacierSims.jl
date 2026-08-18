@@ -36,7 +36,9 @@ begin
     # Temperature lapse rate (K km-1) for the per-bin elevation adjustment. Stated here rather
     # than left to `gemb_glacier_cell`'s default because the up-front check below has to build the
     # same `run_parameters` the run will, and a default that differs between the two would report
-    # every existing cell as a parameter change.
+    # every existing cell as a parameter change. A 12-element January-to-December cycle works in
+    # place of the scalar — `derive_lapse_rate` produces one for a region — and is stored and
+    # compared as a cycle.
     lapse_rate = 6.5
 
     # Correct the ambient reanalysis air temperature to on-glacier conditions with the Shaw et al.
@@ -157,10 +159,13 @@ mp = initialize_parameters(output_frequency = :daily);
 # with the unmodeled remainder folded into the nearest modeled bin so no area is dropped) happens
 # inside `gemb_glacier_cell`, so the ~47,000-cell screen does not pay for it.
 begin
-    # `view = true` keeps this a SubDataFrame over the cached table rather than copying the
-    # ~47,000 rows (and their hyps_* columns) into a second frame.
-    qualifying_cells = filter(r -> glacier_area_total(r) >= cell_area_minimum,
-                              glacier_elevation_classes; view = true)
+    # Screened as a column, not row by row: `glacier_area_column` reads the table's precomputed
+    # total (or sums the per-bin columns as columns), which on the global table is ~40 ms against
+    # the ~1.8 s a per-row `filter` costs. The `view` keeps this a SubDataFrame over the cached
+    # table rather than copying the ~47,000 rows (and their hyps_* columns) into a second frame.
+    qualifying_cells = view(glacier_elevation_classes,
+                            glacier_area_column(glacier_elevation_classes) .>= cell_area_minimum,
+                            :)
     # `view = true` again, so truncating the selection does not materialize the rows either.
     if !(cell_limit === nothing || isinf(cell_limit))
         qualifying_cells = first(qualifying_cells, Int(cell_limit); view = true)
@@ -356,6 +361,10 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # so it would fail identically for every remaining cell. Abort rather than log it
         # thousands of times; the message says how to proceed deliberately.
         e isa RestartParameterMismatch && rethrow()
+        # Likewise a spinup window this sweep's fetch cannot cover: it is set by `restart_overlap`
+        # and the requested `forcing_time_range` above, not by the cell, so every cell with a
+        # fallback bin fails the same way. The message says which window to fetch.
+        e isa SpinupWindowUnavailable && rethrow()
         # Same reasoning for a broken driver: a typo, an undefined name, or a stale session whose
         # loaded GEMB_GlacierSims predates a function used above is a property of the script, not
         # of the cell. Swallowed per cell it turns into thousands of identical "Cell failed"

@@ -1,3 +1,7 @@
+# Default temperature lapse rate (K/km) for this package's elevation adjustments. Defined once so the
+# per-bin adjustment, the sweep driver, and the interval aggregation's gap fill cannot drift apart.
+const _DEFAULT_LAPSE_RATE = 6.5
+
 """
     era5_land_invariant(; parameter=nothing, to=nothing)
 
@@ -32,8 +36,8 @@ Zarr grid — so keep 180.0 as 180.0 and only wrap longitudes strictly greater t
 wrap_lon(lon) = lon > 180 ? lon - 360 : lon
 
 """
-    forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=6.5, precip_scaling_method=nothing,
-                         decoupling_factor=nothing)
+    forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=$(_DEFAULT_LAPSE_RATE),
+                         precip_scaling_method=nothing, decoupling_factor=nothing)
 
 Lapse-rate-adjust `forcing_data` by `delta_elevation` metres and convert it to a GEMB
 `ClimateForcing`, ready to hand to `initialize_profile` / `gemb`.
@@ -53,7 +57,7 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
   requires, since `k` scales an ambient temperature already at the glacier's elevation.
   `nothing` (the default) leaves the forcing ambient.
 """
-function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=6.5,
+function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
                               precip_scaling_method=nothing, decoupling_factor=nothing)
     adjusted = climate_adjust_for_elevation(forcing_data, delta_elevation;
                                             lapse_rate, precip_scaling_method)
@@ -70,3 +74,35 @@ function _rewrap_era5_lon(ras, to)
     ras  = ras[X(sortperm(lonw))]       # physically sort X ascending
     return to === nothing ? ras : reorder(ras, to)   # match `to`'s X/Y direction
 end
+
+# `glm` — the ERA5-Land glacier-mask fraction of a grid cell — as a finite fraction in [0, 1].
+#
+# The column is required: a table missing it cannot support the decoupling factor at all, whether
+# that factor is looked up per cell or regressed across a region, so its absence is schema drift
+# and throws. `missing`/`NaN` are the different case of a real data gap, and fall back to 0.0 —
+# the uncorrected reanalysis assumption of a cell with no glacier.
+function _row_glm(row)
+    hasproperty(row, :glm) || throw(ArgumentError(
+        "glacier elevation-class row has no `:glm` column, which the glacier decoupling factor " *
+        "is weighted by (per cell) and regressed against (per region). A table built before the " *
+        "current invariant column naming carries `:glm_frac`; run " *
+        "`scripts/migrate_invariant_colnames.jl` to rename it in place."))
+    v = row.glm
+    v === missing && return 0.0
+    g = Float64(v)
+    return isfinite(g) ? clamp(g, 0.0, 1.0) : 0.0
+end
+
+# The share of a published decoupling factor `k` a cell still needs, given the ERA5-Land glacier-mask
+# fraction `glm` its land-surface scheme has already accounted for:
+#
+#     k_eff = 1 - (1 - k) * (1 - glm)
+#
+# The full correction where the cell carries no glacier (`glm = 0`) and the identity where it is
+# entirely glacier (`glm = 1`). Defined once because this is the package's single convention for
+# that weighting, applied both per cell ([`cell_decoupling_factor`](@ref), one scalar `k` from the
+# published table) and per elevation interval (`derive_decoupling_factor`, a fitted `k` per
+# timestep) — and it is the same weighting `derive_lapse_rate` folds into its regression sums to
+# undo. Two independent spellings would let those paths disagree about the same cell's forcing
+# while both stayed finite and in-domain, so the drift would be invisible.
+_effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)

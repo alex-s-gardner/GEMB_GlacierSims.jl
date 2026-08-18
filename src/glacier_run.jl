@@ -20,14 +20,12 @@ const CELL_MASS_VARIABLES = (:melt, :runoff, :refreeze, :evaporation_condensatio
 # boundary; `evaporation_condensation` is positive for mass gain.
 const CELL_MASS_CHANGE_FORMULA = "precipitation - runoff + evaporation_condensation"
 
-# The layers that constitute a complete GEMB restart state (`gemb` reads exactly these,
-# `GEMB.jl/src/gemb_driver.jl`). Every one is required: `gemb` indexes them by name off the
-# profile, so a missing layer is a `FieldError` on the first timestep, not a silent default.
-# `age` is part of the state even though no physics reads it — it is the column's only clock,
-# and dropping it from the round-trip would restart every continuation's age at whatever the
-# saved column happened to hold.
-const PROFILE_VARIABLES = (:dz, :temperature, :density, :water, :grain_radius,
-                          :grain_dendricity, :grain_sphericity, :age)
+# The layers that constitute a complete GEMB restart state. Aliased from `GEMB.RESTART_LAYERS`
+# rather than listed here, because GEMB is the only place that can honestly own the list: it is
+# what `gemb` reads off a profile, and a copy here could not detect the case that matters — a
+# layer added to GEMB's state would leave this list stale in exactly the same way as an old
+# restart file, and the check in `read_glacier_cell_restart` would pass.
+const PROFILE_VARIABLES = GEMB.RESTART_LAYERS
 
 # Everything carried as a per-cell total: the area-weighted fluxes plus the budget assembled
 # from them. Keys of `GlacierCellRun.totals` and the mass variables in the NetCDF output.
@@ -46,28 +44,51 @@ The settings that define *how* a cell is run, as NetCDF global attributes.
 These are exactly the values that must be identical for a continuation to be a continuation
 rather than a different experiment spliced onto an old record, so they are what
 [`gemb_glacier_cell`](@ref) checks a restart against. Every `ModelParameters` field is included,
-prefixed `model_`, except `dt_divisors`, which `gemb` computes from the forcing timestep and
-overwrites whatever it is handed (`GEMB.jl/src/gemb_driver.jl` excludes it for the same reason).
+prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gemb` computes from
+the forcing and overwrites whatever it is handed, so they say nothing about how a run was
+configured and would compare unequal for reasons the caller never chose.
 
-Deliberately *excluded* are the things expected to differ between an original run and its
-continuation: the output time axis, the `spinup_*`/`climatology_*` provenance (a resumed run
-performs no spinup at all, and a longer forcing record shifts the climatology window), `history`,
-and the `institution`/`references` labels.
+Deliberately *excluded* is everything that is not a setting: the output time axis, `history`, the
+`institution`/`references` labels, and the `spinup_*`/`climatology_*` provenance — which describes
+where the record came from rather than how it was configured, and is carried across a restart
+unchanged (see [`GlacierCellRun`](@ref)) rather than recomputed for the continuation.
+
+`lapse_rate` is a scalar or a 12-element monthly vector, and is stored in whichever form it was
+given — see [`gemb_glacier_cell`](@ref) for why the per-timestep form `climate_adjust_for_elevation`
+also accepts is not one of them.
 """
-function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real,
+function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
                         decoupling_factor = nothing)
     params = Dict{String,Any}("hypsometry_coverage" => Float64(coverage),
-                              "temperature_lapse_rate" => Float64(lapse_rate),
+                              "temperature_lapse_rate" => _lapse_rate_parameter(lapse_rate),
                               # 1.0 (the identity) rather than an absent key when no correction
                               # was applied, so switching the correction on or off is visible as
                               # a parameter change on restart rather than an unverifiable gap.
                               "glacier_decoupling_factor" =>
                                   decoupling_factor === nothing ? 1.0 : Float64(decoupling_factor))
     for field in propertynames(mp)
-        field === :dt_divisors && continue
+        field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
     end
     return params
+end
+
+# The stored form of the lapse rate. A scalar stays a scalar and a monthly cycle stays a
+# 12-element vector, both of which NetCDF holds natively and compares exactly on restart.
+#
+# A per-timestep vector is refused rather than stored: it has one entry per forcing step, so a
+# continuation over an extended record necessarily supplies a longer one, and the restart check
+# would read every append as a parameter change. There is no way to store it that fixes that —
+# the value genuinely differs — so the limit is stated here, where the caller can act on it,
+# rather than surfacing as an unexplained `RestartParameterMismatch` on the first append.
+function _lapse_rate_parameter(lapse_rate)
+    lapse_rate isa Real && return Float64(lapse_rate)
+    length(lapse_rate) == 12 && return collect(Float64, lapse_rate)
+    throw(ArgumentError("lapse_rate must be a scalar or a 12-element monthly vector (got " *
+                        "length $(length(lapse_rate))). The per-timestep form " *
+                        "`climate_adjust_for_elevation` also accepts cannot be recorded as a " *
+                        "run parameter: its length tracks the forcing record, so every " *
+                        "continuation would compare unequal to the file it extends."))
 end
 
 """
@@ -92,7 +113,10 @@ totals over the full perturbation grid, plus the per-run final firn profiles for
   written as global attributes and checked against on restart. Includes `hypsometry_coverage`,
   `temperature_lapse_rate` and `glacier_decoupling_factor`.
 - `provenance`: the `spinup_*`/`climatology_*` keys `gemb` attached to the output. Recorded but
-  *not* checked on restart — a resumed run performs no spinup, so these are expected to differ.
+  *not* checked on restart, because it describes the record's origin rather than its
+  configuration. It is *carried* across a restart: `read_glacier_cell_restart` restores the saved
+  provenance onto each profile, so a continuation reports the spinup it actually inherited rather
+  than none at all.
 """
 struct GlacierCellRun
     latitude::Float64
@@ -103,7 +127,7 @@ struct GlacierCellRun
     glacier_frac::Union{Float64,Missing}
     delta_temperatures::Vector{Float64}
     precipitation_scalings::Vector{Float64}
-    bins::Vector{@NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}}
+    bins::Vector{HypsometryBin}
     weights::Vector{Float64}
     time::Vector{DateTime}
     totals::Dict{Symbol,Array{Float64,3}}
@@ -112,22 +136,63 @@ struct GlacierCellRun
     provenance::Dict{String,Any}
 end
 
+# The column a glacier elevation-class table stores its per-cell total in. Written by
+# `gemb_glacier_elevation_class_runfile` alongside the per-bin columns it is the sum of, so it is a
+# cache rather than a new fact — see `glacier_area_total` for why a cache is worth the column.
+const GLACIER_AREA_COLUMN = :glacier_area_km2
+
 """
     glacier_area_total(row) -> Float64
 
 Total glacier area (km²) in a glacier elevation-class `row`, summed over every hypsometry bin.
 
-This is the cheap way to screen cells for a minimum area: it sums the flat `hyps_*` columns
-directly, skipping the bin decoding, sorting and nearest-bin reassignment that
-[`glacier_hypsometry_coverage`](@ref) does. Screening a global table is ~47,000 calls, so the
-difference is worth having.
+This is the cheap way to screen cells for a minimum area: it skips the bin sorting, `NamedTuple`
+construction and nearest-bin reassignment that [`glacier_hypsometry_coverage`](@ref) does.
+
+A table carrying the precomputed `$(GLACIER_AREA_COLUMN)` column is read from it directly; one
+without falls back to summing the row's 100 `hyps_*` columns. The fallback is what makes a table
+written before the column existed still work, and the two agree by construction —
+`gemb_glacier_elevation_class_runfile` writes the column as exactly that sum.
 """
 glacier_area_total(row) =
-    sum(Float64(row[c]) for c in _hyps_colnames_in(row); init = 0.0)
+    hasproperty(row, GLACIER_AREA_COLUMN) ? Float64(row[GLACIER_AREA_COLUMN]) :
+    _sum_hypsometry_columns(row)
 
-# The `hyps_<lo>_<hi>` columns of a row, in whatever order the table carries them. Order does not
-# matter for a sum, so this skips parsing the edges out of the names.
-_hyps_colnames_in(row) = filter(c -> startswith(string(c), "hyps_"), propertynames(row))
+# Which columns are hypsometry columns comes from `_parse_hyps_colname`, the same decoder
+# `glacier_hypsometry` uses, so the naming contract lives in one place: a bare `hyps_` prefix test
+# would also sum a future non-hypsometry `hyps_*` column into a cell's glacier area. The parsed
+# edges are discarded — order does not matter for a sum — and the filtered generator keeps this
+# free of the per-row name vector the screen would otherwise allocate once per row.
+_sum_hypsometry_columns(row) =
+    sum(Float64(row[c]) for c in propertynames(row)
+        if _parse_hyps_colname(c) !== nothing; init = 0.0)
+
+"""
+    glacier_area_column(df) -> Vector{Float64}
+
+Total glacier area (km²) for every row of a glacier elevation-class table, as a column.
+
+This is what to screen a whole table with. Row-wise `glacier_area_total` is a per-row property
+lookup either way, and on the ~47,000-row global table the difference is ~1.8 s per sweep against
+~40 ms here: the per-bin columns are summed as columns, and a table carrying the precomputed
+`$(GLACIER_AREA_COLUMN)` returns it without summing at all.
+
+Both paths produce the same values `glacier_area_total` does row by row.
+"""
+function glacier_area_column(df)
+    hasproperty(df, GLACIER_AREA_COLUMN) &&
+        return convert(Vector{Float64}, df[!, GLACIER_AREA_COLUMN])
+
+    hyps = [c for c in propertynames(df) if _parse_hyps_colname(c) !== nothing]
+    total = zeros(Float64, nrow(df))
+    # Accumulated one whole column at a time rather than one row at a time. Summing in a fixed
+    # column order (rather than `propertynames` order per row) also makes the result independent of
+    # how the table's columns happen to be arranged, which floating-point addition otherwise is not.
+    for c in hyps
+        total .+= df[!, c]
+    end
+    return total
+end
 
 """
     glacier_hypsometry_coverage(row; coverage = 0.95)
@@ -215,31 +280,24 @@ cell in the sweep — so this throws instead. A table predating the current inva
 (`glm_frac`) is migrated in place by `scripts/migrate_invariant_colnames.jl`.
 """
 function cell_decoupling_factor(row; max_distance::Real = 10.0)
-    hasproperty(row, :glm) || throw(ArgumentError(
-        "glacier elevation-class row has no `:glm` column, so the decoupling factor cannot be " *
-        "weighted by the cell's non-glacier fraction. A table built before the current invariant " *
-        "column naming carries `:glm_frac`; run `scripts/migrate_invariant_colnames.jl` to " *
-        "rename it in place."))
+    # Throws when the column is absent, so schema drift is caught before the positional lookup.
+    glm = _row_glm(row)
 
     lon, lat = _cell_lonlat(row.geometry)
 
     # Positional lookups error rather than return a sentinel when nothing is close enough (or the
-    # RGI region is uncovered). No `k` is a run-on-ambient-forcing outcome, not a failure.
+    # RGI region is uncovered). No `k` is a run-on-ambient-forcing outcome, not a failure. The
+    # longitude goes in unwrapped: `glacier_decoupling` wraps it itself, and pre-wrapping would
+    # make this the second place that has to agree about the convention.
     found = try
-        glacier_decoupling(Float64(lat), wrap_lon(Float64(lon)); max_distance)
+        glacier_decoupling(Float64(lat), Float64(lon); max_distance)
     catch e
         e isa InterruptException && rethrow()
         return nothing
     end
 
-    # `missing`/`NaN` are real data gaps (an invariant field undefined for the cell), not schema
-    # drift, so they fall back to the uncorrected reanalysis assumption rather than throwing.
-    glm_raw = row.glm
-    glm = (glm_raw === missing || !isfinite(Float64(glm_raw))) ? 0.0 :
-          clamp(Float64(glm_raw), 0.0, 1.0)
-
     # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
-    return (; decoupling_factor = 1 - (1 - found.k) * (1 - glm),
+    return (; decoupling_factor = _effective_decoupling_factor(found.k, glm),
             decoupling_factor_published = found.k, glm,
             rgi_id = found.rgi_id, distance = found.distance)
 end
@@ -290,6 +348,34 @@ end
 Base.showerror(io::IO, e::ForcingUnavailable) = print(io, "ForcingUnavailable: ", e.message)
 
 """
+    SpinupWindowUnavailable(window, n_selected, extent)
+
+Thrown by [`gemb_glacier_cell`](@ref) when the spinup window selects too little of the supplied
+forcing to average a climatological year. `window` is the `(start, stop)` that was asked for,
+`n_selected` how many steps fell inside it, and `extent` the `(first, last)` time of the forcing
+actually supplied.
+
+Its usual cause is a continuation: the window is inherited from the record being extended, but the
+caller fetched only forcing from near the saved time, so those years are absent. Unlike
+[`ForcingUnavailable`](@ref) this is a property of the *request* rather than of the cell — the same
+fetch fails for every cell with a fallback bin — so a driver should widen the window or set
+`spinup_window` rather than skip the cell.
+"""
+struct SpinupWindowUnavailable <: Exception
+    window::Tuple{DateTime,DateTime}
+    n_selected::Int
+    extent::Tuple{DateTime,DateTime}
+end
+
+Base.showerror(io::IO, e::SpinupWindowUnavailable) = print(io,
+    "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) selects " *
+    "$(e.n_selected) forcing step(s) of those supplied ($(e.extent[1]) .. $(e.extent[2])), " *
+    "too few to average a climatological year. On a continuation this window is the one the " *
+    "existing record was spun up on, so reproducing it needs forcing from those years: fetch " *
+    "from $(e.window[1]) rather than from near the saved time, or pass `spinup_window` to spin " *
+    "this run up on a different climatology than the record it extends.")
+
+"""
     forcing_is_complete(forcing_data) -> Bool
 
 Whether a `climate_forcing` stack actually carries data for its cell.
@@ -331,7 +417,13 @@ or perturbations.
 - `delta_temperatures`: prescribed air temperature offsets (K).
 - `precipitation_scalings`: prescribed precipitation multipliers (dimensionless).
 - `coverage = 0.95`: fraction of cell glacier area the modeled bins must cover.
-- `lapse_rate = 6.5`: temperature lapse rate (K/km) for the per-bin elevation adjustment.
+- `lapse_rate = $(_DEFAULT_LAPSE_RATE)`: temperature lapse rate (K/km) for the per-bin elevation
+  adjustment — a scalar, or a 12-element monthly cycle ordered January to December, which is what
+  [`derive_lapse_rate`](@ref) produces once its per-timestep fits are aggregated. The rate is a
+  property of the cell's climate rather than of a bin, so the same value is applied to every bin
+  and perturbation of the cell. The per-timestep vector `climate_adjust_for_elevation` also
+  accepts is rejected here: its length tracks the forcing record, so it cannot be recorded as a
+  run parameter a continuation could match (see [`run_parameters`](@ref)).
 - `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
   Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
   ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
@@ -339,7 +431,13 @@ or perturbations.
   ambient forcing with no correction at all. Set `false` to skip the lookup entirely; pass a
   `Real` to prescribe `k` directly, bypassing both the table and the `glm` weighting.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
-  year used for spinup. Defaults to the first 30 complete years of the forcing.
+  year used for spinup. When not given, a continuation inherits the window its saved record was
+  spun up on (from the restart's stored provenance) and a cold start takes the first 30 complete
+  years of `forcing_data`. Inheriting matters because a restart does not re-spin up: a bin with no
+  saved profile must be spun up on the same climatology as the rest of the file, not on whatever
+  slice of forcing the continuation happened to fetch. If that window's years are outside the
+  supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
+  climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
 - `max_iterations`, `convergence_delta_density`: passed to `gemb_spinup`.
 - `restart`: the value returned by [`read_glacier_cell_restart`](@ref), or `nothing`. When
   given, each run resumes from its saved profile over forcing newer than the saved time and
@@ -367,7 +465,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            delta_temperatures = [0.0],
                            precipitation_scalings = [1.0],
                            coverage::Real = 0.95,
-                           lapse_rate::Real = 6.5,
+                           lapse_rate = _DEFAULT_LAPSE_RATE,
                            glacier_decoupling = true,
                            spinup_window = nothing,
                            max_iterations::Int = 1000,
@@ -399,6 +497,28 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     meta = DimensionalData.metadata(forcing_data)
     forcing_elevation = Float64(meta["elevation"])
 
+    # The climatology a fallback spinup must reproduce. Three sources, in order of authority:
+    # an explicit request; the window the record being continued was spun up on, read back off
+    # the file; and only failing both, the first 30 complete years of this call's forcing.
+    #
+    # The inherited case is what makes a continuation honest. A restart does not re-spin up — it
+    # inherits the previous run's column — so on the rare bin that has no saved profile the
+    # spinup has to be the one the rest of the file already had, not a fresh one over whatever
+    # slice of forcing the caller happened to fetch. `era5_example.jl` fetches from two days
+    # before the saved time, so a derived window there would be the continuation's own few
+    # steps: a completely different climate, substituted without a word.
+    inherited_window = restart === nothing ? nothing : _restart_spinup_window(restart)
+    window_inherited = spinup_window === nothing && inherited_window !== nothing
+    if spinup_window === nothing
+        spinup_window = something(inherited_window, _default_spinup_window(forcing_data))
+    end
+
+    # The record the spinup climatology is averaged from, taken before the restart subset below
+    # removes everything a window over the early years would need. Only the fallback path uses it,
+    # which is rare enough not to justify holding a second adjusted copy per task — so the
+    # adjustment is redone there.
+    spinup_forcing = forcing_data
+
     # Resuming: keep only forcing newer than the saved state. The saved time is the last
     # *output* time, and every forcing step up to and including it has been consumed.
     if restart !== nothing
@@ -410,12 +530,6 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         n_new = length(dims(forcing_data, Ti))
         n_new >= MIN_FORCING_STEPS || throw(ForcingUpToDate(restart.time, n_new))
         @info "Resuming from saved profile" restart_time=restart.time new_steps=n_new
-    end
-
-    if spinup_window === nothing
-        forcing_times = collect(dims(forcing_data, Ti))
-        spinup_start = DateTime(year(first(forcing_times)), 1, 1)
-        spinup_window = (spinup_start, DateTime(year(spinup_start) + 29, 12, 31))
     end
 
     n_bin = length(cov.modeled)
@@ -432,8 +546,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     # matters: bins per cell range from 1 to ~38 while perturbations are fixed at a handful, so
     # threading either loop alone would leave threads idle on cells whose loop is shorter than
     # the thread count. One flat list of n_bin*n_dt*n_ps tasks always has work for everyone.
-    tasks = [(i_bin, i_dt, i_ps) for i_ps in 1:n_ps, i_dt in 1:n_dt, i_bin in 1:n_bin]
-    tasks = vec(tasks)
+    tasks = vec([(i_bin, i_dt, i_ps) for i_ps in 1:n_ps, i_dt in 1:n_dt, i_bin in 1:n_bin])
 
     # Each task writes only its own slot; nothing is accumulated in place. The area-weighted sum
     # happens afterwards in a fixed order, so the totals do not depend on completion order and
@@ -457,16 +570,24 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         # Rebuilt per task rather than hoisted per perturbation: the adjustment is cheap next
         # to a spinup, and sharing one `adjusted` across bins would hand the same object to
         # concurrent tasks.
-        adjusted = precipitation_adjust(temperature_adjust(forcing_data, delta), pscale)
-        cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation;
-                                  lapse_rate, decoupling_factor)
+        at_bin(f) = forcing_at_elevation(
+            precipitation_adjust(temperature_adjust(f, delta), pscale),
+            bin.center - forcing_elevation; lapse_rate, decoupling_factor)
+
+        cf = at_bin(forcing_data)
 
         profile = restart === nothing ? nothing :
                   get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
 
         if profile === nothing
-            restart === nothing || @warn "No saved profile for this run; spinning up over the truncated forcing" bin=bin.center delta pscale
-            cf_spinup = forcing_climatology(cf, spinup_window)
+            restart === nothing || @warn "No saved profile for this run; spinning up over the record's spinup window" bin=bin.center delta pscale window=spinup_window inherited=window_inherited
+            # On a continuation `cf` covers only the new steps, so a climatology over the spinup
+            # window would find nothing in it — the adjustments are reapplied to the untruncated
+            # record instead, giving this bin exactly the climate it is then run on. On a cold
+            # start `spinup_forcing === forcing_data` and `cf` is already that stack, so it is
+            # reused rather than recomputed: that is the common path.
+            cf_spinup = _spinup_climatology(
+                spinup_forcing === forcing_data ? cf : at_bin(spinup_forcing), spinup_window)
             profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
                                   max_iterations, convergence_delta_density)
         end
@@ -582,6 +703,66 @@ function _lookup_decoupling_factor(row)
     return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
+# The first 30 complete years of a record. Used only when nothing more authoritative is available:
+# no explicit `spinup_window` and no window inherited from a restart.
+function _default_spinup_window(forcing_data)
+    start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
+    return (start, DateTime(year(start) + 29, 12, 31))
+end
+
+# The window the record being continued was spun up on. Taken from the restart's file-level
+# `provenance` rather than from a saved profile's metadata, even though the two hold the same keys:
+# the window is needed precisely when a bin has *no* saved profile, and on a single-bin cell that is
+# also the case where `profiles` is empty and there is no profile left to read it from.
+#
+# The dates come back as the strings `_encode_attribute` wrote (NetCDF has no date attribute type),
+# so they are parsed rather than used as-is. A restart with no provenance or an unparseable window —
+# written before provenance was recorded — yields `nothing` and the caller derives one instead.
+function _restart_spinup_window(restart)
+    prov = get(restart, :provenance, nothing)
+    prov === nothing && return nothing
+    parsed = _parse_datetime.((get(prov, "climatology_window_start", nothing),
+                               get(prov, "climatology_window_stop", nothing)))
+    return any(isnothing, parsed) ? nothing : parsed
+end
+
+_parse_datetime(t::DateTime) = t
+_parse_datetime(::Nothing) = nothing
+_parse_datetime(s::AbstractString) = tryparse(DateTime, s)
+_parse_datetime(_) = nothing
+
+# The climatological year a fallback spinup runs on, with the one failure the window can have made
+# explicit: a window containing no complete year of this record.
+#
+# `forcing_climatology` averages whatever the window selects, and over an empty or partial selection
+# that is a `BoundsError` or a one-timestep "year" from deep inside GEMB — either way, unattributable
+# to the window that caused it. It happens for one reason worth naming: a continuation inherited the
+# window the record was spun up on (which is correct, and the point of inheriting it), but the caller
+# fetched only forcing near the saved time, so the years that window names were never downloaded.
+# `SpinupWindowUnavailable` names the window and the remedy, because the alternative — silently
+# spinning this bin up on a different climate than every other bin in the file — is the bug being
+# avoided here.
+function _spinup_climatology(cf, window)
+    times = lookup(cf, Ti)
+    selected = filter(t -> window[1] <= t <= window[2], times)
+
+    # A year of span, not a step count: `forcing_climatology` calls whichever years hold the most
+    # timesteps "complete", so a selection covering one partial year passes any count test and
+    # averages into a climatological "year" of however few steps that partial happened to hold.
+    # Spanning a year is what actually distinguishes a climatology from a fragment of one.
+    spans_a_year = !isempty(selected) && last(selected) - first(selected) >= Day(365)
+    spans_a_year ||
+        throw(SpinupWindowUnavailable(window, length(selected), (first(times), last(times))))
+
+    return forcing_climatology(cf, window)
+end
+
+# What counts as spinup/climatology provenance, by name. GEMB names these keys itself
+# (`GEMB._profile_provenance`, `_attach_spinup_provenance`) and does not publish a roster, so a
+# prefix test is the only contract available — and it must be the *same* test on the way out of a
+# stack and back off a file, or a key would be written and then not recognized on restart.
+_is_provenance_key(key) = startswith(key, "spinup") || startswith(key, "climatology")
+
 # Spinup/climatology provenance carried on the output stack by `gemb` (`_profile_provenance`).
 # Values can be `nothing`, `Bool` or `DateTime`; the NetCDF writer encodes them.
 function _stack_provenance(output)
@@ -589,9 +770,8 @@ function _stack_provenance(output)
     prov = Dict{String,Any}()
     meta isa DimensionalData.NoMetadata && return prov
     for (k, v) in pairs(meta)
-        key = string(k)
-        (startswith(key, "spinup") || startswith(key, "climatology")) || continue
-        prov[key] = v
+        _is_provenance_key(string(k)) || continue
+        prov[string(k)] = v
     end
     return prov
 end
@@ -602,6 +782,12 @@ end
 # line up. Shared by the restart path and the NetCDF appender, which read the same three axes
 # from different places.
 const RUN_GRID_AXES = ("bin_center", "delta_temperature", "precipitation_scaling")
+
+# The requested run grid, in `RUN_GRID_AXES` order. The axes are compared positionally, so building
+# the tuple here keeps that order encoded once rather than at each call site — where a reorder would
+# produce a silently wrong comparison rather than an error.
+_run_grid(bins, delta_temperatures, precipitation_scalings) =
+    ([b.center for b in bins], delta_temperatures, precipitation_scalings)
 
 function _assert_run_grid_matches(source, saved, requested)
     for (name, s, r) in zip(RUN_GRID_AXES, saved, requested)
@@ -615,8 +801,7 @@ _validate_restart(restart, modeled, delta_temperatures, precipitation_scalings) 
     _assert_run_grid_matches("the saved restart state",
                              (restart.bin_centers, restart.delta_temperatures,
                               restart.precipitation_scalings),
-                             ([b.center for b in modeled], delta_temperatures,
-                              precipitation_scalings))
+                             _run_grid(modeled, delta_temperatures, precipitation_scalings))
 
 """
     RestartParameterMismatch(differences)
