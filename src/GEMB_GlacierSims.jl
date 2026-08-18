@@ -5,6 +5,20 @@ using GEMB
 # restart reader need them so profiles read back with the same layer metadata GEMB attaches.
 using GEMB: cf_layermetadata, cf_layer_index_attributes, cf_time_attributes
 using GEMB_ClimateForcing
+# The per-region downscaling-parameter fits and the constants they are defined against. They live
+# upstream because each one inverts a `climate_adjust_for_*` and is pure arithmetic on this
+# package's forcing conventions; what stays here is the half that knows about glacier
+# elevation-class tables. Imported explicitly, and re-exported below, so a caller does not have to
+# know which package a given piece of the derivation lives in — and so the private names this file
+# shares with upstream (`_FORCING_VARIABLES`, the domain limits) are visibly borrowed rather than
+# silently reached for.
+using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
+                           decoupling_factor_at_elevation,
+                           _make_applicable, _decouple_per_timestep,
+                           _cell_forcing_at_interval, _FORCING_VARIABLES,
+                           _MIN_CELLS_DEFAULT, _DECOUPLING_FACTOR_LIMITS,
+                           _LAPSE_RATE_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE,
+                           _MIN_AMBIENT_EXCESS
 using DimensionalData
 using Rasters
 using DataFrames
@@ -38,8 +52,8 @@ include("netcdf_output.jl")
 export write_glacier_cell_netcdf, append_glacier_cell_netcdf, read_glacier_cell_restart
 export read_glacier_cell_parameters, read_glacier_cell_status
 
-include("climate_parameters.jl")
-export derive_climate_parameters, grid_cells_in_region
+include("downscaling_parameters.jl")
+export derive_downscaling_parameters, grid_cells_in_region
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
 
 

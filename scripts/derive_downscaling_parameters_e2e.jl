@@ -1,4 +1,4 @@
-# End-to-end check of `derive_climate_parameters` against real ERA5-Land forcing.
+# End-to-end check of `derive_downscaling_parameters` against real ERA5-Land forcing.
 #
 # The offline suite in `test/runtests.jl` proves the estimator inverts its own forward model. It
 # cannot prove the thing this rewrite was for: that a real region's per-timestep fits carry physical
@@ -11,7 +11,7 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Downloads are cached as
 # Zarr chunks under `tempdir()`, shared across cells, so a re-run is nearly free.
 #
-# Run:  julia --project=. scripts/derive_climate_parameters_e2e.jl [years]
+# Run:  julia --project=. scripts/derive_downscaling_parameters_e2e.jl [years]
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
@@ -52,7 +52,7 @@ function main()
     cache = joinpath(tempdir(), ".cache", string(CLIMATE_MODEL))
 
     table = GeoDataFrames.read(PARQUET)
-    # `derive_climate_parameters` loads forcing by `row.latitude`/`row.longitude`; the cached table
+    # `derive_downscaling_parameters` loads forcing by `row.latitude`/`row.longitude`; the cached table
     # carries only the Point geometry, so derive them the way `era5_example.jl` does.
     table[!, :longitude] = GI.x.(table.geometry)
     table[!, :latitude] = GI.y.(table.geometry)
@@ -61,7 +61,7 @@ function main()
     @info "Region" REGION_NAME box=REGION_BOX time_range=TIME_RANGE
 
     t0 = time()
-    p = derive_climate_parameters(CLIMATE_MODEL, TIME_RANGE, table, region;
+    p = derive_downscaling_parameters(CLIMATE_MODEL, TIME_RANGE, table, region;
                                  token, cache_path = cache)
     @info "Derived" seconds=round(time() - t0; digits = 1)
 

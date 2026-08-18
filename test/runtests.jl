@@ -928,7 +928,7 @@ end
         @test_throws ArgumentError grid_cells_in_region(table, _cp_region(-170.0, 45.0, 170.0, 46.0))
     end
 
-    @testset "derive_climate_parameters" begin
+    @testset "derive_downscaling_parameters" begin
         # Four cells spanning 1000-2500 m with a range of glacier fractions, one populated
         # elevation interval each, inside one square region.
         cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0,  bins = [(1050, 10.0)]),
@@ -954,7 +954,7 @@ end
             return fill(a + (k_applied - 1) * max(a - 273.15, 0.0), length(_CP_TIME))
         end
 
-        p = derive_climate_parameters(:synthetic, time_range, table, region;
+        p = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                       token = nothing, cache_path = nothing,
                                       min_cells = 4,
                                       forcing_loader = _cp_loader(cells, observed),
@@ -1067,7 +1067,7 @@ end
         @testset "laziness" begin
             # `elevation_interval_batch` trades passes over the warm cache against peak memory, and
             # must not change the answer. `0` means one pass holding every interval.
-            p0 = derive_climate_parameters(:synthetic, time_range, table, region;
+            p0 = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 4,
                                            forcing_loader = _cp_loader(cells, observed),
@@ -1084,7 +1084,7 @@ end
             counting = let inner = _cp_loader(cells, observed)
                 (args...; kwargs...) -> (loads[] += 1; inner(args...; kwargs...))
             end
-            pc = derive_climate_parameters(:synthetic, time_range, table, region;
+            pc = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 4,
                                            forcing_loader = counting,
@@ -1121,7 +1121,7 @@ end
             # ERA5-Land is land-only, so a cell center can land on water and come back all-NaN.
             # Those cells are skipped, not fatal — the sweep's `ForcingUnavailable` policy.
             wet(c) = c.z == 1500.0 ? fill(NaN, length(_CP_TIME)) : observed(c)
-            pw = derive_climate_parameters(:synthetic, time_range, table, region;
+            pw = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 3,
                                            forcing_loader = _cp_loader(cells, wet),
@@ -1135,13 +1135,13 @@ end
                   sum(glacier_area_total(r) for r in eachrow(pw.grid_cells))
 
             # Every cell unusable is an error, not an empty result.
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, _ -> fill(NaN, length(_CP_TIME))))
 
             # A region containing no cells at all, likewise.
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, _cp_region(0.0, 0.0, 1.0, 1.0);
                 token = nothing, cache_path = nothing,
                 min_cells = 4,
@@ -1153,7 +1153,7 @@ end
             # here", which is a different claim from any substituted number. Four parameters need
             # four cells, and the `glm x z` interaction needs spread in both regressors.
             thin = cells[1:3]
-            pt = derive_climate_parameters(:synthetic, time_range, _cp_table(thin), region;
+            pt = derive_downscaling_parameters(:synthetic, time_range, _cp_table(thin), region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 3,
                                            forcing_loader = _cp_loader(thin, observed))
@@ -1179,7 +1179,7 @@ end
             # denominator fits noise. Found on real Alpine winter forcing, where a 0.1 K excess
             # "fitted" k = 0.2. A ~0.2 K excess is below `_MIN_AMBIENT_EXCESS`.
             marginal(c) = fill(273.35 - 0.05 * (c.z - 1000.0) / 1000.0, length(_CP_TIME))
-            pm = derive_climate_parameters(:synthetic, time_range, table, region;
+            pm = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 4,
                                            forcing_loader = _cp_loader(cells, marginal))
@@ -1192,7 +1192,7 @@ end
             # information about `k` at all. The lapse rate is still measurable there, and with no
             # decoupling to undo it is simply the ambient one.
             frozen(c) = fill(250.0 - gamma_true * c.z / 1000.0, length(_CP_TIME))
-            pf = derive_climate_parameters(:synthetic, time_range, table, region;
+            pf = derive_downscaling_parameters(:synthetic, time_range, table, region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 4,
                                            forcing_loader = _cp_loader(cells, frozen))
@@ -1201,7 +1201,7 @@ end
 
             # Every cell at one elevation: no slope is measurable however many cells there are.
             flat = [(; c..., z = 1500.0) for c in cells]
-            pl = derive_climate_parameters(:synthetic, time_range, _cp_table(flat), region;
+            pl = derive_downscaling_parameters(:synthetic, time_range, _cp_table(flat), region;
                                            token = nothing, cache_path = nothing,
                                            min_cells = 4,
                                            forcing_loader = _cp_loader(flat, observed))
@@ -1223,7 +1223,7 @@ end
 
             # Non-default fills are honoured, which is the point of the keywords: a region with no
             # usable fit can be given a published or regional value instead of the identity.
-            pfill = derive_climate_parameters(:synthetic, time_range, _cp_table(flat), region;
+            pfill = derive_downscaling_parameters(:synthetic, time_range, _cp_table(flat), region;
                                               token = nothing, cache_path = nothing,
                                               min_cells = 4,
                                               forcing_loader = _cp_loader(flat, observed),
@@ -1236,11 +1236,11 @@ end
             end
             # ...and validated, since they are applied: an out-of-domain fill would be rejected
             # downstream no differently from an out-of-domain fit, but with nothing to inspect.
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, observed), lapse_rate_fill = 99.0)
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, observed), decoupling_factor_fill = 1.5)
@@ -1255,7 +1255,7 @@ end
                 a = ambient(c)
                 return fill(a + c.glm * 0.5 * max(a - 273.15, 0.0), length(_CP_TIME))
             end
-            pi_ = derive_climate_parameters(
+            pi_ = derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, inverted))
@@ -1273,7 +1273,7 @@ end
 
             # Opting out leaves the raw fit in the applied series too, which is what the keyword is
             # for — inspecting what would have been applied.
-            pu = derive_climate_parameters(
+            pu = derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, inverted),
@@ -1314,82 +1314,24 @@ end
             @test !isapprox(first(p.lapse_rate.lapse_rate), ambient_obs, atol = 1e-3)
         end
 
-        @testset "a wide spread is reported, not discarded" begin
-            # The regression test for the behaviour this replaced: an interquartile threshold used to
-            # reject a region's whole fitted series and substitute a constant. Lapse rates and `k`
-            # both vary strongly on diurnal and seasonal timescales, so a wide spread is usually
-            # physics, and no test here can tell it from fit error. So the per-timestep fits survive.
-            scatter(c) = begin
-                v = observed(c)
-                for t in eachindex(v)
-                    v[t] += c.glm * 8.0 * (isodd(t) ? 1 : -1)
-                end
-                v
-            end
-            ps = derive_climate_parameters(:synthetic, time_range, table, region;
-                                          token = nothing, cache_path = nothing,
-                                          min_cells = 4,
-                                          forcing_loader = _cp_loader(cells, scatter))
-            k = collect(filter(isfinite, ps.decoupling.decoupling_factor))
-            @test length(k) == length(_CP_TIME)
-            # Not collapsed to a constant — the whole point.
-            @test length(unique(round.(k; digits = 6))) > 1
-            @test Statistics.quantile(k, 0.75) - Statistics.quantile(k, 0.25) > 0.5
-            # And still usable: the caller's own median over the raw series.
-            @test isfinite(Statistics.median(k))
-        end
-
-        @testset "decoupling_factor_at_elevation" begin
-            z̄ = DimensionalData.metadata(p.decoupling)["reference_elevation"]
-            # At the reference elevation the re-evaluation must reproduce the original fit exactly —
-            # same coefficients, same formula, same guard.
-            at_ref = decoupling_factor_at_elevation(p.decoupling, z̄)
-            @test all(t -> isapprox(at_ref[t], p.decoupling.decoupling_factor[t], atol = 1e-9),
-                      eachindex(at_ref))
-            @test at_ref isa DimArray
-            @test collect(dims(at_ref, Ti)) == p.time
-
-            # The fixture's ambient excess is linear in elevation by construction, and `k_true` is
-            # constant, so `k(z)` is `k_true` at every elevation the ambient excess still supports.
-            for z in (1200.0, 1800.0, 2400.0)
-                at = decoupling_factor_at_elevation(p.decoupling, z)
-                @test all(k -> isapprox(k, k_true, atol = 1e-6), at)
-                @test DimensionalData.metadata(at)["n_fitted"] == length(_CP_TIME)
-            end
-
-            # The guard that motivates the function: high enough up, the fitted ambient excess falls
-            # below `_MIN_AMBIENT_EXCESS` and `k` stops being a ratio of anything. The fixture's
-            # ambient reaches melting at 292.0/5.0 = 3840 m, so at 5000 m every timestep is held —
-            # evaluated at the highest elevation its own fit still supports rather than reverted to
-            # the identity, which would inject a false gradient at the interval boundary it flips on.
-            far = decoupling_factor_at_elevation(p.decoupling, 5000.0)
-            @test DimensionalData.metadata(far)["n_held"] == length(_CP_TIME)
-            @test DimensionalData.metadata(far)["n_fitted"] == length(_CP_TIME)
-            @test all(k -> isapprox(k, k_true, atol = 1e-6), far)
-            @test DimensionalData.metadata(far)["in_range"]
-            # Nothing is held where the fit supports the elevation directly.
-            @test DimensionalData.metadata(
-                decoupling_factor_at_elevation(p.decoupling, 1800.0))["n_held"] == 0
-
-            # Outside the hypsometry there is no glacier to report a factor for, and nothing there
-            # becomes an interval, so `NaN` is safe and says "no glacier" rather than "no damping".
-            out = decoupling_factor_at_elevation(p.decoupling, 5000.0;
-                                                 elevation_range = (1000.0, 3000.0))
-            @test !DimensionalData.metadata(out)["in_range"]
-            @test all(isnan, out)
-            @test DimensionalData.metadata(out)["n_fitted"] == 0
-        end
+        # The two sub-testsets that used to sit here — the per-timestep spread being reported rather
+        # than collapsed to a constant, and `decoupling_factor_at_elevation`'s re-evaluation and
+        # hold-out guard — test the fits themselves, which now live in GEMB_ClimateForcing. They
+        # moved with them, to that package's test/test_downscaling_parameters.jl, where they run
+        # against a hand-built accumulator instead of a synthetic elevation-class table. What stays
+        # below is what this package still owns: orchestration, interval aggregation, laziness,
+        # provenance, and argument validation.
 
         @testset "argument validation" begin
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 forcing_loader = _cp_loader(cells, observed), elevation_interval_batch = -1)
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 forcing_loader = _cp_loader(cells, observed), min_cells = 1)
 
             # The keywords that encoded policy in the fits are gone, not silently ignored.
-            @test_throws MethodError derive_climate_parameters(
+            @test_throws MethodError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, observed),
@@ -1399,7 +1341,7 @@ end
             # before the current invariant column naming must fail loudly.
             stale = select(table, Not(:glm))
             stale.glm_frac = [c.glm for c in cells]
-            @test_throws ArgumentError derive_climate_parameters(
+            @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, stale, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, observed))
