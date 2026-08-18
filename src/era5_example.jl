@@ -61,7 +61,7 @@ begin
     # a model parameter normally means the cells should be rebuilt from scratch instead.
     force_restart = false
 
-    # Display a full `gemb_plot_output` panel for every individual simulation as it finishes —
+    # Display a full `plot_output` panel for every individual simulation as it finishes —
     # one figure per (bin x delta x scaling), so a single cell can produce dozens. Diagnostic
     # only: keep `cell_limit` small when this is on, and note that it forces the per-cell
     # simulations to run serially (Makie is not thread-safe).
@@ -226,7 +226,7 @@ end
 
 # `on_output` hook for `verbose_plotting`: one full GEMB diagnostic panel per simulation, titled
 # with the cell and the perturbation it belongs to so the figures stay distinguishable. Built per
-# cell so the closure carries that cell's identity; `gemb_plot_output` needs a Makie backend,
+# cell so the closure carries that cell's identity; `plot_output` needs a Makie backend,
 # which the `using CairoMakie` above provides.
 #
 # The decoupling factor is part of the title only when one was applied: a `k=1.0` on every figure
@@ -234,7 +234,7 @@ end
 # cell the correction happened to leave alone.
 verbose_plotter(i, r) = function (output; bin, delta, pscale, decoupling_factor)
     k = decoupling_factor_label(decoupling_factor)
-    display(gemb_plot_output(output; datelims = (DateTime(2020, 1, 1), DateTime(2026, 8, 1)),
+    display(plot_output(output; datelims = (DateTime(2020, 1, 1), DateTime(2026, 8, 1)),
         title = "GEMB simulation: ($(round(r.latitude, digits = 3))°N, " *
                 "$(round(wrap_lon(r.longitude), digits = 3))°E) — " *
                 "hyps bin $(round(Int, bin.center)) m, ΔT=$(delta) K, P×$(pscale)" *

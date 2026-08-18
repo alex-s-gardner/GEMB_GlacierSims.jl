@@ -38,7 +38,7 @@ export read_glacier_cell_parameters, read_glacier_cell_status
 
 include("climate_parameters.jl")
 export derive_climate_parameters, grid_cells_in_region
-export derive_decoupling_factor, derive_lapse_rate
+export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
 
 
 end # module
