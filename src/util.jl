@@ -88,6 +88,21 @@ function _row_glm(row)
         "current invariant column naming carries `:glm_frac`; run " *
         "`scripts/migrate_invariant_colnames.jl` to rename it in place."))
     v = row.glm
-    (v === missing || !isfinite(Float64(v))) && return 0.0
-    return clamp(Float64(v), 0.0, 1.0)
+    v === missing && return 0.0
+    g = Float64(v)
+    return isfinite(g) ? clamp(g, 0.0, 1.0) : 0.0
 end
+
+# The share of a published decoupling factor `k` a cell still needs, given the ERA5-Land glacier-mask
+# fraction `glm` its land-surface scheme has already accounted for:
+#
+#     k_eff = 1 - (1 - k) * (1 - glm)
+#
+# The full correction where the cell carries no glacier (`glm = 0`) and the identity where it is
+# entirely glacier (`glm = 1`). Defined once because this is the package's single convention for
+# that weighting, applied both per cell ([`cell_decoupling_factor`](@ref), one scalar `k` from the
+# published table) and per elevation interval (`derive_decoupling_factor`, a fitted `k` per
+# timestep) — and it is the same weighting `derive_lapse_rate` folds into its regression sums to
+# undo. Two independent spellings would let those paths disagree about the same cell's forcing
+# while both stayed finite and in-domain, so the drift would be invisible.
+_effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)

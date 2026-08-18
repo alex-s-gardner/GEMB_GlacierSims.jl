@@ -207,6 +207,11 @@ function hypsometry_bin_edges(df)
     return Int[bins[1][1]; last.(bins)]
 end
 
+# One decoded hypsometry bin: elevation edges (m), bin-center elevation (m), glacier area (km²).
+# Named once so `glacier_hypsometry`'s accumulator and `GlacierCellRun.bins` — the struct that stores
+# what this decoder returned — cannot spell the same type differently.
+const HypsometryBin = @NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}
+
 """
     glacier_hypsometry(row; area_minimum = 0)
 
@@ -219,7 +224,7 @@ This replaces hand-parsing the `hyps_<lo>_<hi>` column names downstream; the bin
 lives here alongside the encoder ([`gemb_glacier_elevation_class_runfile`](@ref)).
 """
 function glacier_hypsometry(row; area_minimum = 0)
-    out = @NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}[]
+    out = HypsometryBin[]
     for name in propertynames(row)
         edges = _parse_hyps_colname(name)
         edges === nothing && continue

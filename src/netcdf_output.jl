@@ -490,5 +490,5 @@ end
 _assert_grid_matches(ds, run::GlacierCellRun) =
     _assert_run_grid_matches("the existing file",
                              Tuple(collect(Float64, ds[name][:]) for name in RUN_GRID_AXES),
-                             ([b.center for b in run.bins], run.delta_temperatures,
-                              run.precipitation_scalings))
+                             _run_grid(run.bins, run.delta_temperatures,
+                                       run.precipitation_scalings))

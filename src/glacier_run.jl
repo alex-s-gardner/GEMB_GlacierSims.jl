@@ -103,7 +103,7 @@ struct GlacierCellRun
     glacier_frac::Union{Float64,Missing}
     delta_temperatures::Vector{Float64}
     precipitation_scalings::Vector{Float64}
-    bins::Vector{@NamedTuple{lo::Int, hi::Int, center::Float64, area::Float64}}
+    bins::Vector{HypsometryBin}
     weights::Vector{Float64}
     time::Vector{DateTime}
     totals::Dict{Symbol,Array{Float64,3}}
@@ -112,22 +112,24 @@ struct GlacierCellRun
     provenance::Dict{String,Any}
 end
 
+# Which columns are hypsometry columns comes from `_parse_hyps_colname`, the same decoder
+# `glacier_hypsometry` uses, so the naming contract lives in one place: a bare `hyps_` prefix test
+# would also sum a future non-hypsometry `hyps_*` column into a cell's glacier area. The parsed
+# edges are discarded — order does not matter for a sum — and the filtered generator keeps this
+# free of the per-row name vector the screen would otherwise allocate ~47,000 times.
 """
     glacier_area_total(row) -> Float64
 
 Total glacier area (km²) in a glacier elevation-class `row`, summed over every hypsometry bin.
 
 This is the cheap way to screen cells for a minimum area: it sums the flat `hyps_*` columns
-directly, skipping the bin decoding, sorting and nearest-bin reassignment that
+directly, skipping the bin sorting, `NamedTuple` construction and nearest-bin reassignment that
 [`glacier_hypsometry_coverage`](@ref) does. Screening a global table is ~47,000 calls, so the
 difference is worth having.
 """
 glacier_area_total(row) =
-    sum(Float64(row[c]) for c in _hyps_colnames_in(row); init = 0.0)
-
-# The `hyps_<lo>_<hi>` columns of a row, in whatever order the table carries them. Order does not
-# matter for a sum, so this skips parsing the edges out of the names.
-_hyps_colnames_in(row) = filter(c -> startswith(string(c), "hyps_"), propertynames(row))
+    sum(Float64(row[c]) for c in propertynames(row)
+        if _parse_hyps_colname(c) !== nothing; init = 0.0)
 
 """
     glacier_hypsometry_coverage(row; coverage = 0.95)
@@ -230,7 +232,7 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
     end
 
     # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
-    return (; decoupling_factor = 1 - (1 - found.k) * (1 - glm),
+    return (; decoupling_factor = _effective_decoupling_factor(found.k, glm),
             decoupling_factor_published = found.k, glm,
             rgi_id = found.rgi_id, distance = found.distance)
 end
@@ -405,8 +407,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     end
 
     if spinup_window === nothing
-        forcing_times = collect(dims(forcing_data, Ti))
-        spinup_start = DateTime(year(first(forcing_times)), 1, 1)
+        spinup_start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
         spinup_window = (spinup_start, DateTime(year(spinup_start) + 29, 12, 31))
     end
 
@@ -424,8 +425,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     # matters: bins per cell range from 1 to ~38 while perturbations are fixed at a handful, so
     # threading either loop alone would leave threads idle on cells whose loop is shorter than
     # the thread count. One flat list of n_bin*n_dt*n_ps tasks always has work for everyone.
-    tasks = [(i_bin, i_dt, i_ps) for i_ps in 1:n_ps, i_dt in 1:n_dt, i_bin in 1:n_bin]
-    tasks = vec(tasks)
+    tasks = vec([(i_bin, i_dt, i_ps) for i_ps in 1:n_ps, i_dt in 1:n_dt, i_bin in 1:n_bin])
 
     # Each task writes only its own slot; nothing is accumulated in place. The area-weighted sum
     # happens afterwards in a fixed order, so the totals do not depend on completion order and
@@ -595,6 +595,12 @@ end
 # from different places.
 const RUN_GRID_AXES = ("bin_center", "delta_temperature", "precipitation_scaling")
 
+# The requested run grid, in `RUN_GRID_AXES` order. The axes are compared positionally, so building
+# the tuple here keeps that order encoded once rather than at each call site — where a reorder would
+# produce a silently wrong comparison rather than an error.
+_run_grid(bins, delta_temperatures, precipitation_scalings) =
+    ([b.center for b in bins], delta_temperatures, precipitation_scalings)
+
 function _assert_run_grid_matches(source, saved, requested)
     for (name, s, r) in zip(RUN_GRID_AXES, saved, requested)
         s == r || throw(ArgumentError("$name in $source ($s) does not match this run ($r); " *
@@ -607,8 +613,7 @@ _validate_restart(restart, modeled, delta_temperatures, precipitation_scalings) 
     _assert_run_grid_matches("the saved restart state",
                              (restart.bin_centers, restart.delta_temperatures,
                               restart.precipitation_scalings),
-                             ([b.center for b in modeled], delta_temperatures,
-                              precipitation_scalings))
+                             _run_grid(modeled, delta_temperatures, precipitation_scalings))
 
 """
     RestartParameterMismatch(differences)

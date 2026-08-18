@@ -1197,7 +1197,7 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             # `k` at *this interval's* elevation, weighted down by the cell's `glm`. Per interval
             # rather than per cell, because `k` varies with elevation and the interval center is
             # where the forcing is being delivered — only `glm` differs between cells.
-            cell_factor = [1 - (1 - k) * (1 - glm) for k in interval.decoupling_factor]
+            cell_factor = [_effective_decoupling_factor(k, glm) for k in interval.decoupling_factor]
             adjusted = _cell_forcing_at_interval(fd, interval.center - z_cell, cell_factor,
                                                  ivf.lapse_rate)
             w = areas[i]
