@@ -204,11 +204,23 @@ which is the full correction where the cell carries no glacier (`glm = 0`) and t
 the cell is entirely glacier (`glm = 1`). A cell with no `:glm` column, or a `missing` value, is
 treated as `glm = 0` — the uncorrected reanalysis assumption, hence the full correction.
 
-Returns `(; k, k_published, glm, rgi_id, distance)`, or `nothing` when the table has no glacier
-within `max_distance` — RGI regions 05 (Greenland periphery) and 19 (Antarctic) are absent from it
-entirely, and those cells are then run on ambient forcing rather than failing.
+Returns `(; decoupling_factor, decoupling_factor_published, glm, rgi_id, distance)`, or `nothing`
+when the table has no glacier within `max_distance` — RGI regions 05 (Greenland periphery) and 19
+(Antarctic) are absent from it entirely, and those cells are then run on ambient forcing rather
+than failing.
+
+The `:glm` column is required. A table without it cannot weight the correction at all, and
+defaulting to the unweighted published factor would apply a silently different correction to every
+cell in the sweep — so this throws instead. A table predating the current invariant column naming
+(`glm_frac`) is migrated in place by `scripts/migrate_invariant_colnames.jl`.
 """
 function cell_decoupling_factor(row; max_distance::Real = 10.0)
+    hasproperty(row, :glm) || throw(ArgumentError(
+        "glacier elevation-class row has no `:glm` column, so the decoupling factor cannot be " *
+        "weighted by the cell's non-glacier fraction. A table built before the current invariant " *
+        "column naming carries `:glm_frac`; run `scripts/migrate_invariant_colnames.jl` to " *
+        "rename it in place."))
+
     lon, lat = _cell_lonlat(row.geometry)
 
     # Positional lookups error rather than return a sentinel when nothing is close enough (or the
@@ -220,13 +232,16 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
         return nothing
     end
 
-    glm_raw = hasproperty(row, :glm) ? row.glm : missing
+    # `missing`/`NaN` are real data gaps (an invariant field undefined for the cell), not schema
+    # drift, so they fall back to the uncorrected reanalysis assumption rather than throwing.
+    glm_raw = row.glm
     glm = (glm_raw === missing || !isfinite(Float64(glm_raw))) ? 0.0 :
           clamp(Float64(glm_raw), 0.0, 1.0)
 
     # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
-    k = 1 - (1 - found.k) * (1 - glm)
-    return (; k, k_published = found.k, glm, rgi_id = found.rgi_id, distance = found.distance)
+    return (; decoupling_factor = 1 - (1 - found.k) * (1 - glm),
+            decoupling_factor_published = found.k, glm,
+            rgi_id = found.rgi_id, distance = found.distance)
 end
 
 """
@@ -366,7 +381,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     precipitation_scalings = collect(Float64, precipitation_scalings)
 
     # One lookup per cell, not per (bin x delta x scaling): `k` is a property of the glacier, not
-    # of the perturbation or the elevation band. `nothing` here means every run stays ambient.
+    # of the perturbation or the elevation interval. `nothing` here means every run stays ambient.
     decoupling_factor = resolve_decoupling_factor(row, glacier_decoupling)
 
     parameters = run_parameters(mp; coverage, lapse_rate, decoupling_factor)
@@ -561,10 +576,10 @@ function _lookup_decoupling_factor(row)
         @info "No Shaw et al. (2025) decoupling factor for this cell; running on ambient forcing"
         return nothing
     end
-    @info "Applying glacier decoupling weighted by the non-glacier fraction" k=found.k k_published=found.k_published glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
+    @info "Applying glacier decoupling weighted by the non-glacier fraction" k=found.decoupling_factor k_published=found.decoupling_factor_published glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
     # An entirely glaciated cell weights k to exactly 1.0, which is the identity — skip the
     # adjustment rather than paying for a no-op pass over the whole forcing record.
-    return found.k >= 1 ? nothing : found.k
+    return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
 # Spinup/climatology provenance carried on the output stack by `gemb` (`_profile_provenance`).
