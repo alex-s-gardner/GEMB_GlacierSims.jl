@@ -36,7 +36,9 @@ begin
     # Temperature lapse rate (K km-1) for the per-bin elevation adjustment. Stated here rather
     # than left to `gemb_glacier_cell`'s default because the up-front check below has to build the
     # same `run_parameters` the run will, and a default that differs between the two would report
-    # every existing cell as a parameter change.
+    # every existing cell as a parameter change. A 12-element January-to-December cycle works in
+    # place of the scalar — `derive_lapse_rate` produces one for a region — and is stored and
+    # compared as a cycle.
     lapse_rate = 6.5
 
     # Correct the ambient reanalysis air temperature to on-glacier conditions with the Shaw et al.

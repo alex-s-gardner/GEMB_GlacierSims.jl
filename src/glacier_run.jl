@@ -52,11 +52,15 @@ Deliberately *excluded* are the things expected to differ between an original ru
 continuation: the output time axis, the `spinup_*`/`climatology_*` provenance (a resumed run
 performs no spinup at all, and a longer forcing record shifts the climatology window), `history`,
 and the `institution`/`references` labels.
+
+`lapse_rate` is a scalar or a 12-element monthly vector, and is stored in whichever form it was
+given — see [`gemb_glacier_cell`](@ref) for why the per-timestep form `climate_adjust_for_elevation`
+also accepts is not one of them.
 """
-function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real,
+function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
                         decoupling_factor = nothing)
     params = Dict{String,Any}("hypsometry_coverage" => Float64(coverage),
-                              "temperature_lapse_rate" => Float64(lapse_rate),
+                              "temperature_lapse_rate" => _lapse_rate_parameter(lapse_rate),
                               # 1.0 (the identity) rather than an absent key when no correction
                               # was applied, so switching the correction on or off is visible as
                               # a parameter change on restart rather than an unverifiable gap.
@@ -67,6 +71,24 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real,
         params["model_" * string(field)] = getproperty(mp, field)
     end
     return params
+end
+
+# The stored form of the lapse rate. A scalar stays a scalar and a monthly cycle stays a
+# 12-element vector, both of which NetCDF holds natively and compares exactly on restart.
+#
+# A per-timestep vector is refused rather than stored: it has one entry per forcing step, so a
+# continuation over an extended record necessarily supplies a longer one, and the restart check
+# would read every append as a parameter change. There is no way to store it that fixes that —
+# the value genuinely differs — so the limit is stated here, where the caller can act on it,
+# rather than surfacing as an unexplained `RestartParameterMismatch` on the first append.
+function _lapse_rate_parameter(lapse_rate)
+    lapse_rate isa Real && return Float64(lapse_rate)
+    length(lapse_rate) == 12 && return collect(Float64, lapse_rate)
+    throw(ArgumentError("lapse_rate must be a scalar or a 12-element monthly vector (got " *
+                        "length $(length(lapse_rate))). The per-timestep form " *
+                        "`climate_adjust_for_elevation` also accepts cannot be recorded as a " *
+                        "run parameter: its length tracks the forcing record, so every " *
+                        "continuation would compare unequal to the file it extends."))
 end
 
 """
@@ -326,7 +348,12 @@ or perturbations.
 - `precipitation_scalings`: prescribed precipitation multipliers (dimensionless).
 - `coverage = 0.95`: fraction of cell glacier area the modeled bins must cover.
 - `lapse_rate = $(_DEFAULT_LAPSE_RATE)`: temperature lapse rate (K/km) for the per-bin elevation
-  adjustment.
+  adjustment — a scalar, or a 12-element monthly cycle ordered January to December, which is what
+  [`derive_lapse_rate`](@ref) produces once its per-timestep fits are aggregated. The rate is a
+  property of the cell's climate rather than of a bin, so the same value is applied to every bin
+  and perturbation of the cell. The per-timestep vector `climate_adjust_for_elevation` also
+  accepts is rejected here: its length tracks the forcing record, so it cannot be recorded as a
+  run parameter a continuation could match (see [`run_parameters`](@ref)).
 - `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
   Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
   ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
@@ -362,7 +389,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            delta_temperatures = [0.0],
                            precipitation_scalings = [1.0],
                            coverage::Real = 0.95,
-                           lapse_rate::Real = _DEFAULT_LAPSE_RATE,
+                           lapse_rate = _DEFAULT_LAPSE_RATE,
                            glacier_decoupling = true,
                            spinup_window = nothing,
                            max_iterations::Int = 1000,

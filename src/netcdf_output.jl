@@ -236,6 +236,12 @@ function _write_globals!(ds, run::GlacierCellRun; institution, references)
         "hypsometry_coverage of the cell total; the area of unselected bins was added to " *
         "the nearest selected bin by center elevation"
     ds.attrib["temperature_lapse_rate_units"] = "K km-1"
+    # A scalar is a constant rate; twelve values are a monthly cycle. Said here because the
+    # parameter attribute itself carries no shape hint, and a reader cannot otherwise tell the
+    # cycle's ordering from its length.
+    ds.attrib["temperature_lapse_rate_comment"] =
+        "A single value is a constant rate; twelve values are a monthly cycle ordered " *
+        "January (index 1) to December."
     ismissing(run.chunk_id) || (ds.attrib["chunk_id"] = run.chunk_id)
     ismissing(run.glacier_frac) || (ds.attrib["glacier_fraction"] = run.glacier_frac)
 
@@ -293,6 +299,11 @@ _encode_attribute(::Nothing) = nothing
 _encode_attribute(v::Bool) = v ? "true" : "false"
 _encode_attribute(v::DateTime) = Dates.format(v, "yyyy-mm-ddTHH:MM:SS")
 _encode_attribute(v::Union{AbstractString,Real}) = v
+# NetCDF holds a numeric attribute vector natively, so a monthly lapse-rate cycle round-trips as
+# numbers rather than as a stringified array — which is also what makes the restart check compare
+# it elementwise instead of by print formatting. Normalized to `Float64` so a cycle given as
+# `Int`s and the same cycle given as floats are the same stored parameter.
+_encode_attribute(v::AbstractVector{<:Real}) = collect(Float64, v)
 _encode_attribute(v) = string(v)
 
 function _write_coordinates!(ds, run::GlacierCellRun, n_layer::Int)

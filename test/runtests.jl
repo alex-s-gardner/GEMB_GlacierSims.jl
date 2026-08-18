@@ -7,6 +7,7 @@ using DimensionalData
 using Statistics
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
+using GEMB_ClimateForcing: climate_adjust_for_elevation
 using NCDatasets
 
 # One-row glacier elevation-class table from bin-center => area (km²) pairs, using the same
@@ -350,6 +351,30 @@ end
         end
         @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3
 
+        # A monthly cycle is stored as the 12-element vector, not flattened to a scalar or a
+        # string: NetCDF holds a numeric attribute vector natively, so the restart check compares
+        # it elementwise. Given as `Int`s it must land as the same parameter as the float form,
+        # or a cycle written one way and requested the other reads as a parameter change.
+        monthly = round.(6.5 .+ 0.5 .* sin.(2π .* (1:12) ./ 12), digits = 3)
+        pm = run_parameters(mp; coverage = 0.95, lapse_rate = monthly)
+        @test pm["temperature_lapse_rate"] == monthly
+        @test run_parameters(mp; coverage = 0.95,
+                             lapse_rate = collect(1:12))["temperature_lapse_rate"] ==
+              collect(Float64, 1:12)
+
+        # A per-timestep rate is refused at the point the caller can act on it. Its length tracks
+        # the forcing record, so it could not be recorded as a parameter a continuation matches —
+        # every append would read as a parameter change with no way to store it that does not.
+        err = try
+            run_parameters(mp; coverage = 0.95, lapse_rate = fill(6.5, 100))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("12-element monthly", err.msg)
+        @test occursin("continuation", err.msg)
+
         # No decoupling is recorded as the identity, not as an absent key, so switching the
         # correction on or off is a visible parameter change on restart.
         @test p["glacier_decoupling_factor"] == 1.0
@@ -385,6 +410,25 @@ end
                                                              "model_densification_method" => :Ligtenberg))
         @test d["model_albedo_ice"] == (0.48, 0.40)
         @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
+
+        # A monthly lapse-rate cycle compares elementwise, so a stored integer cycle matches the
+        # float form and a single changed month is a disagreement. Without vector encoding these
+        # would compare by print formatting, where `Any[...]` and `Float64[...]` differ while the
+        # values do not.
+        cycle = collect(Float64, 1:12)
+        @test isempty(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => cycle),
+            Dict{String,Any}("temperature_lapse_rate" => collect(1:12))))
+        changed = copy(cycle); changed[7] = 9.0
+        @test haskey(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => cycle),
+            Dict{String,Any}("temperature_lapse_rate" => changed)), "temperature_lapse_rate")
+
+        # A scalar and a monthly cycle are different configurations even when every month equals
+        # the scalar — one is a request for a constant rate, the other for a seasonal one.
+        @test haskey(run_parameter_differences(
+            Dict{String,Any}("temperature_lapse_rate" => 6.5),
+            Dict{String,Any}("temperature_lapse_rate" => fill(6.5, 12))), "temperature_lapse_rate")
     end
 
     @testset "read_glacier_cell_status" begin
@@ -433,6 +477,22 @@ end
         @test stored["model_densification_method"] == "Arthern"
         @test stored["model_shortwave_subsurface_absorption"] == "false"
         @test read_glacier_cell_parameters(joinpath(dir, "absent.nc")) === nothing
+
+        # A monthly lapse-rate cycle survives the file as numbers, so the restart check compares
+        # it to the requested cycle elementwise. This is the round trip the in-memory
+        # `run_parameter_differences` tests assume: without it the cycle would come back
+        # stringified and every continuation would read as a parameter change.
+        cycle_path = joinpath(dir, "cycle.nc")
+        cycle = round.(6.5 .+ 0.5 .* sin.(2π .* (1:12) ./ 12), digits = 3)
+        cycle_params = run_parameters(initialize_parameters(); coverage = 0.95,
+                                     lapse_rate = cycle)
+        write_glacier_cell_netcdf(cycle_path,
+                                  _fake_run(; time = t1, kw..., parameters = cycle_params))
+        cycle_restart = read_glacier_cell_restart(cycle_path)
+        @test cycle_restart.parameters["temperature_lapse_rate"] == cycle
+        @test isempty(run_parameter_differences(cycle_restart.parameters, cycle_params))
+        @test GEMB_GlacierSims._validate_restart_parameters(
+            cycle_restart, cycle_params; force_restart = false) === nothing
 
         restart = read_glacier_cell_restart(path)
         @test restart.parameters["model_albedo_ice"] == 0.48
@@ -675,6 +735,24 @@ end
         # `scripts/check_threaded_equivalence.jl` asserts, bit-for-bit, on a real cell.
         m = only(methods(gemb_glacier_cell))
         @test :threaded in Base.kwarg_decl(m)
+    end
+
+    @testset "monthly lapse rate reaches the forcing" begin
+        # `gemb_glacier_cell` forwards `lapse_rate` to `forcing_at_elevation` untouched, so a
+        # monthly cycle must lapse each step by its own month's rate. Checked on the forcing
+        # rather than through a run — the latter needs real GEMB, so network — and against a
+        # January-only fixture, where the cycle's first entry is the only one that applies.
+        f = _cp_forcing(45.0, 7.0, 1000.0, fill(260.0, 6))
+        cycle = collect(Float64, 1:12)
+        raise(lr) = climate_adjust_for_elevation(f, 500.0; lapse_rate = lr)
+        @test all(≈(260.0 - cycle[1] * 0.5), raise(cycle)[:temperature_air])
+
+        # And the scalar path is unchanged: a constant cycle equals the scalar of that value.
+        @test raise(fill(6.5, 12))[:temperature_air] == raise(6.5)[:temperature_air]
+
+        # The signature no longer pins `lapse_rate` to a scalar, which is what let the monthly
+        # form through in the first place.
+        @test :lapse_rate in Base.kwarg_decl(only(methods(gemb_glacier_cell)))
     end
 
     @testset "grid_cells_in_region" begin
