@@ -215,11 +215,8 @@ cell in the sweep — so this throws instead. A table predating the current inva
 (`glm_frac`) is migrated in place by `scripts/migrate_invariant_colnames.jl`.
 """
 function cell_decoupling_factor(row; max_distance::Real = 10.0)
-    hasproperty(row, :glm) || throw(ArgumentError(
-        "glacier elevation-class row has no `:glm` column, so the decoupling factor cannot be " *
-        "weighted by the cell's non-glacier fraction. A table built before the current invariant " *
-        "column naming carries `:glm_frac`; run `scripts/migrate_invariant_colnames.jl` to " *
-        "rename it in place."))
+    # Throws when the column is absent, so schema drift is caught before the positional lookup.
+    glm = _row_glm(row)
 
     lon, lat = _cell_lonlat(row.geometry)
 
@@ -231,12 +228,6 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
         e isa InterruptException && rethrow()
         return nothing
     end
-
-    # `missing`/`NaN` are real data gaps (an invariant field undefined for the cell), not schema
-    # drift, so they fall back to the uncorrected reanalysis assumption rather than throwing.
-    glm_raw = row.glm
-    glm = (glm_raw === missing || !isfinite(Float64(glm_raw))) ? 0.0 :
-          clamp(Float64(glm_raw), 0.0, 1.0)
 
     # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
     return (; decoupling_factor = 1 - (1 - found.k) * (1 - glm),
@@ -331,7 +322,8 @@ or perturbations.
 - `delta_temperatures`: prescribed air temperature offsets (K).
 - `precipitation_scalings`: prescribed precipitation multipliers (dimensionless).
 - `coverage = 0.95`: fraction of cell glacier area the modeled bins must cover.
-- `lapse_rate = 6.5`: temperature lapse rate (K/km) for the per-bin elevation adjustment.
+- `lapse_rate = $(_DEFAULT_LAPSE_RATE)`: temperature lapse rate (K/km) for the per-bin elevation
+  adjustment.
 - `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
   Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
   ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
@@ -367,7 +359,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            delta_temperatures = [0.0],
                            precipitation_scalings = [1.0],
                            coverage::Real = 0.95,
-                           lapse_rate::Real = 6.5,
+                           lapse_rate::Real = _DEFAULT_LAPSE_RATE,
                            glacier_decoupling = true,
                            spinup_window = nothing,
                            max_iterations::Int = 1000,
