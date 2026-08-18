@@ -20,7 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.10'   # lower bound from Project.toml [compat]
+          - '1.11'   # lower bound from Project.toml [compat]; GEMB_ClimateForcing
+                     # pulls in EarthData, which pins Base64 = "1.11.0".
         os:
           - ubuntu-latest
     steps:
