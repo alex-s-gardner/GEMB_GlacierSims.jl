@@ -20,14 +20,12 @@ const CELL_MASS_VARIABLES = (:melt, :runoff, :refreeze, :evaporation_condensatio
 # boundary; `evaporation_condensation` is positive for mass gain.
 const CELL_MASS_CHANGE_FORMULA = "precipitation - runoff + evaporation_condensation"
 
-# The layers that constitute a complete GEMB restart state (`gemb` reads exactly these,
-# `GEMB.jl/src/gemb_driver.jl`). Every one is required: `gemb` indexes them by name off the
-# profile, so a missing layer is a `FieldError` on the first timestep, not a silent default.
-# `age` is part of the state even though no physics reads it — it is the column's only clock,
-# and dropping it from the round-trip would restart every continuation's age at whatever the
-# saved column happened to hold.
-const PROFILE_VARIABLES = (:dz, :temperature, :density, :water, :grain_radius,
-                          :grain_dendricity, :grain_sphericity, :age)
+# The layers that constitute a complete GEMB restart state. Aliased from `GEMB.RESTART_LAYERS`
+# rather than listed here, because GEMB is the only place that can honestly own the list: it is
+# what `gemb` reads off a profile, and a copy here could not detect the case that matters — a
+# layer added to GEMB's state would leave this list stale in exactly the same way as an old
+# restart file, and the check in `read_glacier_cell_restart` would pass.
+const PROFILE_VARIABLES = GEMB.RESTART_LAYERS
 
 # Everything carried as a per-cell total: the area-weighted fluxes plus the budget assembled
 # from them. Keys of `GlacierCellRun.totals` and the mass variables in the NetCDF output.
@@ -46,8 +44,9 @@ The settings that define *how* a cell is run, as NetCDF global attributes.
 These are exactly the values that must be identical for a continuation to be a continuation
 rather than a different experiment spliced onto an old record, so they are what
 [`gemb_glacier_cell`](@ref) checks a restart against. Every `ModelParameters` field is included,
-prefixed `model_`, except `dt_divisors`, which `gemb` computes from the forcing timestep and
-overwrites whatever it is handed (`GEMB.jl/src/gemb_driver.jl` excludes it for the same reason).
+prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gemb` computes from
+the forcing and overwrites whatever it is handed, so they say nothing about how a run was
+configured and would compare unequal for reasons the caller never chose.
 
 Deliberately *excluded* are the things expected to differ between an original run and its
 continuation: the output time axis, the `spinup_*`/`climatology_*` provenance (a resumed run
@@ -64,7 +63,7 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate::Real,
                               "glacier_decoupling_factor" =>
                                   decoupling_factor === nothing ? 1.0 : Float64(decoupling_factor))
     for field in propertynames(mp)
-        field === :dt_divisors && continue
+        field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
     end
     return params
@@ -223,9 +222,11 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
     lon, lat = _cell_lonlat(row.geometry)
 
     # Positional lookups error rather than return a sentinel when nothing is close enough (or the
-    # RGI region is uncovered). No `k` is a run-on-ambient-forcing outcome, not a failure.
+    # RGI region is uncovered). No `k` is a run-on-ambient-forcing outcome, not a failure. The
+    # longitude goes in unwrapped: `glacier_decoupling` wraps it itself, and pre-wrapping would
+    # make this the second place that has to agree about the convention.
     found = try
-        glacier_decoupling(Float64(lat), wrap_lon(Float64(lon)); max_distance)
+        glacier_decoupling(Float64(lat), Float64(lon); max_distance)
     catch e
         e isa InterruptException && rethrow()
         return nothing

@@ -345,7 +345,10 @@ end
         @test p["model_albedo_ice"] == mp.albedo_ice
         @test p["model_densification_method"] === mp.densification_method
         @test !haskey(p, "model_dt_divisors")
-        @test length(p) == length(propertynames(mp)) - 1 + 3
+        for field in GEMB.DERIVED_PARAMETERS
+            @test !haskey(p, "model_" * string(field))
+        end
+        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3
 
         # No decoupling is recorded as the identity, not as an absent key, so switching the
         # correction on or off is a visible parameter change on restart.
@@ -476,9 +479,10 @@ end
 
     @testset "PROFILE_VARIABLES is the complete GEMB state" begin
         # The roster is what the restart group stores, so a layer missing from it is silently
-        # dropped on write and then a bare `FieldError` inside `gemb` on continuation. Pin it
-        # against a real initialized profile rather than a hand-copied list, so a state layer
-        # added in GEMB.jl fails here instead of at the first restart months later.
+        # dropped on write and then rejected inside `gemb` on continuation. It is an alias of
+        # `GEMB.RESTART_LAYERS`, and this pins that alias against a real initialized profile —
+        # so the assertion still fails here if GEMB's constant and GEMB's state diverge, rather
+        # than at the first restart months later.
         n = 10
         t = collect(DateTime(2000, 1, 1):Day(1):DateTime(2000, 1, n))
         cf = GEMB.initialize_forcing(t, fill(250.0, n), fill(85000.0, n), fill(3.0, n),
