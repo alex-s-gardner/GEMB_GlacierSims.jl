@@ -358,6 +358,10 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # so it would fail identically for every remaining cell. Abort rather than log it
         # thousands of times; the message says how to proceed deliberately.
         e isa RestartParameterMismatch && rethrow()
+        # Likewise a spinup window this sweep's fetch cannot cover: it is set by `restart_overlap`
+        # and the requested `forcing_time_range` above, not by the cell, so every cell with a
+        # fallback bin fails the same way. The message says which window to fetch.
+        e isa SpinupWindowUnavailable && rethrow()
         # Same reasoning for a broken driver: a typo, an undefined name, or a stale session whose
         # loaded GEMB_GlacierSims predates a function used above is a property of the script, not
         # of the cell. Swallowed per cell it turns into thousands of identical "Cell failed"

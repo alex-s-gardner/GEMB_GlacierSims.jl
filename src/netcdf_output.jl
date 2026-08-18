@@ -146,12 +146,18 @@ end
 Read the restart state written by [`write_glacier_cell_netcdf`](@ref). Returns `nothing` if the
 file does not exist, so a driver can fall through to a cold start.
 
-Returns `(; time, profiles, bin_centers, delta_temperatures, precipitation_scalings, parameters)`
-where `profiles` maps `(i_bin, i_delta, i_scaling)` to the profile `DimStack` that `gemb`
-accepts (the layers in [`PROFILE_VARIABLES`](@ref)), truncated to that run's real column length. `time` is the last output time in the
-file, i.e. the point the continuation must start after. `parameters` is the file's stored run
-configuration ([`run_parameters`](@ref)), which `gemb_glacier_cell` checks the continuation
-against.
+Returns `(; time, profiles, bin_centers, delta_temperatures, precipitation_scalings, parameters,
+provenance)` where `profiles` maps `(i_bin, i_delta, i_scaling)` to the profile `DimStack` that
+`gemb` accepts (the layers in [`PROFILE_VARIABLES`](@ref)), truncated to that run's real column
+length. `time` is the last output time in the file, i.e. the point the continuation must start
+after. `parameters` is the file's stored run configuration ([`run_parameters`](@ref)), which
+`gemb_glacier_cell` checks the continuation against.
+
+`provenance` is the spinup and climatology account of the run this file descends from, in the
+encoded form it was written in. The same keys are restored onto each profile's stack metadata,
+which is where `gemb` reads them from — so a continuation reports the spinup it inherited rather
+than claiming none happened. `gemb_glacier_cell` also reads the climatology window from here to
+spin up any bin that has no saved profile on the same climatology as the rest of the record.
 """
 function read_glacier_cell_restart(path::AbstractString)
     isfile(path) || return nothing
@@ -185,6 +191,14 @@ function read_glacier_cell_restart(path::AbstractString)
         columns = Dict(v => g[string(v)][:, :, :, :] for v in PROFILE_VARIABLES)
         layer_metadata = cf_layer_index_attributes()
 
+        # The spinup this column descends from, restored onto the profile's stack metadata —
+        # which is where `gemb` reads provenance from (`GEMB._profile_provenance`). Without it a
+        # continuation reports `spinup_performed => false` and no climatology window, because the
+        # rebuilt profile carries no metadata, and the appended file would then claim the record
+        # was never spun up. A restart inherits the previous run's spun-up state; the spinup
+        # happened, it just happened in an earlier invocation.
+        provenance = _read_provenance(ds)
+
         for i_ps in eachindex(scalings), i_dt in eachindex(deltas), i_bin in eachindex(bin_centers)
             n = valid[i_bin, i_dt, i_ps]
             (ismissing(n) || n <= 0) && continue     # bin that produced no output
@@ -194,12 +208,13 @@ function read_glacier_cell_restart(path::AbstractString)
                 v => DimArray(collect(Float64, @view columns[v][1:n, i_bin, i_dt, i_ps]), (zdim,))
                 for v in PROFILE_VARIABLES)
             profiles[(i_bin, i_dt, i_ps)] =
-                DimStack(layers; layermetadata = cf_layermetadata(layers; time_axis = false))
+                DimStack(layers; layermetadata = cf_layermetadata(layers; time_axis = false),
+                         metadata = provenance)
         end
 
         return (; time, profiles, bin_centers,
                 delta_temperatures = deltas, precipitation_scalings = scalings,
-                parameters = _read_run_parameters(ds))
+                parameters = _read_run_parameters(ds), provenance)
     end
 end
 
@@ -267,8 +282,8 @@ function _write_run_parameters!(ds, run::GlacierCellRun)
     ds.attrib["run_parameters_comment"] =
         "The settings that define how this cell was run; a continuation must match them or " *
         "gemb_glacier_cell refuses to append without force_restart = true. Excludes what is " *
-        "expected to differ between a run and its continuation: the spinup_*/climatology_* " *
-        "provenance (a resumed run performs no spinup) and history."
+        "not a setting: history, and the spinup_*/climatology_* provenance, which records where " *
+        "the record came from and is carried across a continuation rather than recomputed."
     return nothing
 end
 
@@ -287,6 +302,22 @@ function read_glacier_cell_parameters(path::AbstractString)
     NCDatasets.NCDataset(path, "r") do ds
         _read_run_parameters(ds)
     end
+end
+
+# The spinup/climatology provenance a file carries, read back by the same name test that selected
+# it for writing (`_is_provenance_key`) — the writer merges it into the globals rather than listing
+# it, so there is no roster to consult and the convention is the only thing both sides share.
+#
+# Values come back in their encoded form: a `DateTime` as the string `_encode_attribute` wrote and
+# a `Bool` as "true"/"false". That is what makes the round trip stable — restoring these onto a
+# profile and letting `gemb` copy them onto the continuation's output re-encodes the same strings,
+# so the window a record was spun up on reads identically however many times it is appended to.
+function _read_provenance(ds)
+    prov = Dict{String,Any}()
+    for k in keys(ds.attrib)
+        _is_provenance_key(k) && (prov[k] = ds.attrib[k])
+    end
+    return prov
 end
 
 function _read_run_parameters(ds)

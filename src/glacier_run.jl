@@ -48,10 +48,10 @@ prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gem
 the forcing and overwrites whatever it is handed, so they say nothing about how a run was
 configured and would compare unequal for reasons the caller never chose.
 
-Deliberately *excluded* are the things expected to differ between an original run and its
-continuation: the output time axis, the `spinup_*`/`climatology_*` provenance (a resumed run
-performs no spinup at all, and a longer forcing record shifts the climatology window), `history`,
-and the `institution`/`references` labels.
+Deliberately *excluded* is everything that is not a setting: the output time axis, `history`, the
+`institution`/`references` labels, and the `spinup_*`/`climatology_*` provenance — which describes
+where the record came from rather than how it was configured, and is carried across a restart
+unchanged (see [`GlacierCellRun`](@ref)) rather than recomputed for the continuation.
 
 `lapse_rate` is a scalar or a 12-element monthly vector, and is stored in whichever form it was
 given — see [`gemb_glacier_cell`](@ref) for why the per-timestep form `climate_adjust_for_elevation`
@@ -113,7 +113,10 @@ totals over the full perturbation grid, plus the per-run final firn profiles for
   written as global attributes and checked against on restart. Includes `hypsometry_coverage`,
   `temperature_lapse_rate` and `glacier_decoupling_factor`.
 - `provenance`: the `spinup_*`/`climatology_*` keys `gemb` attached to the output. Recorded but
-  *not* checked on restart — a resumed run performs no spinup, so these are expected to differ.
+  *not* checked on restart, because it describes the record's origin rather than its
+  configuration. It is *carried* across a restart: `read_glacier_cell_restart` restores the saved
+  provenance onto each profile, so a continuation reports the spinup it actually inherited rather
+  than none at all.
 """
 struct GlacierCellRun
     latitude::Float64
@@ -306,6 +309,34 @@ end
 Base.showerror(io::IO, e::ForcingUnavailable) = print(io, "ForcingUnavailable: ", e.message)
 
 """
+    SpinupWindowUnavailable(window, n_selected, extent)
+
+Thrown by [`gemb_glacier_cell`](@ref) when the spinup window selects too little of the supplied
+forcing to average a climatological year. `window` is the `(start, stop)` that was asked for,
+`n_selected` how many steps fell inside it, and `extent` the `(first, last)` time of the forcing
+actually supplied.
+
+Its usual cause is a continuation: the window is inherited from the record being extended, but the
+caller fetched only forcing from near the saved time, so those years are absent. Unlike
+[`ForcingUnavailable`](@ref) this is a property of the *request* rather than of the cell — the same
+fetch fails for every cell with a fallback bin — so a driver should widen the window or set
+`spinup_window` rather than skip the cell.
+"""
+struct SpinupWindowUnavailable <: Exception
+    window::Tuple{DateTime,DateTime}
+    n_selected::Int
+    extent::Tuple{DateTime,DateTime}
+end
+
+Base.showerror(io::IO, e::SpinupWindowUnavailable) = print(io,
+    "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) selects " *
+    "$(e.n_selected) forcing step(s) of those supplied ($(e.extent[1]) .. $(e.extent[2])), " *
+    "too few to average a climatological year. On a continuation this window is the one the " *
+    "existing record was spun up on, so reproducing it needs forcing from those years: fetch " *
+    "from $(e.window[1]) rather than from near the saved time, or pass `spinup_window` to spin " *
+    "this run up on a different climatology than the record it extends.")
+
+"""
     forcing_is_complete(forcing_data) -> Bool
 
 Whether a `climate_forcing` stack actually carries data for its cell.
@@ -361,7 +392,13 @@ or perturbations.
   ambient forcing with no correction at all. Set `false` to skip the lookup entirely; pass a
   `Real` to prescribe `k` directly, bypassing both the table and the `glm` weighting.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
-  year used for spinup. Defaults to the first 30 complete years of the forcing.
+  year used for spinup. When not given, a continuation inherits the window its saved record was
+  spun up on (from the restart's stored provenance) and a cold start takes the first 30 complete
+  years of `forcing_data`. Inheriting matters because a restart does not re-spin up: a bin with no
+  saved profile must be spun up on the same climatology as the rest of the file, not on whatever
+  slice of forcing the continuation happened to fetch. If that window's years are outside the
+  supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
+  climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
 - `max_iterations`, `convergence_delta_density`: passed to `gemb_spinup`.
 - `restart`: the value returned by [`read_glacier_cell_restart`](@ref), or `nothing`. When
   given, each run resumes from its saved profile over forcing newer than the saved time and
@@ -421,6 +458,28 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     meta = DimensionalData.metadata(forcing_data)
     forcing_elevation = Float64(meta["elevation"])
 
+    # The climatology a fallback spinup must reproduce. Three sources, in order of authority:
+    # an explicit request; the window the record being continued was spun up on, read back off
+    # the file; and only failing both, the first 30 complete years of this call's forcing.
+    #
+    # The inherited case is what makes a continuation honest. A restart does not re-spin up — it
+    # inherits the previous run's column — so on the rare bin that has no saved profile the
+    # spinup has to be the one the rest of the file already had, not a fresh one over whatever
+    # slice of forcing the caller happened to fetch. `era5_example.jl` fetches from two days
+    # before the saved time, so a derived window there would be the continuation's own few
+    # steps: a completely different climate, substituted without a word.
+    inherited_window = restart === nothing ? nothing : _restart_spinup_window(restart)
+    window_inherited = spinup_window === nothing && inherited_window !== nothing
+    if spinup_window === nothing
+        spinup_window = something(inherited_window, _default_spinup_window(forcing_data))
+    end
+
+    # The record the spinup climatology is averaged from, taken before the restart subset below
+    # removes everything a window over the early years would need. Only the fallback path uses it,
+    # which is rare enough not to justify holding a second adjusted copy per task — so the
+    # adjustment is redone there.
+    spinup_forcing = forcing_data
+
     # Resuming: keep only forcing newer than the saved state. The saved time is the last
     # *output* time, and every forcing step up to and including it has been consumed.
     if restart !== nothing
@@ -432,11 +491,6 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         n_new = length(dims(forcing_data, Ti))
         n_new >= MIN_FORCING_STEPS || throw(ForcingUpToDate(restart.time, n_new))
         @info "Resuming from saved profile" restart_time=restart.time new_steps=n_new
-    end
-
-    if spinup_window === nothing
-        spinup_start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
-        spinup_window = (spinup_start, DateTime(year(spinup_start) + 29, 12, 31))
     end
 
     n_bin = length(cov.modeled)
@@ -477,16 +531,24 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         # Rebuilt per task rather than hoisted per perturbation: the adjustment is cheap next
         # to a spinup, and sharing one `adjusted` across bins would hand the same object to
         # concurrent tasks.
-        adjusted = precipitation_adjust(temperature_adjust(forcing_data, delta), pscale)
-        cf = forcing_at_elevation(adjusted, bin.center - forcing_elevation;
-                                  lapse_rate, decoupling_factor)
+        at_bin(f) = forcing_at_elevation(
+            precipitation_adjust(temperature_adjust(f, delta), pscale),
+            bin.center - forcing_elevation; lapse_rate, decoupling_factor)
+
+        cf = at_bin(forcing_data)
 
         profile = restart === nothing ? nothing :
                   get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
 
         if profile === nothing
-            restart === nothing || @warn "No saved profile for this run; spinning up over the truncated forcing" bin=bin.center delta pscale
-            cf_spinup = forcing_climatology(cf, spinup_window)
+            restart === nothing || @warn "No saved profile for this run; spinning up over the record's spinup window" bin=bin.center delta pscale window=spinup_window inherited=window_inherited
+            # On a continuation `cf` covers only the new steps, so a climatology over the spinup
+            # window would find nothing in it — the adjustments are reapplied to the untruncated
+            # record instead, giving this bin exactly the climate it is then run on. On a cold
+            # start `spinup_forcing === forcing_data` and `cf` is already that stack, so it is
+            # reused rather than recomputed: that is the common path.
+            cf_spinup = _spinup_climatology(
+                spinup_forcing === forcing_data ? cf : at_bin(spinup_forcing), spinup_window)
             profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
                                   max_iterations, convergence_delta_density)
         end
@@ -602,6 +664,66 @@ function _lookup_decoupling_factor(row)
     return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
+# The first 30 complete years of a record. Used only when nothing more authoritative is available:
+# no explicit `spinup_window` and no window inherited from a restart.
+function _default_spinup_window(forcing_data)
+    start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
+    return (start, DateTime(year(start) + 29, 12, 31))
+end
+
+# The window the record being continued was spun up on. Taken from the restart's file-level
+# `provenance` rather than from a saved profile's metadata, even though the two hold the same keys:
+# the window is needed precisely when a bin has *no* saved profile, and on a single-bin cell that is
+# also the case where `profiles` is empty and there is no profile left to read it from.
+#
+# The dates come back as the strings `_encode_attribute` wrote (NetCDF has no date attribute type),
+# so they are parsed rather than used as-is. A restart with no provenance or an unparseable window —
+# written before provenance was recorded — yields `nothing` and the caller derives one instead.
+function _restart_spinup_window(restart)
+    prov = get(restart, :provenance, nothing)
+    prov === nothing && return nothing
+    parsed = _parse_datetime.((get(prov, "climatology_window_start", nothing),
+                               get(prov, "climatology_window_stop", nothing)))
+    return any(isnothing, parsed) ? nothing : parsed
+end
+
+_parse_datetime(t::DateTime) = t
+_parse_datetime(::Nothing) = nothing
+_parse_datetime(s::AbstractString) = tryparse(DateTime, s)
+_parse_datetime(_) = nothing
+
+# The climatological year a fallback spinup runs on, with the one failure the window can have made
+# explicit: a window containing no complete year of this record.
+#
+# `forcing_climatology` averages whatever the window selects, and over an empty or partial selection
+# that is a `BoundsError` or a one-timestep "year" from deep inside GEMB — either way, unattributable
+# to the window that caused it. It happens for one reason worth naming: a continuation inherited the
+# window the record was spun up on (which is correct, and the point of inheriting it), but the caller
+# fetched only forcing near the saved time, so the years that window names were never downloaded.
+# `SpinupWindowUnavailable` names the window and the remedy, because the alternative — silently
+# spinning this bin up on a different climate than every other bin in the file — is the bug being
+# avoided here.
+function _spinup_climatology(cf, window)
+    times = lookup(cf, Ti)
+    selected = filter(t -> window[1] <= t <= window[2], times)
+
+    # A year of span, not a step count: `forcing_climatology` calls whichever years hold the most
+    # timesteps "complete", so a selection covering one partial year passes any count test and
+    # averages into a climatological "year" of however few steps that partial happened to hold.
+    # Spanning a year is what actually distinguishes a climatology from a fragment of one.
+    spans_a_year = !isempty(selected) && last(selected) - first(selected) >= Day(365)
+    spans_a_year ||
+        throw(SpinupWindowUnavailable(window, length(selected), (first(times), last(times))))
+
+    return forcing_climatology(cf, window)
+end
+
+# What counts as spinup/climatology provenance, by name. GEMB names these keys itself
+# (`GEMB._profile_provenance`, `_attach_spinup_provenance`) and does not publish a roster, so a
+# prefix test is the only contract available — and it must be the *same* test on the way out of a
+# stack and back off a file, or a key would be written and then not recognized on restart.
+_is_provenance_key(key) = startswith(key, "spinup") || startswith(key, "climatology")
+
 # Spinup/climatology provenance carried on the output stack by `gemb` (`_profile_provenance`).
 # Values can be `nothing`, `Bool` or `DateTime`; the NetCDF writer encodes them.
 function _stack_provenance(output)
@@ -609,9 +731,8 @@ function _stack_provenance(output)
     prov = Dict{String,Any}()
     meta isa DimensionalData.NoMetadata && return prov
     for (k, v) in pairs(meta)
-        key = string(k)
-        (startswith(key, "spinup") || startswith(key, "climatology")) || continue
-        prov[key] = v
+        _is_provenance_key(string(k)) || continue
+        prov[string(k)] = v
     end
     return prov
 end

@@ -683,7 +683,93 @@ end
             end
         end
 
+        # The spinup a column descends from comes back on the profile's *stack* metadata, which is
+        # where `gemb` reads provenance from. Without it a continuation would report
+        # `spinup_performed => false` and no climatology window, and the appended file would claim
+        # a record that was spun up never was.
+        for key in [(1, 1, 1), (2, 2, 1)]
+            pm = DimensionalData.metadata(restart.profiles[key])
+            @test pm["spinup_cycles"] == 37
+            @test pm["climatology_window_start"] == "1950-01-01T00:00:00"
+            # Encoded form, matching the file — re-encoding it is idempotent, so the window a
+            # record was spun up on reads identically however many times it is appended to.
+            @test pm["spinup_converged"] == "false"
+            # Only provenance is restored: the run parameters are checked separately and a
+            # `latitude` on the profile would be a claim `gemb` does not make about a column.
+            @test !haskey(pm, "hypsometry_coverage")
+            @test !haskey(pm, "latitude")
+        end
+
+        # And it survives a second hop: provenance read off a file and re-attached to a profile is
+        # what `gemb` copies onto the next output, which the appender then writes back.
+        @test GEMB_GlacierSims._stack_provenance(first(values(restart.profiles)))["spinup_cycles"] == 37
+
+        # The file-level provenance is returned alongside the profiles, because the climatology
+        # window is needed exactly when a bin has *no* profile to read it from.
+        @test restart.provenance["climatology_window_start"] == "1950-01-01T00:00:00"
+
         @test read_glacier_cell_restart(joinpath(dir, "absent.nc")) === nothing
+    end
+
+    @testset "spinup window inheritance" begin
+        # A cold start derives the window from the record: the first 30 complete years.
+        t = collect(DateTime(1960, 1, 1):Day(1):DateTime(1994, 12, 31))
+        cold = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test GEMB_GlacierSims._default_spinup_window(cold) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # A continuation inherits the window its record was spun up on, parsed back from the
+        # strings NetCDF stored (it has no date attribute type). This is the whole point: a
+        # restart does not re-spin up, so a fallback bin must use the file's climatology rather
+        # than the continuation's own few years of fetched forcing.
+        saved = (; provenance = Dict{String,Any}(
+            "climatology_window_start" => "1960-01-01T00:00:00",
+            "climatology_window_stop" => "1989-12-31T00:00:00"))
+        @test GEMB_GlacierSims._restart_spinup_window(saved) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # Read from the restart, not from a saved profile — on a single-bin cell the fallback case
+        # is also the case where `profiles` is empty, so a profile-sourced window would vanish
+        # precisely when it is needed.
+        @test GEMB_GlacierSims._restart_spinup_window(
+            (; saved..., profiles = Dict{Tuple{Int,Int,Int},DimStack}())) ==
+              (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+
+        # A file predating provenance, or one whose window will not parse, yields `nothing` so the
+        # caller derives a window instead of failing.
+        @test GEMB_GlacierSims._restart_spinup_window((; provenance = Dict{String,Any}())) === nothing
+        @test GEMB_GlacierSims._restart_spinup_window((; parameters = Dict{String,Any}())) === nothing
+        @test GEMB_GlacierSims._restart_spinup_window((; provenance = Dict{String,Any}(
+            "climatology_window_start" => "not a date",
+            "climatology_window_stop" => "1989-12-31T00:00:00"))) === nothing
+    end
+
+    @testset "SpinupWindowUnavailable" begin
+        # A window whose years were never fetched must say so. Silently averaging whatever the
+        # window does select would spin one bin up on a different climate than the rest of the
+        # record — the failure this exception exists to make visible.
+        t = collect(DateTime(1995, 1, 1):Day(1):DateTime(1999, 12, 31))
+        cf = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        window = (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+        err = try
+            GEMB_GlacierSims._spinup_climatology(cf, window)
+            nothing
+        catch e
+            e
+        end
+        @test err isa SpinupWindowUnavailable
+        @test err.window == window
+        @test err.n_selected == 0
+        @test err.extent == (first(t), last(t))
+        # The message names the window to fetch, since that is the remedy.
+        @test occursin("1960-01-01T00:00:00", sprint(showerror, err))
+
+        # A partial year is refused too, and this is why the test is a span rather than a count:
+        # `forcing_climatology` calls whichever years hold the most steps "complete", so six
+        # months of daily data would average into a 182-step "climatological year" without
+        # complaint.
+        partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
+        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial)
     end
 
     @testset "NetCDF append" begin
