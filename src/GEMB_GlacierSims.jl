@@ -26,7 +26,8 @@ include("glacier_elevation_class.jl")
 export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypsometry
 
 include("glacier_run.jl")
-export glacier_hypsometry_coverage, glacier_area_total, gemb_glacier_cell, GlacierCellRun
+export glacier_hypsometry_coverage, glacier_area_total, glacier_area_column,
+       gemb_glacier_cell, GlacierCellRun
 export forcing_is_complete, ForcingUpToDate, ForcingUnavailable, RestartParameterMismatch,
        SpinupWindowUnavailable
 export run_parameters, run_parameter_differences

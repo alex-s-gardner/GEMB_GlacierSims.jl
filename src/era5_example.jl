@@ -159,10 +159,13 @@ mp = initialize_parameters(output_frequency = :daily);
 # with the unmodeled remainder folded into the nearest modeled bin so no area is dropped) happens
 # inside `gemb_glacier_cell`, so the ~47,000-cell screen does not pay for it.
 begin
-    # `view = true` keeps this a SubDataFrame over the cached table rather than copying the
-    # ~47,000 rows (and their hyps_* columns) into a second frame.
-    qualifying_cells = filter(r -> glacier_area_total(r) >= cell_area_minimum,
-                              glacier_elevation_classes; view = true)
+    # Screened as a column, not row by row: `glacier_area_column` reads the table's precomputed
+    # total (or sums the per-bin columns as columns), which on the global table is ~40 ms against
+    # the ~1.8 s a per-row `filter` costs. The `view` keeps this a SubDataFrame over the cached
+    # table rather than copying the ~47,000 rows (and their hyps_* columns) into a second frame.
+    qualifying_cells = view(glacier_elevation_classes,
+                            glacier_area_column(glacier_elevation_classes) .>= cell_area_minimum,
+                            :)
     # `view = true` again, so truncating the selection does not materialize the rows either.
     if !(cell_limit === nothing || isinf(cell_limit))
         qualifying_cells = first(qualifying_cells, Int(cell_limit); view = true)

@@ -304,6 +304,47 @@ end
         @test_throws ArgumentError glacier_hypsometry_coverage(_hyps_row(1000 => 1.0); coverage = 1.5)
     end
 
+    @testset "glacier_area_total and glacier_area_column" begin
+        df = DataFrame(
+            Symbol(only(GEMB_GlacierSims._hyps_colnames([1000, 1100]))) => [10.0, 1.0, 0.0],
+            Symbol(only(GEMB_GlacierSims._hyps_colnames([1100, 1200]))) => [8.0, 2.0, 0.0],
+            # A non-hypsometry column must not be summed into a cell's glacier area, which is why
+            # the sum tests column names through `_parse_hyps_colname` rather than a `hyps_` prefix.
+            :glm => [0.4, 0.6, 0.1])
+
+        # The column form and the row form agree — they are the same screen at two granularities,
+        # so a table screened one way and a cell checked the other cannot disagree.
+        @test glacier_area_column(df) == [18.0, 3.0, 0.0]
+        @test [glacier_area_total(r) for r in eachrow(df)] == [18.0, 3.0, 0.0]
+
+        # With the total cached as a column, both read it instead of summing. This is the point of
+        # the column: the screen becomes a scalar read per row rather than a 100-column sum.
+        cached = copy(df)
+        cached[!, GEMB_GlacierSims.GLACIER_AREA_COLUMN] = [18.0, 3.0, 0.0]
+        @test glacier_area_column(cached) == [18.0, 3.0, 0.0]
+        @test [glacier_area_total(r) for r in eachrow(cached)] == [18.0, 3.0, 0.0]
+
+        # The cached column is authoritative when present, not merely consistent with the bins —
+        # that is what makes it a fast path rather than a redundant check. A table whose cache
+        # disagrees returns the cache, so the migration verifies the values it writes.
+        stale = copy(df)
+        stale[!, GEMB_GlacierSims.GLACIER_AREA_COLUMN] = [99.0, 99.0, 99.0]
+        @test glacier_area_column(stale) == [99.0, 99.0, 99.0]
+        @test glacier_area_total(first(eachrow(stale))) == 99.0
+
+        # A view screens against its own rows, so `grid_cells_in_region`'s column-wise area screen
+        # composes with an already-filtered table.
+        sub = view(df, [2, 1], :)
+        @test glacier_area_column(sub) == [3.0, 18.0]
+
+        # An Int column (a table built with integer areas) still returns Float64, so the screen
+        # comparison and the stored NetCDF weights are the same type either way.
+        ints = DataFrame(Symbol(only(GEMB_GlacierSims._hyps_colnames([1000, 1100]))) => [3, 4])
+        @test glacier_area_column(ints) == [3.0, 4.0]
+        @test glacier_area_column(ints) isa Vector{Float64}
+        @test glacier_area_total(first(eachrow(ints))) === 3.0
+    end
+
     @testset "forcing_is_complete" begin
         # ERA5-Land is land-only, so a cell whose grid point falls on water comes back all-NaN
         # with a NaN reference elevation. `gemb_glacier_cell` must reject that before GEMB

@@ -88,7 +88,7 @@ Cell centers are stored in the table's native 0–359.9°E convention, so they a
 more than 180° of longitude throws: crossing the antimeridian is not handled (the elevation-class
 builder does not handle it either), and a silently wrong selection is worse than an error.
 
-`area_minimum` screens cells by total glacier area (km²) with [`glacier_area_total`](@ref) before
+`area_minimum` screens cells by total glacier area (km²) with [`glacier_area_column`](@ref) before
 the geometric test, since that is much the cheaper of the two.
 
 Returns a view, not a copy: the table carries ~100 `hyps_*` columns over ~47,000 rows, and
@@ -107,18 +107,32 @@ function grid_cells_in_region(glacier_elevation_classes, roi_polygon; area_minim
         "either crosses the antimeridian (not handled — split it into two regions) or is in a " *
         "different longitude convention than the (-180, 180] one expected here"))
 
-    function keep(row)
+    # The area screen runs first and as a column, so the geometric tests below are only asked about
+    # rows that passed it. Done row-wise this is a 100-column sum per row and dominates the whole
+    # selection on a global table; as a column it is a single pass (`glacier_area_column`).
+    area = glacier_area_column(glacier_elevation_classes)
+
+    # `area` is in the order of the frame it was built from, which is the frame being indexed here,
+    # so the two line up whether that frame is a table or already a view.
+    keep = trues(length(area))
+    for (i, row) in enumerate(eachrow(glacier_elevation_classes))
         # Cheap screens first: area, then the region's bounding box, then the exact geometry.
-        glacier_area_total(row) >= area_minimum || return false
+        if area[i] < area_minimum
+            keep[i] = false
+            continue
+        end
         lon_raw, lat_raw = _cell_lonlat(row.geometry)
         lon = wrap_lon(Float64(lon_raw))
         lat = Float64(lat_raw)
-        (bbox.X[1] <= lon <= bbox.X[2] && bbox.Y[1] <= lat <= bbox.Y[2]) || return false
+        if !(bbox.X[1] <= lon <= bbox.X[2] && bbox.Y[1] <= lat <= bbox.Y[2])
+            keep[i] = false
+            continue
+        end
         point = GeoInterface.Point(lon, lat)
-        return any(g -> GO.contains(g, point), region)
+        keep[i] = any(g -> GO.contains(g, point), region)
     end
 
-    return filter(keep, glacier_elevation_classes; view = true)
+    return view(glacier_elevation_classes, keep, :)
 end
 
 # Normalize the region argument to a vector of geometries so the containment test is one `any` for
