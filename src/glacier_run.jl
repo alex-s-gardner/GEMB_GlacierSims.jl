@@ -341,7 +341,7 @@ or perturbations.
   serially (useful when the caller is already saturating the machine by running many cells in
   parallel, as grouping cells by `chunk_id` does). Thread count comes from `julia -t N`.
 - `on_output = nothing`: called as `on_output(output; bin, delta, pscale, decoupling_factor)` with
-  each simulation's full output `DimStack`, for inspection (e.g. `gemb_plot_output`) or diagnostics.
+  each simulation's full output `DimStack`, for inspection (e.g. `plot_output`) or diagnostics.
   The stack is otherwise dropped as soon as its flux vectors are extracted, so this is the only
   place it can be reached; the callback must not retain it, or the memory the per-task extraction
   avoids is held after all. Called from inside the task, so with `threaded = true` it runs
