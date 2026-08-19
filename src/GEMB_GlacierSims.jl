@@ -32,9 +32,14 @@ import GeoInterface
 import GeometryOps as GO
 import Tables
 import NCDatasets
+# The sweep's summary and point->tile index are plain tables with no geometry column, so they are
+# written with Parquet2 (which GeoParquet already carries) rather than through GeoDataFrames.
+import GeoParquet
+import GeoParquet.Parquet2
 
 include("util.jl")
 export era5_land_invariant, wrap_lon, forcing_at_elevation
+export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
 include("glacier_elevation_class.jl")
 export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypsometry
@@ -53,8 +58,15 @@ export write_glacier_cell_netcdf, append_glacier_cell_netcdf, read_glacier_cell_
 export read_glacier_cell_parameters, read_glacier_cell_status
 
 include("downscaling_parameters.jl")
-export derive_downscaling_parameters, grid_cells_in_region
+export derive_downscaling_parameters, grid_cells_in_region, RegionForcingUnavailable
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+
+include("netcdf_downscaling_parameters.jl")
+export write_downscaling_tile_netcdf, write_sparse_downscaling_tile_netcdf
+export read_downscaling_tile, read_downscaling_tile_status
+
+include("downscaling_tiles.jl")
+export downscaling_tiles, tile_index, tile_bounds, derive_downscaling_parameter_tiles
 
 
 end # module

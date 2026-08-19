@@ -174,60 +174,12 @@ begin
 end;
 
 # One NetCDF per cell, named `N52.3_W174.1.nc` by cell center, so a file is traceable to its cell
-# and a listing sorts geographically (by hemisphere, then by degree).
-#
-# The form follows ISO 6709's letter-prefix convention: hemisphere letter, then zero-padded
-# magnitude — two integer digits of latitude, three of longitude, which `wrap_lon` bounds at 180.
-# The letters carry the sign, so every name is the same length without spending a character on
-# '+', and they make `lat`/`lon` prefixes redundant, since N/S can only be a latitude and E/W only
-# a longitude. Keeping '-' out of filenames also avoids the corner where shell and `find` argument
-# parsing treat a name as an option. The cost is that the degrees no longer `parse` straight out
-# of the substring; `parse_cell_lonlat` below is the inverse, so nothing has to re-derive the
-# format.
-#
-# The '_' between the two coordinates is redundant as a delimiter — the E/W letter already marks
-# where latitude ends — but it makes the boundary visible without hunting for a letter among
-# digits, and it means splitting a name into its two halves does not depend on the zero-padding
-# being exactly 2-and-3 digits.
-#
-# ONE decimal, because that is all the forcing grid has: ERA5-Land is 0.1°, so every cell centre
-# in `glacier_elevation_classes` is exact at 1 dp and a second decimal is always '0' — a character
-# of noise in every name. That makes the decimal point itself the only punctuation left, and it is
-# worth keeping: dropping it would leave the scale implied ('N523' read as tenths), and the
-# standard alternative for a point-free name is ISO 6709 degrees-minutes ('N5218'), which is less
-# readable than decimal degrees for anyone working in this field.
-#
-# This ties the name to a 0.1° grid: a finer forcing grid (ERA5 at 0.25° is fine, but a 0.01°
-# product would not be) needs another decimal here, or two of its cells would collide on one name.
-const _CELL_NAME_DECIMALS = 1
-
-function _degrees_tag(x, intdigits, positive, negative)
-    # Round first, then split, so a cell just under a degree (52.97 at 1 dp) becomes 53.0 rather
-    # than 52.10.
-    scale = 10^_CELL_NAME_DECIMALS
-    r = round(abs(x), digits = _CELL_NAME_DECIMALS)
-    whole, frac = floor(Int, r), round(Int, scale * (r - floor(r)))
-    # `x < 0` and not `signbit`: -0.0 is the equator/prime meridian, which is not a hemisphere.
-    return (x < 0 ? negative : positive) * lpad(whole, intdigits, '0') * "." *
-           lpad(frac, _CELL_NAME_DECIMALS, '0')
-end
-cell_output_path(r) = joinpath(output_dir,
-    _degrees_tag(r.latitude, 2, 'N', 'S') * "_" *
-    _degrees_tag(wrap_lon(r.longitude), 3, 'E', 'W') * ".nc")
-
-# Inverse of `cell_output_path`: the (lat, lon) a cell file is named for, or `nothing` if the name
-# is not one of ours. Rounded to the name's precision, so it identifies the cell but is not the
-# exact centre — read the file's attributes for that. Provided so downstream tooling can recover
-# the cell from a filename without re-implementing the format and drifting from it.
-const _CELL_NAME_REGEX =
-    Regex("^([NS])(\\d{2}\\.\\d{$_CELL_NAME_DECIMALS})_([EW])(\\d{3}\\.\\d{$_CELL_NAME_DECIMALS})\\.nc\$")
-
-function parse_cell_lonlat(path::AbstractString)
-    m = match(_CELL_NAME_REGEX, basename(path))
-    m === nothing && return nothing
-    return (latitude = parse(Float64, m[2]) * (m[1] == "S" ? -1 : 1),
-            longitude = parse(Float64, m[4]) * (m[3] == "W" ? -1 : 1))
-end
+# and a listing sorts geographically (by hemisphere, then by degree). `cell_output_name` and its
+# inverse `parse_cell_lonlat` are package functions (`src/util.jl`) rather than script-local ones,
+# because the tile files of a downscaling-parameter sweep follow the same ISO 6709 convention and
+# a second copy of the format would be a second thing to keep in step. See that file for why the
+# name is shaped the way it is.
+cell_output_path(r) = joinpath(output_dir, cell_output_name(r.latitude, r.longitude))
 
 # `on_output` hook for `verbose_plotting`: one full GEMB diagnostic panel per simulation, titled
 # with the cell and the perturbation it belongs to so the figures stay distinguishable. Built per
@@ -370,7 +322,7 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # of the cell. Swallowed per cell it turns into thousands of identical "Cell failed"
         # warnings and looks like the *data* is bad — abort on the first one so the real error is
         # what gets read. Requires `using Revise` (or a restart) after editing the package.
-        (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
+        is_caller_error(e) && rethrow()
         # An existing file that already spans the forcing is up to date, not broken; re-running
         # the sweep before new forcing is published hits this for every completed cell.
         if e isa ForcingUpToDate
