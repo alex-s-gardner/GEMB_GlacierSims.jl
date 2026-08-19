@@ -1134,11 +1134,28 @@ end
             @test sum(iv.area for iv in pw.elevation_interval_forcing) ≈
                   sum(glacier_area_total(r) for r in eachrow(pw.grid_cells))
 
-            # Every cell unusable is an error, not an empty result.
-            @test_throws ArgumentError derive_downscaling_parameters(
+            # Every cell unusable is an error, not an empty result — and a *typed* one, distinct from
+            # the `ArgumentError` a bad argument raises. A tiled sweep hits this legitimately (a
+            # region of island glaciers whose every centre is on water) and has to be able to record
+            # the region as unrunnable rather than treat it as a bug, which matching on an error
+            # message could not do safely.
+            @test_throws RegionForcingUnavailable derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, _ -> fill(NaN, length(_CP_TIME))))
+            # The count of cells that were tried is carried, so a log line can say how big the
+            # unrunnable region was without re-selecting it.
+            e = try
+                derive_downscaling_parameters(
+                    :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                    min_cells = 4,
+                    forcing_loader = _cp_loader(cells, _ -> fill(NaN, length(_CP_TIME))))
+                nothing
+            catch err
+                err
+            end
+            @test e isa RegionForcingUnavailable && e.n_cells == 4
+            @test occursin("land-only", sprint(showerror, e))
 
             # A region containing no cells at all, likewise.
             @test_throws ArgumentError derive_downscaling_parameters(
@@ -1345,6 +1362,496 @@ end
                 :synthetic, time_range, stale, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, observed))
+        end
+    end
+
+    @testset "downscaling_tiles" begin
+        # Four cells in one 2° tile, one in the next tile east, one far away.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5, bins = [(1550, 10.0)]),
+                 (lon = 11.9, lat = 46.0, z = 2000.0, glm = 1.0, bins = [(2050, 10.0)]),
+                 (lon = 12.1, lat = 46.0, z = 2500.0, glm = 0.25, bins = [(2550, 10.0)]),
+                 (lon = 40.0, lat = 20.0, z = 1000.0, glm = 0.1, bins = [(1050, 3.0)])]
+        table = _cp_table(cells)
+
+        tiles = downscaling_tiles(table; tile_size = 2, buffer = 1)
+        by_index = Dict(t.index => t for t in tiles)
+        @test sort(collect(keys(by_index))) == [(10, 46), (12, 46), (40, 20)]
+
+        # The cores partition the table: every row in exactly one, none in two. This is the property
+        # the arithmetic assignment exists for, and the reason the tiling does not go through
+        # `grid_cells_in_region` — see the `_cp_region` boundary test above, where a cell centered on
+        # a region edge is (correctly, for that function) excluded from both sides.
+        core_rows = vcat([parentindices(t.core)[1] for t in tiles]...)
+        @test length(core_rows) == nrow(table)
+        @test allunique(core_rows)
+        @test sort(core_rows) == collect(1:nrow(table))
+
+        # A cell exactly on a tile edge lands in the tile it is the *lower* edge of, not in neither.
+        @test tile_index(10.0, 46.0) == (10, 46)
+        @test tile_index(12.0, 46.0) == (12, 46)
+
+        # Buffered is a superset of core and reaches across the tile boundary: the 11.9 cell is 1°
+        # from the 12-tile's western edge, so it fits that tile too.
+        for t in tiles
+            @test issubset(Set(parentindices(t.core)[1]), Set(parentindices(t.buffered)[1]))
+        end
+        # The 12-tile spans 12-14°, so a 1° buffer reaches back to 11.0: it picks up the 11.9 cell
+        # from its western neighbour but not the 10.1 one, which is 2.9° from its centre.
+        @test sort(collect(by_index[(12, 46)].buffered.longitude)) == [11.9, 12.1]
+        @test sort(collect(by_index[(10, 46)].buffered.longitude)) == [10.0, 10.1, 11.9, 12.1]
+        # ...and the far cell's tile sees only itself, buffer or no buffer.
+        @test nrow(by_index[(40, 20)].buffered) == 1
+
+        # Views, not copies: the real table is ~47k rows x ~100 hyps columns per tile selection.
+        @test all(t -> t.core isa SubDataFrame && t.buffered isa SubDataFrame, tiles)
+        # Row order preserved inside a selection, so a chunk_id-sorted table stays sorted and a
+        # streaming pass over a tile keeps its Zarr cache locality.
+        @test all(t -> issorted(parentindices(t.buffered)[1]), tiles)
+
+        # The wrap trap, as for `grid_cells_in_region`: centers are stored native 0-359.9°E and the
+        # tiling is on (-180, 180], so 350°E is -10° and belongs to the tile at -10.
+        west = _cp_table([(lon = 350.0, lat = 46.0, z = 1000.0, glm = 0.2, bins = [(1050, 5.0)])])
+        @test only(downscaling_tiles(west; tile_size = 2, buffer = 1)).index == (-10, 46)
+
+        # `area_minimum` screens before tiling, so a screened-out cell is in no tile at all — which
+        # keeps the partition a partition of the *qualifying* rows.
+        @test sum(nrow(t.core) for t in downscaling_tiles(table; area_minimum = 6.0)) == 4
+        @test isempty(downscaling_tiles(table; area_minimum = 1e6))
+
+        # The table must carry the columns the forcing loader is keyed on, and say so here rather
+        # than failing tens of thousands of cell loads into a sweep.
+        @test_throws ArgumentError downscaling_tiles(select(table, Not(:latitude)))
+        @test_throws ArgumentError downscaling_tiles(table; order = :nonsense)
+        @test_throws ArgumentError downscaling_tiles(table; buffer = -1)
+
+        @testset "antimeridian" begin
+            # The case that rules out a polygon per tile: a tile against the seam has a buffer that
+            # crosses it, and a region spanning ±180 is exactly what `grid_cells_in_region` refuses.
+            am = _cp_table([(lon = 179.5, lat = 60.0, z = 1000.0, glm = 0.2, bins = [(1050, 5.0)]),
+                            (lon = 180.5, lat = 60.0, z = 1200.0, glm = 0.2, bins = [(1250, 5.0)]),
+                            (lon = 179.9, lat = 60.0, z = 1400.0, glm = 0.2, bins = [(1450, 5.0)])])
+            tiles = downscaling_tiles(am; tile_size = 2, buffer = 1)
+            by = Dict(t.index => t for t in tiles)
+            # 180.5°E wraps to -179.5, which is west of the seam; the other two are east of it. So
+            # the three cells split across the two tiles that share the antimeridian.
+            @test sort(collect(keys(by))) == [(-180, 60), (178, 60)]
+            @test nrow(by[(-180, 60)].core) == 1
+            @test nrow(by[(178, 60)].core) == 2
+            # Each tile's buffer reaches across the seam and picks up the other's cells. Without the
+            # modular longitude distance these would be ~359° apart and neither would see the other.
+            @test nrow(by[(-180, 60)].buffered) == 3
+            @test nrow(by[(178, 60)].buffered) == 3
+
+            # No tile index at +180: tile edges land exactly on ±180 (tile_size divides 360), and a
+            # cell exactly on the seam folds onto the -180 tile rather than creating a duplicate
+            # column of tiles there.
+            @test all(t -> t.index[1] != 180, tiles)
+            @test tile_index(180.0, 60.0) == (-180, 60)
+            @test tile_index(-179.9, 60.0) == (-180, 60)
+            @test tile_index(179.9, 60.0) == (178, 60)
+
+            # The recorded buffered bounds are the honest span, not a wrapped one — a reader must be
+            # able to see that this window crosses the seam.
+            @test by[(-180, 60)].buffered_bounds.lon_min == -181.0
+            @test by[(178, 60)].buffered_bounds.lon_max == 181.0
+
+            # And it is not special-cased to one tile: at a coarse tile size several tiles have
+            # seam-crossing buffers, and the partition still holds.
+            coarse = downscaling_tiles(am; tile_size = 10, buffer = 1)
+            @test sum(nrow(t.core) for t in coarse) == nrow(am)
+        end
+
+        @testset "grid options" begin
+            spread = _cp_table([(lon = 10.0 + 0.5i, lat = 46.0 + 0.5j, z = 1000.0 + 100i,
+                                 glm = 0.1, bins = [(1050 + 100i, 4.0)])
+                                for i in 0:5, j in 0:5] |> vec)
+            for tile_size in (1, 2, 5), buffer in (0, 1, 2)
+                tiles = downscaling_tiles(spread; tile_size, buffer)
+                rows = vcat([parentindices(t.core)[1] for t in tiles]...)
+                # Total and disjoint at every grid setting, which is what makes the setting safe to
+                # change: no combination silently drops or duplicates a cell.
+                @test sort(rows) == collect(1:nrow(spread))
+                @test all(t -> issubset(Set(parentindices(t.core)[1]),
+                                        Set(parentindices(t.buffered)[1])), tiles)
+                # A zero buffer is legal and degenerate: the fits then see the tile alone.
+                buffer == 0 &&
+                    @test all(t -> parentindices(t.core)[1] == parentindices(t.buffered)[1], tiles)
+            end
+            # Finer tiles mean more of them; coarser mean fewer.
+            @test length(downscaling_tiles(spread; tile_size = 1)) >
+                  length(downscaling_tiles(spread; tile_size = 2)) >
+                  length(downscaling_tiles(spread; tile_size = 5))
+
+            # A tile size that does not divide 360 would make the column of tiles against +180
+            # narrower than every other while still reporting this `tile_size`; a fractional one
+            # would let two tiles collide on one file name. Both refuse.
+            @test_throws ArgumentError downscaling_tiles(spread; tile_size = 7)
+            @test_throws ArgumentError downscaling_tiles(spread; tile_size = 2.5)
+            @test_throws ArgumentError downscaling_tiles(spread; tile_size = 0)
+            # An integer-valued float is the same grid, so it is accepted.
+            @test length(downscaling_tiles(spread; tile_size = 2.0)) ==
+                  length(downscaling_tiles(spread; tile_size = 2))
+        end
+    end
+
+    @testset "output file naming" begin
+        # Round-trips, including the extremes of the padding.
+        for index in ((-142, 60), (-180, -80), (178, 82), (0, 0), (10, -2))
+            @test parse_tile_index(tile_output_name(index)) == index
+        end
+        @test tile_output_name((-142, 60)) == "N60_W142.nc"
+        @test tile_output_name((178, -80)) == "S80_E178.nc"
+
+        @test cell_output_name(52.3, -174.1) == "N52.3_W174.1.nc"
+        rt = parse_cell_lonlat(cell_output_name(52.3, -174.1))
+        @test rt.latitude == 52.3 && rt.longitude == -174.1
+        # Native longitudes name the same file as their wrapped equivalents.
+        @test cell_output_name(46.0, 350.0) == cell_output_name(46.0, -10.0)
+        # Rounding carries into the whole degrees rather than producing "52.10".
+        @test cell_output_name(52.97, 0.0) == "N53.0_E000.0.nc"
+
+        # The two name forms cannot be confused, which is what lets either be parsed without knowing
+        # which produced it: a cell name always carries its 0.1° decimal, a tile name never does.
+        @test parse_tile_index(cell_output_name(52.3, -174.1)) === nothing
+        @test parse_cell_lonlat(tile_output_name((-142, 60))) === nothing
+        @test parse_cell_lonlat("not-ours.nc") === nothing
+        @test parse_tile_index("not-ours.nc") === nothing
+    end
+
+    @testset "downscaling tile NetCDF" begin
+        # The same four synthetic cells the fits are validated against above, so the file's contents
+        # can be checked against a fit whose truth is known exactly.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5, bins = [(1550, 10.0)]),
+                 (lon = 10.2, lat = 46.0, z = 2000.0, glm = 1.0, bins = [(2050, 10.0)]),
+                 (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.25, bins = [(2550, 10.0)])]
+        table = _cp_table(cells)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+        k_true = 0.7
+        ambient(c) = 292.0 - 5.0 * c.z / 1000.0
+        function observed(c)
+            a = ambient(c)
+            k_applied = 1 - c.glm * (1 - k_true)
+            return fill(a + (k_applied - 1) * max(a - 273.15, 0.0), length(_CP_TIME))
+        end
+
+        tile = only(downscaling_tiles(table; tile_size = 2, buffer = 1))
+        p = derive_downscaling_parameters(:synthetic, time_range, tile.buffered;
+                                         token = nothing, cache_path = nothing, min_cells = 4,
+                                         forcing_loader = _cp_loader(cells, observed),
+                                         elevation_interval_batch = 0)
+
+        dir = mktempdir()
+        path = joinpath(dir, tile.name)
+        write_downscaling_tile_netcdf(path, tile, p; climate_model = :synthetic, time_range,
+                                      tile_size = 2, buffer = 1, min_cells = 4)
+        r = read_downscaling_tile(path)
+
+        @test r.time == p.time
+        @test collect(r.lapse_rate.lapse_rate) ≈ collect(p.lapse_rate.lapse_rate) atol = 1e-3
+        @test collect(r.decoupling.decoupling_factor) ≈
+              collect(p.decoupling.decoupling_factor) atol = 1e-6
+
+        # THE reason the coefficients are stored, and stored in Float64: `k` is a function of
+        # elevation (the fit carries a glm x z interaction), so a file that stored only the series
+        # would pin it to the reference elevation — while the glacier sits mostly above that. Storing
+        # the coefficients has to make `k(z)` reproducible *exactly*, including far above where it was
+        # fitted, which is where a Float32 beta would visibly drift.
+        for z in (1000.0, 1750.0, 5000.0, 8000.0)
+            from_file = collect(decoupling_factor_at_elevation(r.decoupling, z))
+            in_memory = collect(decoupling_factor_at_elevation(p.decoupling, z))
+            @test all(((a, b),) -> (isnan(a) && isnan(b)) || a == b,
+                      zip(from_file, in_memory))
+        end
+        @test all(c -> collect(r.decoupling[c]) == collect(p.decoupling[c]),
+                  (:coef_alpha, :coef_beta, :coef_gamma, :coef_delta))
+
+        # The joint screen, as a variable rather than a comment a reader may skip.
+        @test r.fit_usable ==
+              [isfinite(k) && 0 < k <= 1 for k in collect(p.decoupling.decoupling_factor)]
+
+        # Two cell sets, answering two different questions: what the parameters apply to (the tile's
+        # core, its share of the global partition) and what they were fitted from (the buffered
+        # selection that had usable forcing).
+        @test nrow(r.cells) == nrow(tile.core)
+        @test sort(r.cells.longitude) == sort([wrap_lon(c.lon) for c in cells])
+        @test nrow(r.fit_cells) == nrow(p.grid_cells)
+        @test r.fit_cells.elevation == collect(p.cell_elevations)
+        @test r.fit_cells.glacier_area == collect(p.cell_areas)
+
+        # What a consumer needs to reproduce `k(z)` without this package.
+        for key in ("min_ambient_excess", "decoupling_reference_temperature",
+                    "decoupling_factor_formula", "reference_elevation", "tile_size", "tile_buffer",
+                    "tile_assignment", "longitude_convention", "n_cells_core", "n_cells_used",
+                    "requested_time_coverage_start", "downscaling_parameters")
+            @test haskey(r.attributes, key)
+        end
+        @test r.attributes["tile_size"] == 2.0
+        @test r.attributes["tile_buffer"] == 1.0
+        @test r.attributes["sparse"] == "false"
+
+        status = read_downscaling_tile_status(path)
+        @test status.sparse == false
+        @test status.n_timesteps == length(_CP_TIME)
+        @test status.n_cells_core == nrow(tile.core)
+        @test status.time_first == first(_CP_TIME) && status.time_last == last(_CP_TIME)
+        @test read_downscaling_tile_status(joinpath(dir, "N00_E000.nc")) === nothing
+
+        @testset "NaN survives Float32 and deflate" begin
+            # An unmeasurable timestep must read back as unmeasurable. Every cell at one elevation
+            # leaves the slope unidentifiable, so the lapse fit is NaN throughout — and a fill-value
+            # misconfiguration would turn that into a number, which is the one thing a diagnostic
+            # must not do.
+            flat = [(lon = c.lon, lat = c.lat, z = 1500.0, glm = c.glm, bins = c.bins)
+                    for c in cells]
+            ft = _cp_table(flat)
+            ftile = only(downscaling_tiles(ft; tile_size = 2, buffer = 1))
+            pf = derive_downscaling_parameters(:synthetic, time_range, ftile.buffered;
+                                              token = nothing, cache_path = nothing, min_cells = 4,
+                                              forcing_loader = _cp_loader(flat, observed),
+                                              elevation_interval_batch = 0)
+            fpath = joinpath(dir, "flat.nc")
+            write_downscaling_tile_netcdf(fpath, ftile, pf; climate_model = :synthetic, time_range,
+                                          tile_size = 2, buffer = 1, min_cells = 4)
+            rf = read_downscaling_tile(fpath)
+            @test all(isnan, collect(pf.lapse_rate.lapse_rate))
+            @test all(isnan, collect(rf.lapse_rate.lapse_rate))
+            @test !any(rf.fit_usable)
+        end
+
+        @testset "elevation interval forcing" begin
+            ivs = collect(p.elevation_interval_forcing)
+            ipath = joinpath(dir, "intervals.nc")
+            write_downscaling_tile_netcdf(ipath, tile, p; climate_model = :synthetic, time_range,
+                                          tile_size = 2, buffer = 1, min_cells = 4,
+                                          elevation_intervals = ivs)
+            ri = read_downscaling_tile(ipath)
+
+            @test ri.intervals !== nothing
+            @test length(ri.intervals) == length(ivs)
+            @test [x.center for x in ri.intervals] == [x.center for x in ivs]
+            # No ice is dropped between the cells and the intervals.
+            @test sum(x.area for x in ri.intervals) ≈
+                  sum(glacier_area_total(row) for row in eachrow(p.grid_cells))
+            # Physics that has to survive the round-trip: higher intervals are colder, and the
+            # applied factor is inside the domain its consumer validates against.
+            @test issorted([mean(x.forcing[:temperature_air]) for x in ri.intervals], rev = true)
+            @test all(x -> all(v -> 0 < v <= 1, x.decoupling_factor), ri.intervals)
+            for j in eachindex(ivs)
+                @test collect(ri.intervals[j].forcing[:temperature_air]) ≈
+                      collect(ivs[j].forcing[:temperature_air]) atol = 1e-2
+            end
+            # Recorded as a stored setting, so a sweep asked for intervals does not reuse a
+            # fits-only file (and vice versa).
+            @test read_downscaling_tile_status(ipath).parameters["elevation_interval_forcing"] ==
+                  "true"
+            @test read_downscaling_tile_status(path).parameters["elevation_interval_forcing"] ==
+                  "false"
+
+            # A clamped `k` must survive the write still inside the domain it was clamped into.
+            #
+            # `_make_applicable` clamps a below-domain fit to `nextfloat(0.0)` = 5e-324 exactly so
+            # the value satisfies the half-open `(0, 1]` that `climate_adjust_for_glacier`
+            # validates. Float32's smallest subnormal is ~1e-45, so storing the applied series at
+            # `precision` would flatten that sentinel to 0.0 and the file would read back *outside*
+            # the domain the clamp exists to satisfy. Observed on real Wrangell-St Elias forcing,
+            # where 8.7% of applied values sat on the sentinel — routine, not an edge case.
+            @test Float32(nextfloat(0.0)) == 0.0f0            # the underflow that made this a bug
+            clamped = [(; lo = 1000, hi = 1100, center = 1050.0, area = 1.0, n_cells = 1,
+                        decoupling_factor = fill(nextfloat(0.0), length(_CP_TIME)),
+                        forcing = first(ivs).forcing)]
+            cpath = joinpath(dir, "clamped.nc")
+            write_downscaling_tile_netcdf(cpath, tile, p; climate_model = :synthetic, time_range,
+                                          tile_size = 2, buffer = 1, min_cells = 4,
+                                          elevation_intervals = clamped, precision = Float32)
+            back = only(read_downscaling_tile(cpath).intervals).decoupling_factor
+            @test all(v -> 0 < v <= 1, back)
+            @test back == fill(nextfloat(0.0), length(_CP_TIME))
+        end
+
+        @testset "sparse tile" begin
+            spath = joinpath(dir, "sparse.nc")
+            write_sparse_downscaling_tile_netcdf(spath, tile; climate_model = :synthetic, time_range,
+                                                 tile_size = 2, buffer = 1, min_cells = 8,
+                                                 reason = "below_min_cells")
+            st = read_downscaling_tile_status(spath)
+            @test st.sparse == true
+            @test st.sparse_reason == "below_min_cells"
+            # No time axis at all: a tile below `min_cells` never loads forcing, so its native
+            # timestep is genuinely unknown rather than empty-by-accident.
+            @test st.n_timesteps == 0
+            # ...so coverage is judged from the requested window instead, which is what keeps a
+            # sparse tile skippable on a re-run rather than re-derived forever.
+            @test st.time_first == first(time_range) && st.time_last == last(time_range)
+            # The cells are still listed. A file is written at all so that "missing" unambiguously
+            # means "not yet run", and so every cell on Earth stays accounted for.
+            @test st.n_cells_core == nrow(tile.core)
+            rs = read_downscaling_tile(spath)
+            @test nrow(rs.cells) == nrow(tile.core)
+            @test isempty(rs.time)
+            @test rs.intervals === nothing
+        end
+    end
+
+    @testset "derive_downscaling_parameter_tiles" begin
+        # Two fittable tiles and one holding a single cell, so one sweep exercises all three outcomes.
+        many = vcat([(lon = 10.0 + 0.1i, lat = 46.0, z = 1000.0 + 500i, glm = 0.05i,
+                      bins = [(1050 + 500i, 10.0)]) for i in 0:3],
+                    [(lon = 20.0 + 0.1i, lat = 46.0, z = 1200.0 + 400i, glm = 0.1i,
+                      bins = [(1250 + 400i, 8.0)]) for i in 0:3],
+                    [(lon = 30.0, lat = 46.0, z = 1500.0, glm = 0.3, bins = [(1550, 5.0)])])
+        mt = _cp_table(many)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+        obs(c) = (a = 292.0 - 5.0 * c.z / 1000.0;
+                  fill(a + ((1 - c.glm * (1 - 0.7)) - 1) * max(a - 273.15, 0.0), length(_CP_TIME)))
+
+        dir = mktempdir()
+        s = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, dir;
+                                              token = nothing, cache_path = nothing,
+                                              tile_size = 2, buffer = 1, min_cells = 4,
+                                              forcing_loader = _cp_loader(many, obs))
+        @test nrow(s) == 3
+        @test sort(s.status) == ["sparse", "written", "written"]
+        @test all(isfile(joinpath(dir, n)) for n in s.name)
+        # The lone-cell tile is recorded rather than skipped, so its cells stay accounted for.
+        sparse_row = only(eachrow(s[s.status .== "sparse", :]))
+        @test sparse_row.sparse_reason == "below_min_cells"
+        @test sparse_row.n_cells_core == 1
+
+        # The point->tile mapping: one row per cell, every cell present exactly once. This is what
+        # makes "parameters for every cell" a join rather than a scan of 819 files.
+        index = DataFrame(GEMB_GlacierSims.Parquet2.Dataset(joinpath(dir, "tiles_index.parquet")))
+        @test nrow(index) == nrow(mt)
+        @test sort(index.row) == collect(1:nrow(mt))
+        @test Set(index.tile_name) == Set(s.name)
+        @test isfile(joinpath(dir, "tiles_summary.parquet"))
+
+        @testset "resumability" begin
+            # A re-run over the same window must decide from metadata alone. Counted, because the
+            # forcing pass is the whole cost of a sweep: a re-run that reads even one cell's forcing
+            # per tile would make resuming a global sweep as expensive as starting it.
+            calls = Ref(0)
+            counting = function (m, lat, lon; kwargs...)
+                calls[] += 1
+                return _cp_loader(many, obs)(m, lat, lon; kwargs...)
+            end
+            again = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, dir;
+                                                      token = nothing, cache_path = nothing,
+                                                      tile_size = 2, buffer = 1, min_cells = 4,
+                                                      forcing_loader = counting)
+            @test all(==("skipped"), again.status)
+            @test calls[] == 0
+
+            # Any change to what the file means re-derives it. The file name records only the tile
+            # corner, so without this a changed setting would silently read a tile that means
+            # something else.
+            for kw in ((; min_cells = 5), (; buffer = 2), (; area_minimum = 6.0),
+                       (; retain_elevation_interval_forcing = true), (; force = true))
+                calls[] = 0
+                out = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, dir;
+                                                        token = nothing, cache_path = nothing,
+                                                        tile_size = 2, buffer = 1, min_cells = 4,
+                                                        forcing_loader = counting, kw...)
+                # Nothing is skipped: the stored settings no longer match the request.
+                @test all(!=("skipped"), out.status)
+                # Forcing is re-read wherever a fit is still attempted. Not asserted for
+                # `min_cells = 5`, where every tile of this small fixture falls below the threshold
+                # and is (correctly) written sparse without loading anything at all.
+                haskey(kw, :min_cells) || @test calls[] > 0
+            end
+
+            # A wider window is not covered by the stored one, so it re-derives too — there is no
+            # append for a pooled cross-cell regression.
+            calls[] = 0
+            wider = derive_downscaling_parameter_tiles(
+                :synthetic, (first(_CP_TIME) - Day(1), last(_CP_TIME)), mt, dir;
+                token = nothing, cache_path = nothing, tile_size = 2, buffer = 1, min_cells = 4,
+                forcing_loader = counting)
+            @test any(==("written"), wider.status)
+        end
+
+        @testset "failure isolation" begin
+            # A tile whose every cell is on water is unrunnable, not failed: it is recorded as sparse
+            # while its neighbours are still written, which is how a global sweep survives coastal
+            # and island ice.
+            d = mktempdir()
+            nanloader = function (m, lat, lon; kwargs...)
+                c = many[findfirst(x -> x.lat == lat && x.lon == lon, many)]
+                return 10.0 <= lon <= 10.3 ?
+                       _cp_forcing(lat, lon, c.z, fill(NaN, length(_CP_TIME))) :
+                       _cp_loader(many, obs)(m, lat, lon; kwargs...)
+            end
+            out = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, d;
+                                                     token = nothing, cache_path = nothing,
+                                                     tile_size = 2, buffer = 1, min_cells = 4,
+                                                     forcing_loader = nanloader)
+            row = only(eachrow(out[out.name .== "N46_E010.nc", :]))
+            @test row.status == "sparse"
+            @test row.sparse_reason == "no_usable_forcing"
+            @test only(out[out.name .== "N46_E020.nc", :].status) == "written"
+
+            # An ordinary per-tile failure is logged and skipped, not fatal.
+            d2 = mktempdir()
+            boom = function (m, lat, lon; kwargs...)
+                20.0 <= lon <= 20.3 && error("synthetic forcing store failure")
+                return _cp_loader(many, obs)(m, lat, lon; kwargs...)
+            end
+            out2 = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, d2;
+                                                      token = nothing, cache_path = nothing,
+                                                      tile_size = 2, buffer = 1, min_cells = 4,
+                                                      forcing_loader = boom)
+            @test only(out2[out2.name .== "N46_E010.nc", :].status) == "written"
+            @test only(out2[out2.name .== "N46_E020.nc", :].status) != "written"
+
+            # But a broken *caller* must not be swallowed. A typo or a moved signature fails
+            # identically for every tile, and per-tile handling would turn one bug into hundreds of
+            # warnings that read like bad data — so it aborts on the first one instead.
+            d3 = mktempdir()
+            @test_throws MethodError derive_downscaling_parameter_tiles(
+                :synthetic, time_range, mt, d3; token = nothing, cache_path = nothing,
+                tile_size = 2, buffer = 1, min_cells = 4,
+                forcing_loader = (m, lat, lon; kwargs...) -> throw(MethodError(sin, (1,))))
+        end
+
+        @testset "a view of a larger table" begin
+            # Sweeping a region of the global table means passing a `SubDataFrame`, which is a
+            # different case than it looks: the tile `core`/`buffered` views are built over the frame
+            # handed in, so `parentindices` on them resolves to the *ultimate* parent and returns
+            # indices into a frame with different row numbering. Using those to index the passed frame
+            # is an out-of-bounds error (or, worse, silently the wrong rows). Caught on a real
+            # regional sweep, hence `core_rows`.
+            padded = vcat(_cp_table([(lon = 100.0, lat = -60.0, z = 900.0, glm = 0.1,
+                                      bins = [(950, 2.0)])]), mt)
+            sub = view(padded, 2:nrow(padded), :)
+            @test all(t -> t.core_rows == parentindices(t.core)[1] .- 0,
+                      downscaling_tiles(mt))          # equal when the input is not itself a view
+            d = mktempdir()
+            out = derive_downscaling_parameter_tiles(:synthetic, time_range, sub, d;
+                                                    token = nothing, cache_path = nothing,
+                                                    tile_size = 2, buffer = 1, min_cells = 4,
+                                                    forcing_loader = _cp_loader(many, obs))
+            @test nrow(out) == 3
+            index = DataFrame(GEMB_GlacierSims.Parquet2.Dataset(joinpath(d, "tiles_index.parquet")))
+            @test nrow(index) == nrow(sub)
+            # The recorded coordinates are the subset's own rows, not the parent's — the padding cell
+            # at (100, -60) must not appear.
+            @test !any(≈(100.0), index.longitude)
+            @test sort(index.row) == collect(1:nrow(sub))
+        end
+
+        @testset "tile_limit" begin
+            d = mktempdir()
+            out = derive_downscaling_parameter_tiles(:synthetic, time_range, mt, d;
+                                                    token = nothing, cache_path = nothing,
+                                                    tile_size = 2, buffer = 1, min_cells = 4,
+                                                    tile_limit = 1,
+                                                    forcing_loader = _cp_loader(many, obs))
+            @test nrow(out) == 1
+            # The index still covers every cell: it comes from the tiling, not from what was swept,
+            # so an interrupted or truncated sweep still leaves a complete mapping behind.
+            index = DataFrame(GEMB_GlacierSims.Parquet2.Dataset(joinpath(d, "tiles_index.parquet")))
+            @test nrow(index) == nrow(mt)
         end
     end
 

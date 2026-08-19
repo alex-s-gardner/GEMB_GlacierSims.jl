@@ -38,6 +38,25 @@
 # than restated here — a second copy would stop being a guarantee the moment upstream moved.
 
 """
+    RegionForcingUnavailable(n_cells)
+
+Thrown by [`derive_downscaling_parameters`](@ref) when **no** grid cell of the region has usable
+forcing — ERA5-Land is land-only, so a region of small coastal or island glaciers can have every
+cell centre fall on water ([`forcing_is_complete`](@ref)).
+
+A distinct type for the same reason [`ForcingUnavailable`](@ref) is one per cell: sweeping a global
+table hits this legitimately, and a driver has to be able to tell "this region is unrunnable" from
+"the driver is broken" without matching on an error message.
+"""
+struct RegionForcingUnavailable <: Exception
+    n_cells::Int
+end
+
+Base.showerror(io::IO, e::RegionForcingUnavailable) = print(io,
+    "RegionForcingUnavailable: none of the region's $(e.n_cells) grid cell(s) has usable " *
+    "forcing (ERA5-Land is land-only; every cell center may have fallen on water)")
+
+"""
     grid_cells_in_region(glacier_elevation_classes, roi_polygon; area_minimum = 0.0)
 
 The grid cells of a glacier elevation-class table whose center falls within `roi_polygon`, as a
@@ -229,6 +248,51 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range, glacie
                                    token,
                                    cache_path,
                                    area_minimum::Real = 0.0,
+                                   kwargs...)
+    selected = grid_cells_in_region(glacier_elevation_classes, roi_polygon; area_minimum)
+    nrow(selected) == 0 && throw(ArgumentError(
+        "no grid cells in the region with at least $area_minimum km² of glacier area"))
+
+    # The region's own extent, not the selected cells' bounding box: they differ whenever the region
+    # is larger than the ice in it, and it is the region the caller asked about that belongs in the
+    # provenance.
+    return derive_downscaling_parameters(climate_model, time_range, selected;
+                                         token, cache_path, area_minimum,
+                                         region_extent = _region_extent(
+                                             _validate_region(roi_polygon)),
+                                         kwargs...)
+end
+
+"""
+    derive_downscaling_parameters(climate_model, time_range, grid_cells; token, cache_path,
+                                  region_extent = nothing, kwargs...)
+
+Derive the downscaling parameters from an **already-selected** set of grid cells, skipping the
+region test entirely.
+
+This is the method to call when the selection was made some other way — most importantly by
+[`downscaling_tiles`](@ref), whose arithmetic partition cannot be expressed as a polygon (a tile's
+buffer may cross the antimeridian, which [`grid_cells_in_region`](@ref) refuses by design). The
+four-argument `roi_polygon` method is a thin wrapper over this one, so both paths derive
+identically.
+
+`grid_cells` is any `AbstractDataFrame` of glacier elevation-class rows — typically a `SubDataFrame`
+view — carrying `:latitude`, `:longitude` and `:glm`. No area screen is applied here; `area_minimum`
+is accepted only so it can be recorded in the provenance of a selection that was already screened.
+
+`region_extent` is recorded in the provenance as-is. When `nothing`, no extent is recorded — the
+cells are the selection, and a bounding box computed from them would describe the ice rather than
+the region, which is a different (and easily misread) fact.
+
+See the four-argument method for everything else: the returned fields, the keywords, and the
+warnings about screening the two fitted series together.
+"""
+function derive_downscaling_parameters(climate_model::Symbol, time_range,
+                                   grid_cells::AbstractDataFrame;
+                                   token,
+                                   cache_path,
+                                   region_extent = nothing,
+                                   area_minimum::Real = 0.0,
                                    elevation_interval_batch::Int = 8,
                                    min_cells::Int = _MIN_CELLS_DEFAULT,
                                    decoupling_factor_fill::Real = 1.0,
@@ -240,9 +304,8 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range, glacie
     min_cells >= 2 ||
         throw(ArgumentError("min_cells must be >= 2 to fit a slope, got $min_cells"))
 
-    selected = grid_cells_in_region(glacier_elevation_classes, roi_polygon; area_minimum)
-    nrow(selected) == 0 && throw(ArgumentError(
-        "no grid cells in the region with at least $area_minimum km² of glacier area"))
+    selected = grid_cells
+    nrow(selected) == 0 && throw(ArgumentError("no grid cells were given"))
 
     load(row) = forcing_loader(climate_model, row.latitude, row.longitude;
                                time_range, token, cache_path)
@@ -253,9 +316,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range, glacie
     # actually have forcing. Both fits need only per-timestep sums over cells, so neither the cell
     # forcing stacks nor their temperature vectors are retained.
     acc = _accumulate_cross_cell(selected, load)
-    isempty(acc.used) && throw(ArgumentError(
-        "no grid cell in the region has usable forcing (ERA5-Land is land-only; every cell " *
-        "center may have fallen on water)"))
+    isempty(acc.used) && throw(RegionForcingUnavailable(nrow(selected)))
 
     grid_cells = @view selected[acc.used, :]
 
@@ -281,7 +342,6 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range, glacie
         "n_grid_cells_in_region" => nrow(selected),
         "n_grid_cells_used" => length(acc.used),
         "n_elevation_intervals" => length(interval_forcing.intervals),
-        "region_extent" => _region_extent(_validate_region(roi_polygon)),
         "area_minimum" => Float64(area_minimum),
         "mean_elevation" => acc.mean_elevation,
         "adjustment_order" => "lapse_then_decouple",
@@ -291,8 +351,15 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range, glacie
         "n_decoupling_factor_fitted" => count(isfinite, decoupling.decoupling_factor),
         "n_lapse_rate_fitted" => count(isfinite, lapse_rate.lapse_rate),
     )
+    # Only when there is one: an absent extent is not the same fact as a bounding box of the ice.
+    region_extent === nothing || (provenance["region_extent"] = region_extent)
 
+    # `cell_elevations`/`cell_areas` line up with `grid_cells` row for row — they are the reanalysis
+    # surface elevation and glacier area of each cell the regressions actually saw. Returned because
+    # they are what the fits were taken *over*: `reference_elevation` alone is their area-weighted
+    # mean, from which the spread that made the slope identifiable cannot be recovered.
     return (; grid_cells, time = acc.time, decoupling, lapse_rate,
+            cell_elevations = acc.elevations, cell_areas = acc.areas,
             elevation_interval_forcing = interval_forcing, provenance)
 end
 
@@ -317,6 +384,13 @@ function _accumulate_cross_cell(selected, load)
             load(row)
         catch e
             e isa InterruptException && rethrow()
+            # A broken *caller* is not a bad cell. A typo, a stale session, or a loader whose
+            # signature has moved fails identically for every cell of every region, and skipping it
+            # per cell turns that into "no cell had usable forcing" — which a sweep then records as
+            # an unrunnable region, i.e. reports a code bug as a property of the data. Let those
+            # through so the real error is what surfaces; the network and data failures this skip
+            # exists for (a CDS timeout, a cell over water) are none of these types.
+            (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
             @warn "Forcing load failed for grid cell; skipping" cell=i exception=e
             continue
         end
@@ -535,6 +609,9 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             ivf.load(row)
         catch e
             e isa InterruptException && rethrow()
+            # Same reasoning as in `_accumulate_cross_cell`: a broken caller is not a bad cell, and
+            # swallowing it here would silently drop that cell's ice out of the interval weights.
+            (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
             @warn "Forcing load failed during elevation interval aggregation; skipping cell" exception=e
             continue
         end

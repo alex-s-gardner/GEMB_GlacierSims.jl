@@ -1,2 +1,6 @@
 # Per-cell GEMB output written by the batch drivers; regenerable, and large.
 data/gemb_runs/
+
+# Per-tile downscaling parameters written by scripts/derive_downscaling_parameter_tiles.jl;
+# likewise regenerable, and a global sweep is thousands of files.
+data/downscaling_parameters/
