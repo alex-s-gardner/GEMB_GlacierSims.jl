@@ -2,6 +2,24 @@
 # per-bin adjustment, the sweep driver, and the interval aggregation's gap fill cannot drift apart.
 const _DEFAULT_LAPSE_RATE = 6.5
 
+# Is this exception a broken *caller* rather than a bad cell?
+#
+# A typo, an undefined name, a stale session whose loaded package predates a function being called, a
+# signature that has moved: these fail identically for every cell of every region. Swallowed per cell
+# they turn one bug into thousands of identical warnings that read like the *data* is bad — and worse,
+# a sweep then records the region as unrunnable. So every per-cell `catch` in this package rethrows
+# them, and the predicate lives here rather than being spelled out at each site: four copies of a type
+# tuple is four places to forget one.
+#
+# `FieldError` (a mistyped or removed struct field) only exists from Julia 1.12; before that the same
+# mistake surfaces as an `ErrorException`, which is too broad to rethrow on — this package supports
+# 1.11, so the type is included only where it is defined rather than assumed. Without the guard the
+# reference itself is an `UndefVarError` on 1.11, i.e. the handler becomes the bug it exists to catch.
+const _CALLER_ERROR_TYPES = isdefined(Base, :FieldError) ?
+    (UndefVarError, MethodError, getfield(Base, :FieldError)) : (UndefVarError, MethodError)
+
+is_caller_error(e) = any(T -> e isa T, _CALLER_ERROR_TYPES)
+
 """
     era5_land_invariant(; parameter=nothing, to=nothing)
 

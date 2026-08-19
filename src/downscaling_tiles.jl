@@ -452,7 +452,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
             # for every one of the hundreds of tiles. Swallowed per tile it becomes hundreds of
             # identical warnings that read like bad *data*, so abort on the first one and let the
             # real error be what gets seen.
-            (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
+            is_caller_error(e) && rethrow()
             @warn "Tile failed; continuing" tile=i path exception=(e, catch_backtrace())
             push!(rows, _tile_summary_row(tile, nothing, :failed, time() - t0;
                                           error = sprint(showerror, e)))

@@ -390,7 +390,7 @@ function _accumulate_cross_cell(selected, load)
             # an unrunnable region, i.e. reports a code bug as a property of the data. Let those
             # through so the real error is what surfaces; the network and data failures this skip
             # exists for (a CDS timeout, a cell over water) are none of these types.
-            (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
+            is_caller_error(e) && rethrow()
             @warn "Forcing load failed for grid cell; skipping" cell=i exception=e
             continue
         end
@@ -611,7 +611,7 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             e isa InterruptException && rethrow()
             # Same reasoning as in `_accumulate_cross_cell`: a broken caller is not a bad cell, and
             # swallowing it here would silently drop that cell's ice out of the interval weights.
-            (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
+            is_caller_error(e) && rethrow()
             @warn "Forcing load failed during elevation interval aggregation; skipping cell" exception=e
             continue
         end

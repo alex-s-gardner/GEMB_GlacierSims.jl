@@ -322,7 +322,7 @@ for (i, r) in enumerate(eachrow(qualifying_cells))
         # of the cell. Swallowed per cell it turns into thousands of identical "Cell failed"
         # warnings and looks like the *data* is bad — abort on the first one so the real error is
         # what gets read. Requires `using Revise` (or a restart) after editing the package.
-        (e isa UndefVarError || e isa MethodError || e isa FieldError) && rethrow()
+        is_caller_error(e) && rethrow()
         # An existing file that already spans the forcing is up to date, not broken; re-running
         # the sweep before new forcing is published hits this for every completed cell.
         if e isa ForcingUpToDate

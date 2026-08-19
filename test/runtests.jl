@@ -1495,6 +1495,24 @@ end
         end
     end
 
+    @testset "is_caller_error" begin
+        # The predicate every per-cell `catch` in the package rethrows on. Pinned because it is the
+        # thing standing between one code bug and thousands of warnings that read like bad data.
+        @test GEMB_GlacierSims.is_caller_error(MethodError(sin, (1,)))
+        @test GEMB_GlacierSims.is_caller_error(UndefVarError(:nope))
+        # Not caller errors: these are the network and data failures the per-cell skip exists for.
+        @test !GEMB_GlacierSims.is_caller_error(ErrorException("CDS timeout"))
+        @test !GEMB_GlacierSims.is_caller_error(ArgumentError("bad argument"))
+
+        # `FieldError` is Julia 1.12+, and this package supports 1.11 — naming it unconditionally is
+        # itself an `UndefVarError` on 1.11, i.e. the handler becomes the bug it exists to catch.
+        # (Caught by CI on 1.11 after passing locally on 1.12.) So the type list is built from what
+        # the running version actually defines.
+        @test (:FieldError in nameof.(GEMB_GlacierSims._CALLER_ERROR_TYPES)) ==
+              isdefined(Base, :FieldError)
+        @test all(T -> T <: Exception, GEMB_GlacierSims._CALLER_ERROR_TYPES)
+    end
+
     @testset "output file naming" begin
         # Round-trips, including the extremes of the padding.
         for index in ((-142, 60), (-180, -80), (178, 82), (0, 0), (10, -2))
