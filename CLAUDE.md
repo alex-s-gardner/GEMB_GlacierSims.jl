@@ -19,8 +19,26 @@ Downloads are cached as Zarr chunks and the cache is shared across cells and til
 neighbouring cells are nearly free. Use the same cache path the scripts do:
 
 ```julia
-cache = joinpath(tempdir(), ".cache", "era5land")
+climate_cache = get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land")
+cache = joinpath(climate_cache, "cache")
 ```
+
+This lives on shared storage rather than `tempdir()` on purpose: the global cache is already tens of
+GB and a reboot would otherwise throw it away. **Never delete it casually** — refetching means
+waiting on the CDS queue for hours. `$CLIMATE_CACHE/downscaling_parameters` holds the tile outputs
+from `derive_downscaling_parameter_tiles.jl` for the same reason.
+
+One cache is *not* covered by this: `climate_forcing` does not thread a path through to the
+invariant geopotential file, so `GEMB_ClimateForcing` always puts it at
+`tempdir()/GEMB_ClimateForcing/invariant/era5_land/`. A copy is preserved at
+`$CLIMATE_CACHE/invariant/era5_land/`; restore it after a reboot with
+
+```sh
+mkdir -p /tmp/GEMB_ClimateForcing/invariant
+cp -a /mnt/bylot-r3/data/era5land/invariant/era5_land /tmp/GEMB_ClimateForcing/invariant/
+```
+
+Low stakes either way — it is one 50 MB file from a plain HTTP URL, not a CDS-queued request.
 
 This means network-dependent work **can** be verified directly rather than deferred — run a real
 cell or tile rather than stopping at the offline tests. A first fetch of a fresh region is slow

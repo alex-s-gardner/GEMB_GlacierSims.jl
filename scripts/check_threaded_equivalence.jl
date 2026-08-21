@@ -20,7 +20,10 @@ Threads.nthreads() == 1 &&
 
 const CLASSES_FILE = joinpath(@__DIR__, "..", "data",
                               "era5land_glacier_elevation_classes.parquet")
-const FORCING_CACHE = joinpath(tempdir(), ".cache", "era5land")
+# Shared persistent forcing cache: the ERA5-Land chunks are tens of GB and expensive to re-fetch, so
+# they live off `tempdir()` and survive a reboot. Override with `ENV["CLIMATE_CACHE"]` elsewhere.
+const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land")
+const FORCING_CACHE = joinpath(CLIMATE_CACHE, "cache")
 
 classes = GeoDataFrames.read(CLASSES_FILE)
 classes[!, :longitude] = GeoDataFrames.GeoInterface.x.(classes.geometry)

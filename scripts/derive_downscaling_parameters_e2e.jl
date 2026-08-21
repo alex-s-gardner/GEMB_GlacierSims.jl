@@ -9,7 +9,7 @@
 # `_MAX_IDENTIFIABLE_IQR` and its whole series was replaced. So it is the region checked here.
 #
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Downloads are cached as
-# Zarr chunks under `tempdir()`, shared across cells, so a re-run is nearly free.
+# Zarr chunks under `CLIMATE_CACHE`, shared across cells, so a re-run is nearly free.
 #
 # Run:  julia --project=. scripts/derive_downscaling_parameters_e2e.jl [years]
 
@@ -24,6 +24,11 @@ const GI = GeoDataFrames.GeoInterface
 
 const CLIMATE_MODEL = :era5land
 const PARQUET = joinpath(@__DIR__, "..", "data", "era5land_glacier_elevation_classes.parquet")
+
+# Shared persistent forcing cache: the ERA5-Land chunks are tens of GB and expensive to re-fetch, so
+# they live off `tempdir()` and survive a reboot. Override with `ENV["CLIMATE_CACHE"]` elsewhere.
+const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
+                          joinpath("/mnt/bylot-r3/data", string(CLIMATE_MODEL)))
 
 # Wrangell-St Elias, Alaska (RGI region 01). A ~1° box, 64 grid cells, ~1400 km² of ice.
 const REGION_NAME = "Wrangell-St Elias"
@@ -49,7 +54,7 @@ fmt(x; digits = 2) = isfinite(x) ? string(round(x; digits)) : "  --"
 function main()
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
-    cache = joinpath(tempdir(), ".cache", string(CLIMATE_MODEL))
+    cache = joinpath(CLIMATE_CACHE, "cache")
 
     table = GeoDataFrames.read(PARQUET)
     # `derive_downscaling_parameters` loads forcing by `row.latitude`/`row.longitude`; the cached table

@@ -10,7 +10,7 @@
 # re-running the same command, and only the incomplete tiles cost anything.
 #
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Forcing is cached as Zarr
-# chunks under `tempdir()` and shared between tiles, which is why the tiles are visited in chunk order.
+# chunks under `CLIMATE_CACHE` and shared between tiles, which is why tiles are visited in chunk order.
 #
 # Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start_year] [end_year]
 #
@@ -24,11 +24,9 @@ using GEMB_ClimateForcing
 using DataFrames
 using Dates
 import GeoDataFrames
-const GI = GeoDataFrames.GeoInterface
 
+const BASE_CLIMATE_DIR = "/mnt/bylot-r3/data";
 const CLIMATE_MODEL = :era5land
-const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
-const OUTPUT_DIR = joinpath(@__DIR__, "..", "data", "downscaling_parameters", string(CLIMATE_MODEL))
 
 # The grid. 2° tiles with a 1° buffer means each tile's fits see a 4°×4° neighbourhood: both fits are
 # regressions across cells, and a bare 2° tile often carries too little elevation and glacier-fraction
@@ -59,10 +57,22 @@ const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 2018
 const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2020
 const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 
+
+const GI = GeoDataFrames.GeoInterface
+
+# Where the forcing cache and the tile outputs live. Kept outside the repo and off `tempdir()`: the
+# ERA5-Land chunks are tens of GB and expensive to re-fetch, so they must survive a reboot. Override
+# with `ENV["CLIMATE_CACHE"]` on a machine without this mount.
+const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
+                          joinpath(BASE_CLIMATE_DIR, string(CLIMATE_MODEL)))
+
+const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
+const OUTPUT_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
+
 function main()
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
-    cache = joinpath(tempdir(), ".cache", string(CLIMATE_MODEL))
+    cache = joinpath(CLIMATE_CACHE, "cache")
 
     isfile(PARQUET) || error("no glacier elevation-class table at $PARQUET; build it with " *
                              "src/era5_example.jl first")
