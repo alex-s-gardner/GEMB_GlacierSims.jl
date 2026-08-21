@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "ba35cdc4a3ba105c2c5b508cc659cce9eff40cc0"
+project_hash = "cbd79a476239af89e3370384b0fff8feb40f6e36"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -827,7 +827,9 @@ version = "304.1200.400+0"
 
 [[deps.GEMB]]
 deps = ["DataInterpolations", "Dates", "DimensionalData", "FillArrays", "Statistics"]
-path = "/Users/gardnera/Documents/GitHub/GEMB.jl"
+git-tree-sha1 = "8a8fe3bab7ca73ef8c05831a2fd09969acf845be"
+repo-rev = "main"
+repo-url = "https://github.com/alex-s-gardner/GEMB.jl"
 uuid = "658e70de-abe2-4db6-8b40-f6dcda98d853"
 version = "2.0.0"
 
@@ -842,7 +844,9 @@ version = "2.0.0"
 
 [[deps.GEMB_ClimateForcing]]
 deps = ["ArchGDAL", "Base64", "CodecZlib", "Dates", "DimensionalData", "Downloads", "EarthData", "HTTP", "JSON3", "Mmap", "NCDatasets", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "Rasters", "SHA", "Statistics", "Zarr", "p7zip_jll"]
-path = "/Users/gardnera/Documents/GitHub/GEMB_ClimateForcing.jl"
+git-tree-sha1 = "bffb2017fbb8134269f641b4817d947b417ffe26"
+repo-rev = "main"
+repo-url = "https://github.com/alex-s-gardner/GEMB_ClimateForcing.jl"
 uuid = "a64e60a8-608f-46bc-88f4-efdcc7581069"
 version = "0.1.0"
 
