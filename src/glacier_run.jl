@@ -789,10 +789,13 @@ const RUN_GRID_AXES = ("bin_center", "delta_temperature", "precipitation_scaling
 _run_grid(bins, delta_temperatures, precipitation_scalings) =
     ([b.center for b in bins], delta_temperatures, precipitation_scalings)
 
-function _assert_run_grid_matches(source, saved, requested)
-    for (name, s, r) in zip(RUN_GRID_AXES, saved, requested)
+# `axes` names the three axes positionally, defaulting to a cell run's. A tile run's first axis is
+# `band_center` rather than `bin_center`, and naming the wrong one in the error would send a reader
+# looking for a variable the file does not have.
+function _assert_run_grid_matches(source, saved, requested; axes = RUN_GRID_AXES, what = "cell")
+    for (name, s, r) in zip(axes, saved, requested)
         s == r || throw(ArgumentError("$name in $source ($s) does not match this run ($r); " *
-                                      "rebuild the cell from scratch"))
+                                      "rebuild the $what from scratch"))
     end
     return nothing
 end

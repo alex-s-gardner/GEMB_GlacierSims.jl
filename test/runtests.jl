@@ -124,6 +124,76 @@ function _fake_run(; time, deltas, scalings, bins, weights, lengths,
     )
 end
 
+# A fully-populated `GlacierTileRun` without running GEMB, for the writer and restart tests. Values are
+# distinctive and non-round so an exact round-trip is meaningful, and one band is left with no profile
+# so the "band produced no output" path is covered.
+function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(2000, 6, 1)),
+                        bands = [(1050, 12.5), (1550, 40.25), (2050, 3.0)],
+                        deltas = [0.0, 1.0], scalings = [1.0, 1.5])
+    n_band, n_dt, n_ps, n_t = length(bands), length(deltas), length(scalings), length(time)
+    band_tuples = [(; lo = Int(c) - 50, hi = Int(c) + 50, center = Float64(c),
+                    area = a, n_cells = i) for (i, (c, a)) in enumerate(bands)]
+
+    bands_series = Dict{Symbol,Array{Float64,4}}()
+    for (j, v) in enumerate((TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...))
+        bands_series[v] = [0.5j + i + 10b + 100d + 1000s
+                           for i in 1:n_t, b in 1:n_band, d in 1:n_dt, s in 1:n_ps]
+    end
+    band_areas = [b.area for b in band_tuples]
+    totals = Dict{Symbol,Array{Float64,3}}()
+    # Cumulative, as `_tile_totals` produces and as the file documents: the per-band series are per
+    # output interval, the tile totals accumulate from the record start.
+    for v in TILE_MASS_VARIABLES
+        totals[v] = cumsum([tile_mass_total(bands_series[v][i:i, :, d, s], band_areas)[1]
+                            for i in 1:n_t, d in 1:n_dt, s in 1:n_ps]; dims = 1)
+    end
+    totals[:dm] = totals[:precipitation] .- totals[:runoff] .+
+                  totals[:evaporation_condensation] .+ totals[:blowing_snow]
+    for (name, source) in ((:dv, :dh), (:dv_mass, :dh_mass), (:dv_firn, :dh_firn),
+                           (:fac, :firn_air_content))
+        totals[name] = [tile_volume_change(bands_series[source][i:i, :, d, s], band_areas)[1]
+                        for i in 1:n_t, d in 1:n_dt, s in 1:n_ps]
+    end
+
+    profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
+    for s in 1:n_ps, d in 1:n_dt, b in 1:(n_band - 1)     # last band deliberately has no state
+        profiles[b, d, s] = _fake_profile(4 + b, 100.0b + 10.0d + s)
+    end
+
+    band_provenance = [Dict{String,Any}(
+        "extrapolation_above_reanalysis" => 100.0i - 250.0,
+        "temperature_lapse_rate" => 6.2,
+        "glacier_decoupling_factor_mean" => 0.4 + 0.05i,
+        "glacier_decoupling_factor_n_fit_held" => i - 1,
+        "glacier_decoupling_factor_n_fit_in_domain" => 3,
+        "n_timesteps_above_freezing" => 4,
+        "glacier_decoupling_factor_n_fitted" => 3,
+        "glacier_decoupling_factor_n_fitted_above_freezing" => 2,
+        "temperature_lapse_rate_n_fitted" => n_t) for i in 1:n_band]
+    # One band missing a key the others carry. The writer defines a variable per key seen anywhere, so
+    # this band's entry has to read back as absent rather than as a number — the fill is the only thing
+    # that distinguishes "not recorded" from "recorded as zero".
+    n_band > 1 && delete!(band_provenance[end], "glacier_decoupling_factor_n_fit_held")
+
+    parameters = Dict{String,Any}("downscaling_basis" => "fitted",
+                                 "downscaling_min_cells" => 8,
+                                 "spinup_window_start" => "1990-01-01T00:00:00",
+                                 "spinup_window_stop" => "2019-12-31T00:00:00",
+                                 "model_densification_method" => :Arthern,
+                                 "model_albedo_ice" => 0.48)
+
+    return GlacierTileRun(
+        (-142, 60), "N60_W142.nc", "lat[+60+62]lon[-142-140]",
+        (lon_min = -142.0, lon_max = -140.0, lat_min = 60.0, lat_max = 62.0),
+        335, 716, band_tuples, collect(Float64, deltas), collect(Float64, scalings),
+        collect(time), bands_series, totals, profiles, band_provenance, parameters,
+        Dict{String,Any}("spinup_performed" => true, "spinup_cycles" => 37,
+                         "spinup_converged" => false,
+                         "climatology_window_start" => DateTime(1990, 1, 1),
+                         "max_dh_residual" => 1.2e-14),
+    )
+end
+
 @testset "GEMB_GlacierSims.jl" begin
     @testset "module surface" begin
         @test isdefined(GEMB_GlacierSims, :era5_land_invariant)
@@ -1007,9 +1077,82 @@ end
                                     k_true, atol = 1e-9), by_hour)
         end
 
+        @testset "lapse rate uncertainty" begin
+            # The three extra accumulator moments must describe the *same* regression `derive_lapse_rate`
+            # reports, or the error belongs to a different slope than the one beside it. Checked against
+            # a from-scratch regression on the reconstructed corrected temperatures — no sums involved.
+            un = p.lapse_rate_uncertainty
+            @test issetequal(keys(un), (:lapse_rate_stderr, :lapse_rate_r2, :residual_sd))
+            @test all(isfinite, un.lapse_rate_stderr)
+            @test all(>=(0), un.lapse_rate_stderr)          # an error has no direction
+            @test all(x -> 0 <= x <= 1, un.lapse_rate_r2)
+
+            zs = [c.z for c in cells]
+            gs = [c.glm for c in cells]
+            kk = collect(p.decoupling.decoupling_factor)[1]
+            a, b = collect(p.decoupling.coef_alpha)[1], collect(p.decoupling.coef_beta)[1]
+            usable = isfinite(kk) && 0 < kk <= 1
+            raw = [observed(c)[1] for c in cells]
+            corrected = usable ?
+                [raw[i] + (kk - 1) * (1 - gs[i]) * (a + b * zs[i]) for i in eachindex(raw)] : copy(raw)
+            Szz = sum((zs .- mean(zs)) .^ 2)
+            SzT = sum((zs .- mean(zs)) .* (corrected .- mean(corrected)))
+            STT = sum((corrected .- mean(corrected)) .^ 2)
+            rss = STT - SzT^2 / Szz
+            # This fixture is noiseless, so the corrected temperatures fall exactly on a line and the
+            # reference residual is identically zero. A one-pass moment accumulator cannot reproduce
+            # that exactly — `ΣT² - (ΣT)²/m` is a difference of nearly equal numbers — so the
+            # assertion is against the accumulator's precision floor. Accumulating the second moment
+            # about the melting point rather than about absolute zero is what keeps that floor at
+            # ~1e-7 K instead of ~5e-6 K; the realistic case, where the residual is a real 0.1-1 K, is
+            # checked below and agrees tightly.
+            @test rss ≈ 0 atol = 1e-12
+            @test collect(un.residual_sd)[1] ≈ 0 atol = 1e-6
+            @test collect(un.lapse_rate_stderr)[1] ≈ 0 atol = 1e-6
+
+            # The decomposition that makes this worth having: leverage the tile always has, times
+            # scatter it has at this instant. `elevation_spread` is a tile constant, the scatter is not.
+            @test collect(un.lapse_rate_stderr)[1] ≈
+                  1000 * collect(un.residual_sd)[1] / sqrt(Szz) rtol = 1e-10
+            @test length(unique(collect(p.lapse_rate.elevation_spread))) == 1
+
+            @test p.provenance["n_lapse_rate_fitted"] == length(_CP_TIME)
+
+            # The realistic case: cells that do *not* fall exactly on a line, which is what the
+            # diagnostic exists to measure. Here the sums must reproduce a from-scratch regression
+            # tightly, not just to a floor.
+            scatter = [0.0, 0.4, -0.3, 0.25, -0.15, 0.05][1:length(cells)]
+            noisy(c) = (i = findfirst(x -> x.lat == c.lat && x.lon == c.lon, cells);
+                        observed(c) .+ scatter[i])
+            pn = derive_downscaling_parameters(:synthetic, time_range, table, region;
+                                               token = nothing, cache_path = nothing, min_cells = 4,
+                                               forcing_loader = _cp_loader(cells, noisy))
+            kn = collect(pn.decoupling.decoupling_factor)[1]
+            an, bn = collect(pn.decoupling.coef_alpha)[1], collect(pn.decoupling.coef_beta)[1]
+            rawn = [noisy(c)[1] for c in cells]
+            corrn = (isfinite(kn) && 0 < kn <= 1) ?
+                [rawn[i] + (kn - 1) * (1 - gs[i]) * (an + bn * zs[i]) for i in eachindex(rawn)] :
+                copy(rawn)
+            SzTn = sum((zs .- mean(zs)) .* (corrn .- mean(corrn)))
+            STTn = sum((corrn .- mean(corrn)) .^ 2)
+            rssn = STTn - SzTn^2 / Szz
+            @test rssn > 1e-6                       # genuinely scattered, so the check has teeth
+            @test collect(pn.lapse_rate_uncertainty.residual_sd)[1] ≈
+                  sqrt(rssn / (length(zs) - 2)) rtol = 1e-6
+            @test collect(pn.lapse_rate_uncertainty.lapse_rate_stderr)[1] ≈
+                  1000 * sqrt(rssn / (length(zs) - 2)) / sqrt(Szz) rtol = 1e-6
+            @test collect(pn.lapse_rate_uncertainty.lapse_rate_r2)[1] ≈
+                  1 - rssn / STTn rtol = 1e-6
+            # And the slope the error belongs to is still upstream's, unchanged by any of this.
+            @test collect(pn.lapse_rate.lapse_rate)[1] ≈ -1000 * SzTn / Szz rtol = 1e-8
+        end
+
         @testset "elevation interval forcing" begin
             intervals = collect(p.elevation_interval_forcing)
-            @test length(intervals) == length(p.elevation_interval_forcing) == 4
+            @test length(intervals) == 4
+            # No `length` on the iterator: an interval whose donor cells have no usable forcing cannot
+            # be emitted, and which those are is only known once the forcing has been read.
+            @test Base.IteratorSize(typeof(p.elevation_interval_forcing)) == Base.SizeUnknown()
             # Intervals ascend, and each is centered on its bin.
             @test [iv.center for iv in intervals] == [1050.0, 1550.0, 2050.0, 2550.0]
             @test [iv.lo for iv in intervals] == [1000, 1500, 2000, 2500]
@@ -1034,13 +1177,23 @@ end
                       Float64(iv.lo)
                 @test DimensionalData.metadata(iv.forcing)["elevation_interval_upper"] ==
                       Float64(iv.hi)
-                # Every timestep of this fixture is measured, so nothing was filled or clamped —
-                # the counts exist precisely so a substituted interval is distinguishable.
+                # Every timestep of this fixture is measured, so every applied value is a fit and
+                # nothing was substituted — the source counts exist precisely so a substituted
+                # interval is distinguishable from a measured one.
                 m = DimensionalData.metadata(iv.forcing)
-                @test m["glacier_decoupling_factor_n_filled"] == 0
-                @test m["glacier_decoupling_factor_n_clamped"] == 0
-                @test m["temperature_lapse_rate_n_filled"] == 0
-                @test m["temperature_lapse_rate_n_clamped"] == 0
+                n = length(_CP_TIME)
+                @test m["glacier_decoupling_factor_n_fitted"] == n
+                @test m["temperature_lapse_rate_n_fitted"] == n
+                for source in (:held, :climatology, :prior, :ambient)
+                    @test m["glacier_decoupling_factor_n_$source"] == 0
+                    @test m["temperature_lapse_rate_n_$source"] == 0
+                end
+                # The fixture is warm at every timestep, so `k` mattered throughout and the
+                # above-freezing counts equal the unrestricted ones.
+                @test m["n_timesteps_above_freezing"] == n
+                @test m["glacier_decoupling_factor_n_fitted_above_freezing"] == n
+                @test m["glacier_decoupling_factor_n_fit_in_domain"] == n
+                @test m["glacier_decoupling_factor_n_fit_held"] == 0
                 # Each interval here sits 50 m above its own single contributing cell, so every one
                 # reports the same small extrapolation. Measured against the cells that actually
                 # feed the interval, not the region's highest, so the batching cannot change it.
@@ -1226,44 +1379,67 @@ end
             @test all(isnan, pl.lapse_rate.elevation_spread)
             @test pl.provenance["n_lapse_rate_fitted"] == 0
 
-            # The interval forcing still builds, because it fills — and the fill is visible in the
-            # metadata rather than silent. Without it a single `NaN` would make the interval fail
-            # `forcing_is_complete` and a sweep would skip it like an ocean cell.
+            # The interval forcing still builds, because `resolve_downscaling` substitutes — and it
+            # says which tier it reached rather than substituting silently. Without a substitution a
+            # single `NaN` would make the interval fail `forcing_is_complete` and a sweep would skip
+            # it like an ocean cell. With no accepted fit anywhere there is no climatology either, so
+            # both series fall to their last tier: the lapse rate to its prior, and `k` — which has no
+            # prior here — to the identity.
             for iv in pl.elevation_interval_forcing
                 @test forcing_is_complete(iv.forcing)
                 m = DimensionalData.metadata(iv.forcing)
-                @test m["temperature_lapse_rate_n_filled"] == length(_CP_TIME)
+                @test m["temperature_lapse_rate_n_prior"] == length(_CP_TIME)
+                @test m["temperature_lapse_rate_n_fitted"] == 0
+                @test m["temperature_lapse_rate_n_climatology"] == 0
                 @test m["temperature_lapse_rate"] ≈ 6.5
-                @test m["glacier_decoupling_factor_n_filled"] == length(_CP_TIME)
+                @test m["glacier_decoupling_factor_n_ambient"] == length(_CP_TIME)
                 @test m["glacier_decoupling_factor_mean"] == 1.0   # the bit-exact no-op
             end
 
-            # Non-default fills are honoured, which is the point of the keywords: a region with no
-            # usable fit can be given a published or regional value instead of the identity.
-            pfill = derive_downscaling_parameters(:synthetic, time_range, _cp_table(flat), region;
+            # Priors are honoured, which is the point of the keywords: a region with no usable fit can
+            # be given a published or regional value instead of the identity, and the label then says
+            # the value is external evidence rather than this region's forcing.
+            pprior = derive_downscaling_parameters(:synthetic, time_range, _cp_table(flat), region;
                                               token = nothing, cache_path = nothing,
                                               min_cells = 4,
                                               forcing_loader = _cp_loader(flat, observed),
-                                              lapse_rate_fill = 7.25,
-                                              decoupling_factor_fill = 0.85)
-            for iv in pfill.elevation_interval_forcing
-                @test DimensionalData.metadata(iv.forcing)["temperature_lapse_rate"] ≈ 7.25
-                @test DimensionalData.metadata(
-                    iv.forcing)["glacier_decoupling_factor_mean"] ≈ 0.85
+                                              lapse_rate_prior = 7.25,
+                                              decoupling_factor_prior = 0.85)
+            for iv in pprior.elevation_interval_forcing
+                m = DimensionalData.metadata(iv.forcing)
+                @test m["temperature_lapse_rate"] ≈ 7.25
+                @test m["glacier_decoupling_factor_mean"] ≈ 0.85
+                @test m["glacier_decoupling_factor_n_prior"] == length(_CP_TIME)
+                @test m["glacier_decoupling_factor_n_ambient"] == 0
             end
-            # ...and validated, since they are applied: an out-of-domain fill would be rejected
+            # A monthly prior cycle is accepted too, which is the form the published regional lapse
+            # rates take.
+            pmonthly = derive_downscaling_parameters(:synthetic, time_range, _cp_table(flat), region;
+                                              token = nothing, cache_path = nothing,
+                                              min_cells = 4,
+                                              forcing_loader = _cp_loader(flat, observed),
+                                              lapse_rate_prior = collect(1.0:12.0))
+            # `_CP_TIME` is entirely in January, so the cycle's first entry is the one applied.
+            @test DimensionalData.metadata(
+                first(pmonthly.elevation_interval_forcing).forcing)["temperature_lapse_rate"] ≈ 1.0
+
+            # ...and validated, since they are applied: an out-of-domain prior would be rejected
             # downstream no differently from an out-of-domain fit, but with nothing to inspect.
             @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
-                forcing_loader = _cp_loader(cells, observed), lapse_rate_fill = 99.0)
+                forcing_loader = _cp_loader(cells, observed), lapse_rate_prior = 99.0)
             @test_throws ArgumentError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
-                forcing_loader = _cp_loader(cells, observed), decoupling_factor_fill = 1.5)
+                forcing_loader = _cp_loader(cells, observed), decoupling_factor_prior = 1.5)
+            @test_throws ArgumentError derive_downscaling_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                min_cells = 4,
+                forcing_loader = _cp_loader(cells, observed), lapse_rate_prior = [1.0, 2.0])
         end
 
-        @testset "the fits report raw; only the application clamps" begin
+        @testset "the fits report raw; the application resolves" begin
             # Here the glaciated cells are *warmer* than ambient, so the fit exceeds 1 — a value
             # `climate_adjust_for_glacier` would reject. The fit reports it anyway: that number is
             # evidence about the fit, and clamping it to 1.0 in the report would silently convert a
@@ -1278,27 +1454,41 @@ end
                 forcing_loader = _cp_loader(cells, inverted))
             @test all(>(1.0), pi_.decoupling.decoupling_factor)
 
-            # ...but the interval forcing, which *applies* it, is in domain and finite, and says how
-            # many timesteps it had to clamp. This is the assertion that policy moved rather than
+            # ...but the interval forcing, which *applies* it, is in domain and finite. An
+            # out-of-domain fit is **excluded** rather than clamped: dragging 1.5 to the nearest bound
+            # would report the identity as though it had been measured. With every fit out of domain
+            # there is nothing left to build a climatology from either, so the series resolves to its
+            # last tier and the label says so. This is the assertion that policy moved rather than
             # vanished.
             for iv in pi_.elevation_interval_forcing
                 @test forcing_is_complete(iv.forcing)
                 @test all(k -> 0 < k <= 1, iv.decoupling_factor)
-                @test DimensionalData.metadata(
-                    iv.forcing)["glacier_decoupling_factor_n_clamped"] == length(_CP_TIME)
+                m = DimensionalData.metadata(iv.forcing)
+                @test m["glacier_decoupling_factor_n_ambient"] == length(_CP_TIME)
+                @test m["glacier_decoupling_factor_n_fitted"] == 0
+                # No fit at this elevation was in domain, which is the count that says the tier was
+                # reached because the fits failed rather than because they were absent.
+                @test m["glacier_decoupling_factor_n_fit_in_domain"] == 0
             end
 
-            # Opting out leaves the raw fit in the applied series too, which is what the keyword is
-            # for — inspecting what would have been applied.
-            pu = derive_downscaling_parameters(
+            # A prior displaces the identity where the fits are unusable, and is labelled as external
+            # evidence rather than as a measurement.
+            pip = derive_downscaling_parameters(
+                :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
+                min_cells = 4,
+                forcing_loader = _cp_loader(cells, inverted),
+                decoupling_factor_prior = 0.7)
+            iv1 = first(pip.elevation_interval_forcing)
+            @test all(≈(0.7), iv1.decoupling_factor)
+            @test DimensionalData.metadata(
+                iv1.forcing)["glacier_decoupling_factor_n_prior"] == length(_CP_TIME)
+
+            # The clamp keyword is gone, not silently ignored: there is nothing left to opt out of.
+            @test_throws MethodError derive_downscaling_parameters(
                 :synthetic, time_range, table, region; token = nothing, cache_path = nothing,
                 min_cells = 4,
                 forcing_loader = _cp_loader(cells, inverted),
                 clamp_to_valid_domain = false)
-            iv1 = first(pu.elevation_interval_forcing)
-            @test all(>(1.0), iv1.decoupling_factor)
-            @test DimensionalData.metadata(
-                iv1.forcing)["glacier_decoupling_factor_n_clamped"] == 0
 
             # The lapse fit *consumes* `k`, and an out-of-domain one corrupts it: the correction is
             # proportional to `k - 1` and weighted by `(1 - glm)`, so a `k` of 1.5 scales every cell
@@ -1667,22 +1857,43 @@ end
             @test read_downscaling_tile_status(path).parameters["elevation_interval_forcing"] ==
                   "false"
 
-            # A clamped `k` must survive the write still inside the domain it was clamped into.
+            # The provenance counts survive the round trip, which is what makes a stored interval
+            # judgeable without re-deriving it. The per-timestep source labels they summarize are not
+            # stored, so the counts are the whole record.
+            for j in eachindex(ivs)
+                stored = DimensionalData.metadata(ri.intervals[j].forcing)
+                live = DimensionalData.metadata(ivs[j].forcing)
+                for key in ("glacier_decoupling_factor_n_fit_held",
+                            "glacier_decoupling_factor_n_fit_in_domain",
+                            "n_timesteps_above_freezing")
+                    @test stored[key] == live[key]
+                end
+                for source in DOWNSCALING_SOURCES
+                    @test stored["glacier_decoupling_factor_n_$source"] ==
+                          live["glacier_decoupling_factor_n_$source"]
+                    @test stored["glacier_decoupling_factor_n_$(source)_above_freezing"] ==
+                          live["glacier_decoupling_factor_n_$(source)_above_freezing"]
+                    @test stored["temperature_lapse_rate_n_$source"] ==
+                          live["temperature_lapse_rate_n_$source"]
+                end
+            end
+
+            # A very small applied `k` must survive the write still inside the domain it came from.
             #
-            # `_make_applicable` clamps a below-domain fit to `nextfloat(0.0)` = 5e-324 exactly so
-            # the value satisfies the half-open `(0, 1]` that `climate_adjust_for_glacier`
-            # validates. Float32's smallest subnormal is ~1e-45, so storing the applied series at
-            # `precision` would flatten that sentinel to 0.0 and the file would read back *outside*
-            # the domain the clamp exists to satisfy. Observed on real Wrangell-St Elias forcing,
-            # where 8.7% of applied values sat on the sentinel — routine, not an edge case.
-            @test Float32(nextfloat(0.0)) == 0.0f0            # the underflow that made this a bug
-            clamped = [(; lo = 1000, hi = 1100, center = 1050.0, area = 1.0, n_cells = 1,
-                        decoupling_factor = fill(nextfloat(0.0), length(_CP_TIME)),
-                        forcing = first(ivs).forcing)]
-            cpath = joinpath(dir, "clamped.nc")
+            # `k`'s domain is the half-open `(0, 1]`, so a stored value has to read back *strictly*
+            # above zero. Float32's smallest subnormal is ~1e-45, so storing the applied series at
+            # `precision` would flatten anything below that to exactly 0.0 and the file would read
+            # back outside the domain `climate_adjust_for_glacier` validates — which is why this one
+            # variable is Float64 whatever `precision` says.
+            @test Float32(nextfloat(0.0)) == 0.0f0            # the underflow this guards against
+            tiny = [(; lo = 1000, hi = 1100, center = 1050.0, area = 1.0, n_cells = 1,
+                     decoupling_factor = fill(nextfloat(0.0), length(_CP_TIME)),
+                     decoupling_factor_source = fill(Int8(1), length(_CP_TIME)),
+                     forcing = first(ivs).forcing)]
+            cpath = joinpath(dir, "tiny_factor.nc")
             write_downscaling_tile_netcdf(cpath, tile, p; climate_model = :synthetic, time_range,
                                           tile_size = 2, buffer = 1, min_cells = 4,
-                                          elevation_intervals = clamped, precision = Float32)
+                                          elevation_intervals = tiny, precision = Float32)
             back = only(read_downscaling_tile(cpath).intervals).decoupling_factor
             @test all(v -> 0 < v <= 1, back)
             @test back == fill(nextfloat(0.0), length(_CP_TIME))
@@ -1873,7 +2084,481 @@ end
         end
     end
 
+    @testset "CachedForcingLoader" begin
+        calls = Ref(0)
+        base = function (model, lat, lon; time_range = nothing, kwargs...)
+            calls[] += 1
+            return (model, lat, lon, time_range)
+        end
+        tr = (DateTime(2018, 1, 1), DateTime(2020, 1, 1))
+
+        c = CachedForcingLoader(base; capacity = 4)
+        @test c(:era5land, 60.0, -142.0; time_range = tr) == (:era5land, 60.0, -142.0, tr)
+        @test c(:era5land, 60.0, -142.0; time_range = tr) == (:era5land, 60.0, -142.0, tr)
+        # The point of the whole file: a repeated cell costs one underlying load, not two. At the
+        # 2°/1° tiling each cell is requested ~3.62 times over a global sweep.
+        @test calls[] == 1
+        r = forcing_cache_report(c)
+        @test (r.hits, r.misses, r.requests) == (1, 1, 2)
+        @test r.hit_rate == 0.5
+
+        # Bounded: past capacity the least recently used are dropped, and an evicted cell reloads.
+        for i in 1:6
+            c(:era5land, 60.0 + i, -142.0; time_range = tr)
+        end
+        r = forcing_cache_report(c)
+        @test r.cached_cells <= 4
+        @test r.evictions > 0
+        @test calls[] == 7
+
+        # A different window is different data under the same key. Silently returning the wrong one
+        # would be invisible, so it is refused.
+        @test_throws "one cache cannot serve two of them" c(:era5land, 60.0, -142.0;
+                                                            time_range = (DateTime(1990, 1, 1),
+                                                                          DateTime(1991, 1, 1)))
+
+        # A throwing load is not cached, so a transient store error is retried rather than remembered
+        # as a permanent failure.
+        boom = Ref(0)
+        flaky = function (model, lat, lon; time_range = nothing, kwargs...)
+            boom[] += 1
+            boom[] == 1 && error("transient")
+            return :ok
+        end
+        c2 = CachedForcingLoader(flaky; capacity = 2)
+        @test_throws ErrorException c2(:era5land, 1.0, 2.0; time_range = tr)
+        @test c2(:era5land, 1.0, 2.0; time_range = tr) == :ok
+        @test boom[] == 2
+
+        # Capacity from a memory budget depends on the record length, which is the easy thing to
+        # forget: the same budget that holds thousands of cells of a two-year window holds ~100 of
+        # the full record.
+        @test forcing_cache_capacity(4 * 2^30, 17_521) > 4_000
+        @test forcing_cache_capacity(4 * 2^30, 666_000) < 200
+        @test forcing_cache_capacity(1, 10_000) == 1        # floored at one, never zero
+        @test_throws ArgumentError CachedForcingLoader(base; capacity = 0)
+        @test_throws ArgumentError forcing_cache_capacity(0, 100)
+        @test_throws ArgumentError forcing_cache_capacity(100, 0)
+    end
+
+    @testset "volume change" begin
+        # A synthetic `gemb` output built so the identity holds exactly by construction: `ice_flux` is
+        # derived *from* the mass, water and firn terms, which is what makes the closure a test of the
+        # decomposition rather than of the fixture.
+        nt, nz, rho = 6, 4, 917.0
+        ti = Ti(collect(DateTime(2000, 1, 1):Month(1):DateTime(2000, 6, 1)))
+        zd = Z(1:nz)
+        dz = [0.5 + 0.01i + 0.002j for j in 1:nz, i in 1:nt]
+        density = [400.0 + 120.0 * (j - 1) + 5.0i for j in 1:nz, i in 1:nt]
+        density[nz, :] .= rho                       # base at ice density, as the datum requires
+        water = [j == 2 ? 3.0sin(i) + 3.0 : 0.0 for j in 1:nz, i in 1:nt]
+        precip, ec = fill(40.0, nt), fill(-1.5, nt)
+        runoff = [0.0, 0.0, 5.0, 30.0, 12.0, 0.0]
+
+        fac = [GEMB.firn_air_content(view(dz, :, i), view(density, :, i), rho) for i in 1:nt]
+        stored = [sum(view(water, :, i)) for i in 1:nt]
+        smb = cumsum(precip .+ ec .- runoff)
+        dh_true = [(smb[i] - smb[1] - (stored[i] - stored[1])) / rho + (fac[i] - fac[1])
+                   for i in 1:nt]
+        flux = -diff(vcat(0.0, dh_true))            # so -cumsum(flux) == dh_true
+
+        out = DimStack((ice_flux = DimArray(flux, (ti,)),
+                        precipitation = DimArray(precip, (ti,)),
+                        evaporation_condensation = DimArray(ec, (ti,)),
+                        runoff = DimArray(runoff, (ti,)),
+                        dz = DimArray(dz, (zd, ti)),
+                        density = DimArray(density, (zd, ti)),
+                        water = DimArray(water, (zd, ti)));
+                       metadata = Dict{String,Any}("density_ice" => rho))
+
+        dh = surface_height_change(out)
+        @test dh ≈ -cumsum(flux)
+        c = height_change_components(out)
+        # Every term is an anomaly against the first output time, so all six start at zero and the
+        # four physical ones sum to the total. This is the check every dh in a tile file carries.
+        @test c.total ≈ dh .- dh[1]
+        @test all(iszero, (c.total[1], c.mass[1], c.water[1], c.firn[1], c.strain[1]))
+        @test c.total ≈ c.mass .+ c.water .+ c.firn .+ c.strain .+ c.residual
+        @test maximum(abs, c.residual) < 1e-12
+        # `strain_thinning` is absent here, which is what a run at the default
+        # `horizontal_strain_rate` produces — treated as zero rather than as a missing layer.
+        @test all(iszero, c.strain)
+
+        # The datum assumes the material below the model base is already ice. A base short of ice
+        # density means the height series under-counts compaction, silently, so it is checkable.
+        @test column_reaches_ice_density(out)
+        shallow_density = copy(density)
+        shallow_density[nz, nt] = 800.0
+        shallow = DimStack((ice_flux = DimArray(flux, (ti,)),
+                            dz = DimArray(dz, (zd, ti)),
+                            density = DimArray(shallow_density, (zd, ti)),
+                            water = DimArray(water, (zd, ti)));
+                           metadata = Dict{String,Any}("density_ice" => rho))
+        @test !column_reaches_ice_density(shallow)
+        @test column_reaches_ice_density(shallow; tolerance = 200.0)
+        @test_throws ArgumentError column_reaches_ice_density(out; tolerance = -1)
+
+        # A stack with no `density_ice` cannot convert between mass and thickness at all, so it says
+        # so rather than assuming a density.
+        @test_throws ArgumentError height_change_components(
+            DimStack((ice_flux = DimArray(flux, (ti,)),)))
+        @test_throws ArgumentError surface_height_change(
+            DimStack((melt = DimArray(precip, (ti,)),)))
+
+        @testset "area weighting and units" begin
+            areas = [10.0, 25.0, 4.0]
+            dhb = [-1.0 -0.5 0.2; -2.0 -1.0 0.4]
+            # A metre over a square kilometre is a thousandth of a cubic kilometre.
+            @test tile_volume_change(dhb, areas) ≈
+                  [(10 * -1.0 + 25 * -0.5 + 4 * 0.2) / 1000,
+                   (10 * -2.0 + 25 * -1.0 + 4 * 0.4) / 1000]
+            # kg m-2 over km² into Gt: times 1e6 m²/km², divided by 1e12 kg/Gt.
+            @test tile_mass_total([-100.0 -50.0 20.0], areas) ≈
+                  [(10 * -100.0 + 25 * -50.0 + 4 * 20.0) * 1e-6]
+            @test mie2cubickm(areas) ≈ sum(areas) / 1000
+            # A zero-area band contributes nothing and cannot make the total `NaN`, which matters
+            # because an unrunnable band is a normal outcome.
+            @test tile_volume_change([1.0 NaN], [2.0, 0.0]) ≈ [2.0 / 1000]
+            @test_throws DimensionMismatch tile_volume_change(dhb, [1.0, 2.0])
+        end
+    end
+
+    @testset "geotile_id" begin
+        # The exact strings the 2° geotile products on disk use, so a join needs no translation.
+        @test geotile_id((-142, 60), 2) == "lat[+60+62]lon[-142-140]"
+        @test geotile_id((28, 0), 2) == "lat[+00+02]lon[+028+030]"
+        @test geotile_id((36, -2), 2) == "lat[-02+00]lon[+036+038]"
+        @test geotile_id((-180, -90), 2) == "lat[-90-88]lon[-180-178]"
+        @test geotile_id((-24, 82), 2) == "lat[+82+84]lon[-024-022]"
+        # Bounds and index forms agree, so a tile's own `bounds` and its index name the same geotile.
+        @test geotile_id(tile_bounds((-142, 60); tile_size = 2)) == geotile_id((-142, 60), 2)
+        # Zero carries an explicit `+`, which is what the ids on disk do.
+        @test geotile_id((0, 0), 2) == "lat[+00+02]lon[+000+002]"
+    end
+
+    @testset "resolve_downscaling" begin
+        # A fit fixture built directly rather than derived, so each acceptance test can put one
+        # timestep into one state. Twelve hourly steps in January, so the month-and-hour climatology
+        # has one populated cell per step.
+        rt = collect(DateTime(2001, 1, 1):Hour(1):DateTime(2001, 1, 1, 11))
+        n = length(rt)
+        function _fit(; k, lapse, cells = fill(20, n), spread = fill(900.0, n),
+                      alpha = fill(8.0, n), beta = fill(-0.001, n),
+                      gamma = fill(-3.0, n), delta = fill(0.0004, n))
+            ti = Ti(rt)
+            dec = DimStack((decoupling_factor = DimArray(collect(Float64, k), (ti,)),
+                            n_cells = DimArray(fill(20, n), (ti,)),
+                            r2 = DimArray(fill(0.99, n), (ti,)),
+                            ambient_excess = DimArray(fill(5.0, n), (ti,)),
+                            coef_alpha = DimArray(collect(Float64, alpha), (ti,)),
+                            coef_beta = DimArray(collect(Float64, beta), (ti,)),
+                            coef_gamma = DimArray(collect(Float64, gamma), (ti,)),
+                            coef_delta = DimArray(collect(Float64, delta), (ti,))))
+            lr = DimStack((lapse_rate = DimArray(collect(Float64, lapse), (ti,)),
+                           n_cells = DimArray(collect(Int, cells), (ti,)),
+                           elevation_spread = DimArray(collect(Float64, spread), (ti,))))
+            return (; time = rt, decoupling = dec, lapse_rate = lr)
+        end
+        bands = [(; lo = 1000, hi = 1100, center = 1050.0),
+                 (; lo = 2000, hi = 2100, center = 2050.0)]
+
+        @testset "a good fit is used as measured" begin
+            a = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(6.0, n)), bands, rt;
+                                    basis = :fitted)
+            @test a.lapse_rate == fill(6.0, n)
+            @test downscaling_source_counts(a.lapse_rate_source)[:fitted] == n
+            @test length(a.bands) == 2
+            # `k` is re-evaluated at each band's own centre, so the two bands differ — the fit carries
+            # a `glm x z` interaction and the bands are the glacier, not the reanalysis surface.
+            @test a.bands[1].decoupling_factor != a.bands[2].decoupling_factor
+            @test all(v -> 0 < v <= 1, a.bands[1].decoupling_factor)
+            @test downscaling_source_counts(a.bands[1].decoupling_factor_source)[:fitted] == n
+        end
+
+        @testset "the joint screen against k, not fit_usable" begin
+            # `derive_lapse_rate` consumes `k`, and a `k` outside `(0, 1]` corrupts that timestep's
+            # slope through a correction proportional to `k - 1`. So it is dropped...
+            k = fill(0.7, n); k[3] = 2.5
+            a = resolve_downscaling(_fit(; k, lapse = fill(6.0, n)), bands, rt; basis = :fitted)
+            @test a.lapse_rate_source[3] != GEMB_GlacierSims._SOURCE_FITTED
+            @test downscaling_source_counts(a.lapse_rate_source)[:fitted] == n - 1
+
+            # ...but a `NaN` `k` is NOT a rejection: the fit treats it as `k = 1`, the exact no-op, so
+            # that timestep's slope is the ambient one and is sound. This is the difference between
+            # screening on the stored `fit_usable` flag (which is 0 for both cases) and screening on
+            # what actually corrupts the slope — on a real tile, 17,159 kept fits against 4,777.
+            k2 = fill(0.7, n); k2[3] = NaN
+            a2 = resolve_downscaling(_fit(k = k2, lapse = fill(6.0, n)), bands, rt; basis = :fitted)
+            @test downscaling_source_counts(a2.lapse_rate_source)[:fitted] == n
+        end
+
+        @testset "each rejection reaches the next tier" begin
+            # Too few cells, too little elevation spread, and a physically absent slope: three
+            # independent reasons a finite fit is still not evidence. Each falls to the climatology of
+            # the accepted ones, which here is the median of the good timesteps.
+            lapse = fill(6.0, n)
+            cells = fill(20, n); cells[2] = 3
+            spread = fill(900.0, n); spread[4] = 10.0
+            lapse[6] = 40.0                          # inside the validator's range, physically absent
+            a = resolve_downscaling(_fit(k = fill(0.7, n), lapse = lapse; cells, spread), bands, rt;
+                                    basis = :fitted)
+            for i in (2, 4, 6)
+                @test a.lapse_rate_source[i] == GEMB_GlacierSims._SOURCE_CLIMATOLOGY
+                @test a.lapse_rate[i] ≈ 6.0          # the median of the accepted fits
+            end
+            @test downscaling_source_counts(a.lapse_rate_source)[:fitted] == n - 3
+
+            # With nothing accepted at all there is no climatology either, so the prior is reached.
+            none = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(NaN, n)), bands, rt;
+                                       basis = :fitted, lapse_rate_prior = 7.5)
+            @test none.lapse_rate == fill(7.5, n)
+            @test downscaling_source_counts(none.lapse_rate_source)[:prior] == n
+        end
+
+        @testset "an out-of-domain k is excluded, not clamped" begin
+            # A band's `k` is re-evaluated from the four coefficients, not read off the stored
+            # `decoupling_factor` series, so it is the coefficients that decide whether a band's fit
+            # is in domain. A positive `gamma` puts the decoupled excess *above* the ambient one,
+            # i.e. `k > 1`: the glaciated cells fitted warmer than the ice-free ones.
+            #
+            # Clamping such a value to the nearest bound would report the identity as though it had
+            # been measured. Excluding it and taking the median of the fits that *are* in domain is
+            # both a better estimate and honestly labelled.
+            gamma = fill(-3.0, n); gamma[5] = 3.0
+            a = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(6.0, n); gamma), bands, rt;
+                                    basis = :fitted)
+            # The label is the assertion, not the value: here the other eleven timesteps are identical,
+            # so their median happens to equal them and the substitution is invisible numerically.
+            # That is exactly why the provenance is recorded separately from the series.
+            @test a.bands[1].decoupling_factor_source[5] ==
+                  GEMB_GlacierSims._SOURCE_CLIMATOLOGY
+            @test all(i -> a.bands[1].decoupling_factor_source[i] ==
+                           GEMB_GlacierSims._SOURCE_FITTED, [1, 2, 3, 4, 6, 7])
+            @test all(v -> 0 < v <= 1, a.bands[1].decoupling_factor)
+            @test a.bands[1].n_fit_in_domain == n - 1
+
+            # With every fit out of domain and no prior, the identity is reached — and is labelled
+            # `:ambient`, which is a different claim from `:fitted` at the same numeric value.
+            allbad = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(6.0, n),
+                                              gamma = fill(3.0, n)), bands, rt; basis = :fitted)
+            @test allbad.bands[1].decoupling_factor == fill(1.0, n)
+            @test downscaling_source_counts(allbad.bands[1].decoupling_factor_source)[:ambient] == n
+            @test allbad.bands[1].n_fit_in_domain == 0
+            # A prior displaces the identity, and says so.
+            withprior = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(6.0, n),
+                                                 gamma = fill(3.0, n)), bands, rt;
+                                            basis = :fitted, decoupling_factor_prior = 0.6)
+            @test withprior.bands[1].decoupling_factor == fill(0.6, n)
+            @test downscaling_source_counts(
+                withprior.bands[1].decoupling_factor_source)[:prior] == n
+        end
+
+        @testset "a held k is labelled, not substituted" begin
+            # Above the elevation where the tile's ambient warm excess `alpha + beta*z` falls below the
+            # fit's threshold, `decoupling_factor_at_elevation` holds the evaluation elevation down
+            # rather than reverting to 1 — a step in the vertical profile is read downstream as a
+            # mass-balance signal. A held value is still a fit, so it is used; the label records that
+            # it is not a fit at this band's own elevation.
+            #
+            # `2.0 - 0.001z` crosses 0.5 K at 1500 m, so the 2050 m band is held and the 1050 m band
+            # is not. `gamma`/`delta` are set so the held evaluation still lands inside `(0, 1]` —
+            # a held value that is out of domain would be excluded like any other, and this testset is
+            # about the held-but-usable case.
+            held = _fit(k = fill(0.7, n), lapse = fill(6.0, n),
+                        alpha = fill(2.0, n), beta = fill(-0.001, n),
+                        gamma = fill(-0.3, n), delta = fill(0.0001, n))
+            a = resolve_downscaling(held, [(; lo = 1000, hi = 1100, center = 1050.0),
+                                           (; lo = 2000, hi = 2100, center = 2050.0)], rt;
+                                    basis = :fitted)
+            @test a.bands[1].n_fit_held == 0
+            @test a.bands[2].n_fit_held == n
+            @test downscaling_source_counts(a.bands[1].decoupling_factor_source)[:fitted] == n
+            @test downscaling_source_counts(a.bands[2].decoupling_factor_source)[:held] == n
+            @test all(v -> 0 < v <= 1, a.bands[2].decoupling_factor)
+        end
+
+        @testset "the climatology basis applies to any window" begin
+            fit = _fit(k = fill(0.7, n), lapse = fill(6.0, n))
+            # A run window the fits do not cover, which is the normal case: the fits are a pooled
+            # cross-cell regression and cannot be appended to, so a decades-long run over a two-year
+            # fit window has to reduce them.
+            long = collect(DateTime(1990, 1, 1):Hour(1):DateTime(1990, 1, 2, 5))
+            a = resolve_downscaling(fit, bands, long; basis = :climatology)
+            @test length(a.lapse_rate) == length(long)
+            @test a.lapse_rate ≈ fill(6.0, length(long))
+            # Nothing is `:fitted` under this basis — every value is a climatology by construction, and
+            # the label distinguishes a populated month-hour cell from one that fell to a prior.
+            counts = downscaling_source_counts(a.lapse_rate_source)
+            @test counts[:fitted] == 0
+            @test counts[:climatology] == length(long)
+            # `:fitted` refuses the same mismatch rather than silently reverting to the climatology.
+            @test_throws ArgumentError resolve_downscaling(fit, bands, long; basis = :fitted)
+
+            # A month with no accepted fit falls through to the prior, not to another month's median —
+            # this fixture has January only, so a July run window is entirely prior.
+            july = collect(DateTime(1990, 7, 1):Hour(1):DateTime(1990, 7, 1, 5))
+            # (The whole-record median is still reached first, which is the intended third tier.)
+            aj = resolve_downscaling(fit, bands, july; basis = :climatology)
+            @test aj.lapse_rate ≈ fill(6.0, length(july))
+            @test downscaling_source_counts(aj.lapse_rate_source)[:climatology] == length(july)
+        end
+
+        @testset "argument validation" begin
+            fit = _fit(k = fill(0.7, n), lapse = fill(6.0, n))
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt; basis = :nonsense)
+            @test_throws ArgumentError resolve_downscaling(fit, bands, DateTime[])
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt; spread_minimum = -1)
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt;
+                                                           lapse_rate_window = (10.0, 5.0))
+            # A window wider than the validator's would accept a fit that is then rejected where it is
+            # applied, which is the one failure mode the acceptance test exists to prevent.
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt;
+                                                           lapse_rate_window = (-50.0, 50.0))
+            # Priors are applied, so they must be applicable.
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt; lapse_rate_prior = 99.0)
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt;
+                                                           decoupling_factor_prior = 1.5)
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt;
+                                                           decoupling_factor_prior = 0.0)
+            @test_throws ArgumentError resolve_downscaling(fit, bands, rt;
+                                                           lapse_rate_prior = [1.0, 2.0])
+            # No bands is not an error: a tile can carry cells with no populated hypsometry, and the
+            # lapse rate is still resolvable for it.
+            empty_bands = resolve_downscaling(fit, typeof(bands)(), rt)
+            @test isempty(empty_bands.bands)
+            @test length(empty_bands.lapse_rate) == n
+        end
+
+        @testset "source counts and masking" begin
+            a = resolve_downscaling(_fit(k = fill(0.7, n), lapse = fill(6.0, n)), bands, rt;
+                                    basis = :fitted)
+            counts = downscaling_source_counts(a.lapse_rate_source)
+            # Every source is a key even when unused, so two reports are comparable without either
+            # having to know which tiers the other reached.
+            @test issetequal(keys(counts), DOWNSCALING_SOURCES)
+            @test sum(values(counts)) == n
+            # The mask is the honest denominator for `k`: below freezing every value gives identical
+            # forcing, so an unmasked count describes the fit rather than the run.
+            mask = [i <= 4 for i in 1:n]
+            @test sum(values(downscaling_source_counts(a.lapse_rate_source, mask))) == 4
+            @test_throws DimensionMismatch downscaling_source_counts(a.lapse_rate_source, [true])
+        end
+    end
+
+    @testset "hypsometry_intervals" begin
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0), (1550, 2.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5, bins = [(1550, 5.0), (2050, 1.0)])]
+        iv = hypsometry_intervals(_cp_table(cells))
+        # The union of populated bins, ascending, each centred on its bin.
+        @test [(x.lo, x.hi) for x in iv] == [(1000, 1100), (1500, 1600), (2000, 2100)]
+        @test [x.center for x in iv] == [1050.0, 1550.0, 2050.0]
+        # Which bins are populated, not how much area is in them — the area a band carries is
+        # accumulated over the cells whose forcing was usable, and a total summed here would disagree
+        # with it whenever a cell drops out.
+        @test !any(hasproperty(x, :area) for x in iv)
+        @test isempty(hypsometry_intervals(_cp_table([(lon = 0.0, lat = 0.0, z = 1.0, glm = 0.0,
+                                                       bins = Tuple{Int,Float64}[])])))
+    end
+
+    @testset "tile run NetCDF" begin
+        run = _fake_tile_run()
+        dir = mktempdir()
+        path = write_glacier_tile_netcdf(joinpath(dir, run.name), run;
+                                       institution = "JPL", references = "none")
+
+        @testset "status reads metadata only" begin
+            st = read_glacier_tile_status(path)
+            @test st.geotile_id == run.geotile_id
+            @test st.band_centers == [b.center for b in run.bands]
+            @test st.delta_temperatures == run.delta_temperatures
+            @test st.precipitation_scalings == run.precipitation_scalings
+            @test st.time == last(run.time)
+            # The downscaling policy is a run parameter, because two runs of one tile that resolved
+            # their lapse rate differently are different experiments.
+            @test st.parameters["downscaling_basis"] == "fitted"
+            @test haskey(st.parameters, "model_densification_method")
+            @test read_glacier_tile_status(joinpath(dir, "absent.nc")) === nothing
+        end
+
+        @testset "series and totals round trip" begin
+            NCDatasets.NCDataset(path, "r") do ds
+                # Band-resolved series and tile totals are both stored, at both resolutions: the
+                # bands are what altimetry dh is binned at, the totals are what a regional sum uses.
+                @test size(ds["dh"]) == (length(run.time), length(run.bands),
+                                         length(run.delta_temperatures),
+                                         length(run.precipitation_scalings))
+                @test ds["dh"].attrib["units"] == "m"
+                @test size(ds["total_dv"]) == (length(run.time), length(run.delta_temperatures),
+                                               length(run.precipitation_scalings))
+                @test ds["total_dv"].attrib["units"] == "km3"
+                @test ds["total_dm"].attrib["units"] == "Gt"
+                # A per-band flux and its tile total share a name, so the total is prefixed; both must
+                # be present and distinguishable.
+                @test ds["melt"].attrib["units"] == "kg m-2"
+                @test ds["total_melt"].attrib["units"] == "Gt"
+                # The two are per-interval and cumulative respectively, which the file has to say or a
+                # reader compares a record-long volume change against one month's melt.
+                @test ds["total_melt"].attrib["cell_methods"] == "area: sum time: sum"
+                @test ds["total_fac"].attrib["cell_methods"] == "area: sum time: mean"
+                @test occursin("CUMULATIVE", ds.attrib["total_accumulation_comment"])
+                @test collect(ds["total_dv"][:, :, :]) ≈ run.totals[:dv]
+                @test collect(ds["band_area"][:]) == [b.area for b in run.bands]
+                @test ds["glacier_area_total"][] ≈ sum(b.area for b in run.bands)
+                @test ds["mie2cubickm"][] ≈ mie2cubickm([b.area for b in run.bands])
+                # Both identifiers, so a join against the 2° products needs no filename parsing.
+                @test ds.attrib["geotile_id"] == run.geotile_id
+                @test ds.attrib["tile_name"] == run.name
+                @test haskey(ds.attrib, "height_change_identity")
+                # The per-band parameter provenance is a variable, not an attribute: `k` is resolved
+                # at each band's own centre, so it varies with the band.
+                @test collect(ds["band_extrapolation_above_reanalysis"][:]) ==
+                      [p["extrapolation_above_reanalysis"] for p in run.band_provenance]
+                @test ds["band_extrapolation_above_reanalysis"].attrib["units"] == "m"
+                # A key one band did not record must read back as absent, not as zero: the writer
+                # defines a variable per key seen on *any* band, so the fill is what carries "this
+                # band has no value" through to a reader.
+                held = ds["band_glacier_decoupling_factor_n_fit_held"][:]
+                @test ismissing(held[end])
+                @test held[1] == run.band_provenance[1]["glacier_decoupling_factor_n_fit_held"]
+            end
+        end
+
+        @testset "restart round trip" begin
+            r = read_glacier_tile_restart(path)
+            @test length(r.profiles) == count(!isnothing, run.profiles)
+            @test r.band_centers == [b.center for b in run.bands]
+            @test r.time == last(run.time)
+            for (key, profile) in r.profiles
+                saved = run.profiles[key...]
+                @test issetequal(keys(profile), GEMB_GlacierSims.PROFILE_VARIABLES)
+                # Bit-exact, not approximate: `gemb` pins the column depth and cell count from the
+                # restored `dz`, so a rounded column is a different grid and cannot be resumed.
+                @test collect(profile[:dz]) == collect(saved[:dz])
+                @test collect(profile[:density]) == collect(saved[:density])
+            end
+            # The spinup provenance is restored onto each profile, so a continuation reports the
+            # spinup it inherited rather than none at all.
+            @test DimensionalData.metadata(first(values(r.profiles)))["spinup_cycles"] == 37
+            @test read_glacier_tile_restart(joinpath(dir, "absent.nc")) === nothing
+        end
+
+        @testset "append" begin
+            later = _fake_tile_run(; time = collect(DateTime(2001, 1, 1):Month(1):DateTime(2001, 3, 1)))
+            append_glacier_tile_netcdf(path, later)
+            st = read_glacier_tile_status(path)
+            @test st.n_timesteps == length(run.time) + length(later.time)
+            @test st.time == last(later.time)
+            # An overlapping or out-of-order continuation would duplicate output, so it is refused.
+            @test_throws ArgumentError append_glacier_tile_netcdf(path, run)
+            # A changed run grid means the arrays do not line up at all, so it cannot be reconciled.
+            wider = _fake_tile_run(; time = collect(DateTime(2002, 1, 1):Month(1):DateTime(2002, 3, 1)),
+                                   deltas = [0.0, 1.0, 2.0])
+            @test_throws ArgumentError append_glacier_tile_netcdf(path, wider)
+        end
+    end
+
     # Note: end-to-end simulation tests need CDS API credentials and network access to the
-    # Copernicus DEM, so the runfile builder and `gemb_glacier_cell` are exercised by
-    # `src/era5_example.jl` rather than here.
+    # Copernicus DEM, so the runfile builder, `gemb_glacier_cell` and `gemb_glacier_tile` are
+    # exercised by `src/era5_example.jl`, `scripts/derive_downscaling_parameters_e2e.jl` and
+    # `scripts/gemb_tile_e2e.jl` rather than here.
 end

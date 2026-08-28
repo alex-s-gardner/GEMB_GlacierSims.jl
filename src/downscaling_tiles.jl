@@ -325,9 +325,10 @@ unconditionally.
 - `elevation_interval_batch = 0`: how many intervals to accumulate per pass when the above is on.
   `0` means one pass holding every interval at once, which is the fewest forcing reads and the most
   memory. Ignored when interval forcing is off.
-- `decoupling_factor_fill`, `lapse_rate_fill`, `clamp_to_valid_domain`: how an unmeasurable timestep
-  is handled where the fits are *applied*. These affect **only** the interval forcing, since that is
-  the only thing here that applies a fit; the stored fits themselves are always raw.
+- `downscaling_basis`, `elevation_spread_minimum`, `lapse_rate_window`, `lapse_rate_prior`,
+  `decoupling_factor_prior`: how the fits are turned into applied parameters, forwarded to
+  [`resolve_downscaling`](@ref). These affect **only** the interval forcing, since that is the only
+  thing here that applies a fit; the stored fits themselves are always raw.
 - `precision = Float32`, `deflatelevel = 4`: storage for the written series. The `k` coefficients are
   always Float64 — see [`write_downscaling_tile_netcdf`](@ref).
 - `order = :chunk`: tile visit order; `:chunk` keeps the forcing cache warm across neighbouring
@@ -349,9 +350,12 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             min_cells::Int = _MIN_CELLS_DEFAULT,
                                             retain_elevation_interval_forcing::Bool = false,
                                             elevation_interval_batch::Int = 0,
-                                            decoupling_factor_fill::Real = 1.0,
-                                            lapse_rate_fill::Real = _DEFAULT_LAPSE_RATE,
-                                            clamp_to_valid_domain::Bool = true,
+                                            downscaling_basis::Symbol = :fitted,
+                                            elevation_spread_minimum::Real =
+                                                APPLIED_ELEVATION_SPREAD_MINIMUM,
+                                            lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
+                                            lapse_rate_prior = _DEFAULT_LAPSE_RATE,
+                                            decoupling_factor_prior = nothing,
                                             precision::Type = Float32,
                                             deflatelevel::Int = 4,
                                             order::Symbol = :chunk,
@@ -415,8 +419,9 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                              region_extent = tile.buffered_bounds,
                                              area_minimum, min_cells,
                                              elevation_interval_batch,
-                                             decoupling_factor_fill, lapse_rate_fill,
-                                             clamp_to_valid_domain, forcing_loader)
+                                             downscaling_basis, elevation_spread_minimum,
+                                             lapse_rate_window, lapse_rate_prior,
+                                             decoupling_factor_prior, forcing_loader)
 
             # `elevation_interval_forcing` is a lazy iterator: leaving it alone reads no forcing at
             # all, which is why the fits-only sweep costs one pass over the tile's cells. Collecting
@@ -479,7 +484,10 @@ function _tile_is_current(status, time_range; climate_model, tile_size, buffer, 
         "tile_buffer" => Float64(buffer),
         "min_cells" => min_cells,
         "area_minimum" => Float64(area_minimum),
-        "elevation_interval_forcing" => _encode_attribute(retain_elevation_interval_forcing))
+        "elevation_interval_forcing" => _encode_attribute(retain_elevation_interval_forcing),
+        # Not a setting but a property of the file: a tile written by an earlier version stores fewer
+        # variables than the current writer produces, and no comparison of *settings* can see that.
+        "downscaling_schema_version" => _TILE_SCHEMA_VERSION)
     for (k, want) in requested
         haskey(stored, k) || return false
         got = stored[k]

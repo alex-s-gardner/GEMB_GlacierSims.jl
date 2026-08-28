@@ -1,12 +1,14 @@
 # End-to-end check of `derive_downscaling_parameters` against real ERA5-Land forcing.
 #
-# The offline suite in `test/runtests.jl` proves the estimator inverts its own forward model. It
-# cannot prove the thing this rewrite was for: that a real region's per-timestep fits carry physical
-# structure — a summer lapse-rate minimum, a nocturnal inversion — which the deleted interquartile
-# threshold was discarding wholesale by substituting a constant for the entire series.
+# The offline suite in `test/runtests.jl` fits `:synthetic` forcing through an injected
+# `forcing_loader`, so it proves the estimator inverts its own forward model but never exercises the
+# real loader. This script does, and reports the two things only real forcing can show: how much a
+# region's per-timestep fits vary once resolved by season and by hour of day, which is what says
+# whether their spread is physical structure or fit error; and whether the elevation-interval forcing
+# they produce drops into `gemb_glacier_cell` unchanged.
 #
-# Wrangell-St Elias is the case that motivated the change: its fitted spread tripped
-# `_MAX_IDENTIFIABLE_IQR` and its whole series was replaced. So it is the region checked here.
+# Wrangell-St Elias has the elevation range to make both fits identifiable across its cells, so it is
+# the region checked here.
 #
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Downloads are cached as
 # Zarr chunks under `CLIMATE_CACHE`, shared across cells, so a re-run is nearly free.
@@ -102,24 +104,19 @@ function report_fits(p)
     println("lapse rate fitted:    $(length(lf))/$n " *
             "($(round(100 * length(lf) / n; digits = 1))%)")
 
-    # THE POINT OF THE REWRITE. The old code compared this spread against a fixed threshold (0.5 for
-    # `k`, 3.0 K/km for the lapse rate) and, when it was exceeded, replaced every timestep of the
-    # series with one constant. A wide spread here is physics — see the seasonal and diurnal tables
-    # below, which are that same spread resolved — so the series is now reported whole.
-    for (name, v, unit, old_threshold) in (("k", kf, "", 0.5),
-                                           ("lapse rate", lf, " K/km", 3.0))
+    # Spread over the whole series. Both parameters vary with season and time of day — the seasonal
+    # and diurnal tables below are this same spread resolved along those axes — so a wide range here
+    # is structure, and reading it as fit error would be a mistake. The per-timestep diagnostics
+    # printed next are what says whether an individual fit is trustworthy.
+    for (name, v, unit) in (("k", kf, ""), ("lapse rate", lf, " K/km"))
         isempty(v) && continue
         q25, q75 = Statistics.quantile(v, 0.25), Statistics.quantile(v, 0.75)
-        iqr = q75 - q25
-        verdict = iqr > old_threshold ? "REJECTED by the old IQR test -> whole series replaced " *
-                                        "by a constant" : "would have passed the old IQR test"
         println("\n$name:")
         println("  median  $(fmt(Statistics.median(v)))$unit   " *
-                "IQR $(fmt(iqr))$unit   range $(fmt(minimum(v)))..$(fmt(maximum(v)))$unit")
-        println("  $verdict")
+                "IQR $(fmt(q75 - q25))$unit   range $(fmt(minimum(v)))..$(fmt(maximum(v)))$unit")
     end
 
-    # The diagnostics that replaced the verdict: enough to judge each fit without one.
+    # Per-timestep fit quality, summarized: enough to judge a fit on its own terms.
     r2 = filter(isfinite, p.decoupling.r2)
     ae = filter(isfinite, p.decoupling.ambient_excess)
     isempty(r2) || println("\nfit diagnostics:")
@@ -130,8 +127,8 @@ function report_fits(p)
     sp = filter(isfinite, p.lapse_rate.elevation_spread)
     isempty(sp) || println("  elev. spread    median $(fmt(Statistics.median(sp); digits = 1)) m")
 
-    # Out-of-domain fits are now visible instead of clamped away. Their count is the honest measure
-    # of how much of the series is hard to fit.
+    # Fits outside the domain their consumer accepts are reported raw here; clamping happens only
+    # where the parameters are applied. Their count measures how much of the series is hard to fit.
     n_high = count(x -> isfinite(x) && x > 1.0, k)
     n_low = count(x -> isfinite(x) && x <= 0.0, k)
     n_lr_out = count(x -> isfinite(x) && (x < -30 || x > 25), lr)
@@ -140,8 +137,9 @@ function report_fits(p)
     println("  lapse rate outside [-30, 25] K/km:  $n_lr_out")
 end
 
-# The seasonal cycle, which is the structure the IQR test was destroying: melt-season lapse rates are
-# shallower than winter ones over ice, and `k` is only measurable when there is a warm excess to damp.
+# The seasonal cycle. `k` is only identifiable when there is a warm ambient excess to damp, so it is
+# fitted in the melt season and absent outside it; the lapse rate is fitted year-round, and its
+# month-to-month range is what one constant per region would have to stand in for.
 function report_seasonal(p)
     println("\n", "="^78, "\n SEASONAL CYCLE   (groupby(p.lapse_rate, Ti => month))\n", "="^78)
     lr_by = groupby(p.lapse_rate, Ti => month)
@@ -174,8 +172,8 @@ function report_seasonal(p)
     end
 end
 
-# The diurnal cycle, the other axis the IQR test conflated with fit error. Nighttime valley
-# inversions flatten or reverse the lapse rate; a single constant per region cannot express this.
+# The diurnal cycle, the other axis the fits resolve. Where nighttime inversions form they flatten or
+# reverse the lapse rate; the hourly medians are what shows whether this region has them.
 function report_diurnal(p)
     println("\n", "="^78, "\n DIURNAL CYCLE   (groupby(p.lapse_rate, Ti => hour))\n", "="^78)
     lr_by = groupby(p.lapse_rate, Ti => hour)
@@ -217,16 +215,26 @@ function report_intervals(p)
     println("intervals: $(length(ivs))   area $(fmt(sum(iv.area for iv in ivs); digits = 3)) km² " *
             "vs $(fmt(total_area; digits = 3)) km² in the cells " *
             "(conserved: $(isapprox(sum(iv.area for iv in ivs), total_area; atol = 1e-9)))")
-    println("\n  interval m    area km²  cells   mean T K   k mean   held  filled clamp  extrap m")
+    # `measured/warm` is the number that matters. `k` scales `max(T - 273.15, 0)`, so below freezing
+    # every value gives identical forcing and a substitution there costs nothing; restricting the
+    # count to the above-freezing timesteps is what says how much of the *melt-relevant* forcing
+    # rested on a measurement. `fit_ok` and `held` describe the fits behind it: `held` approaching
+    # `fit_ok` means this interval's `k` is the ceiling value the tile's ambient excess still
+    # supports rather than a fit at this elevation.
+    println("\n  interval m    area km²  cells   mean T K   k mean  fit_ok  held  " *
+            "measured/warm  extrap m")
     for iv in ivs
         m = DimensionalData.metadata(iv.forcing)
+        warm = m["n_timesteps_above_freezing"]
+        measured = m["glacier_decoupling_factor_n_fitted_above_freezing"] +
+                   m["glacier_decoupling_factor_n_held_above_freezing"]
         println("  ", lpad("$(iv.lo)-$(iv.hi)", 11),
                 lpad(fmt(iv.area; digits = 2), 11), lpad(iv.n_cells, 7),
                 lpad(fmt(m["temperature_air_mean"]), 11),
                 lpad(fmt(m["glacier_decoupling_factor_mean"]; digits = 3), 9),
-                lpad(m["glacier_decoupling_factor_n_held"], 7),
-                lpad(m["glacier_decoupling_factor_n_filled"], 8),
-                lpad(m["glacier_decoupling_factor_n_clamped"], 6),
+                lpad(m["glacier_decoupling_factor_n_fit_in_domain"], 8),
+                lpad(m["glacier_decoupling_factor_n_fit_held"], 6),
+                lpad("$measured/$warm", 15),
                 lpad(fmt(m["extrapolation_above_reanalysis"]; digits = 0), 10))
     end
 
@@ -239,9 +247,11 @@ function report_intervals(p)
     println("applied k within (0, 1] on every interval:  $in_domain")
     println("temperature decreases with elevation:       $cools")
     m1 = DimensionalData.metadata(first(ivs).forcing)
-    println("lapse rate applied: $(fmt(m1["temperature_lapse_rate"])) K/km  " *
-            "(filled $(m1["temperature_lapse_rate_n_filled"]), " *
-            "clamped $(m1["temperature_lapse_rate_n_clamped"]) of $(length(p.time)))")
+    lapse_by_source = join(["$source $(m1["temperature_lapse_rate_n_$source"])"
+                            for source in DOWNSCALING_SOURCES
+                            if m1["temperature_lapse_rate_n_$source"] > 0], ", ")
+    println("lapse rate applied: $(fmt(m1["temperature_lapse_rate"])) K/km mean  " *
+            "($lapse_by_source of $(length(p.time)))")
 end
 
 # The last link: an interval's forcing has to drop into `gemb_glacier_cell` unchanged. Run the
