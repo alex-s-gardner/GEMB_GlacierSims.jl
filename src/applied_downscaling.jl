@@ -51,20 +51,47 @@ const _SOURCE_CLIMATOLOGY = Int8(3)
 const _SOURCE_PRIOR = Int8(4)
 const _SOURCE_AMBIENT = Int8(5)
 
-# How narrow a physically credible lapse rate is, against the much wider range
+# A physical sanity window on a fitted lapse rate, against the much wider range
 # `climate_adjust_for_elevation` merely validates against ($(_LAPSE_RATE_LIMITS) K/km). The validator's
-# job is to catch a units mistake; this one's is to catch a fit that is arithmetically fine and
-# physically absent. The upper bound is above the dry adiabatic rate (9.8 K/km) because a fit is a
-# regression across cells at one instant, not a sounding, and clears it legitimately on clear summer
-# afternoons; the lower bound admits the nocturnal and polar inversions that are real (the Antarctic
-# Peninsula tiles fit -3 K/km at the 5th percentile) while rejecting the runaway slopes an
-# out-of-domain `k` produces.
-const APPLIED_LAPSE_RATE_WINDOW = (-5.0, 12.0)
+# job is to catch a units mistake; this one's is to catch a slope that is arithmetically fine and
+# physically absurd.
+#
+# Wide on purpose, because it is no longer what judges conditioning — `APPLIED_LAPSE_RATE_STDERR_MAXIMUM`
+# is. The upper bound sits above the dry adiabatic rate (9.8 K/km) because a fit is a regression across
+# cells at one instant, not a sounding, and clears it legitimately on clear summer afternoons; the lower
+# bound admits the polar and nocturnal inversions that are real. A narrower window than this rejects
+# measured physics: across the global table it would discard >1% of the fits in 364 of 739 tiles, and
+# highly glaciated tiles — the ones whose slope barely depends on `k` at all, so the most trustworthy —
+# reach -4 K/km at their 1st percentile.
+const APPLIED_LAPSE_RATE_WINDOW = (-15.0, 15.0)
 
-# Fewest metres of elevation spread among the fitted cells before a slope is believed. `derive_lapse_rate`
-# reports `elevation_spread` precisely because it matters far more than the cell count: eight cells
-# spanning 40 m constrain a slope no better than two do.
-const APPLIED_ELEVATION_SPREAD_MINIMUM = 300.0
+# Largest standard error (K km-1) a fitted lapse rate may carry and still be used.
+#
+# This is the conditioning test, and the only one that varies with time — see
+# [`derive_lapse_rate_uncertainty`](@ref).
+#
+# Set by the temperature error it admits, not by a percentile. A slope error multiplies the distance it
+# is applied over: at 1 K km-1 a band a kilometre above the reanalysis surface — a typical glacier
+# extrapolation — carries about 1 K of forcing error, which is roughly one step of the temperature
+# perturbation grid the downstream fit searches. Tightening it much below that buys accuracy the
+# perturbation grid cannot resolve; loosening it lets the lapse uncertainty exceed the signal being
+# fitted.
+#
+# What it keeps, pooled over every fitted timestep on the global table: 77.9% at 1.0, against 55.4% at
+# 0.5 and 89.9% at 2.0. Note the distribution has a long tail — the 99th percentile is 15 K km-1 — so a
+# statistic built from per-tile medians badly overstates how permissive any ceiling is.
+#
+# Against a cutoff on `elevation_spread`, which is what this replaces: that is a tile constant, so it
+# accepts or rejects a tile's whole series. Requiring 300 m of spread rejected 70% of all fitted
+# timesteps and ran 8.9 million of them on the constant prior; this keeps 71% and leaves 0.3 million.
+const APPLIED_LAPSE_RATE_STDERR_MAXIMUM = 1.0
+
+# Fewest metres of elevation spread before a slope is believed, used **only** where no standard error is
+# available — a tile derived before the temperature second moments were accumulated. Low, because it is
+# a fallback for a missing diagnostic rather than the diagnostic: the median fitted slope is stable
+# across every spread bin (4.6 to 6.0 K/km from under 200 m of spread to over 600 m), so a high cutoff
+# discards sound central values to avoid tails that the standard error identifies directly.
+const APPLIED_ELEVATION_SPREAD_MINIMUM = 50.0
 
 """
     hypsometry_intervals(grid_cells) -> Vector{@NamedTuple{lo::Int, hi::Int, center::Float64}}
@@ -205,10 +232,16 @@ which need not be the fit's.
 A timestep's own fit is accepted when all of these hold, and used as measured:
 
 1. it is finite and its cell count reaches `min_cells`;
-2. `elevation_spread` reaches `spread_minimum` — the diagnostic that says whether the cells span enough
-   elevation to constrain a slope at all;
-3. it lies inside `lapse_rate_window`, a physical range rather than the wider one
-   `climate_adjust_for_elevation` validates against;
+2. its **standard error** is at most `stderr_maximum` — see
+   [`derive_lapse_rate_uncertainty`](@ref). This is the conditioning test, and the only one that varies
+   with time: `elevation_spread` and the cell count are fixed by which cells the tile has, so a cutoff on
+   either accepts or rejects the tile's whole series, while the standard error separates the
+   well-determined hours from the rest *within* a poorly-instrumented tile. Where no standard error is
+   available — a tile derived before the temperature second moments were accumulated —
+   `elevation_spread` must instead reach `spread_minimum`;
+3. it lies inside `lapse_rate_window`, a wide physical sanity range. Wide because it is no longer what
+   judges conditioning: a narrow window rejects measured physics, discarding >1% of the fits in 364 of
+   739 tiles and clipping the inversions that highly glaciated tiles legitimately fit;
 4. **the same timestep's `k` is not out of domain.** `derive_lapse_rate` consumes `k` to bring the cells
    to a common on-glacier state, so a `k` outside `(0, 1]` corrupts that timestep's slope through a
    correction proportional to `k - 1`. Because that correction carries a `1 - glm` weight and `glm`
@@ -255,8 +288,11 @@ silently reverting to the climatology.
 
 # Keywords
 - `basis = :climatology`: as above.
-- `min_cells = $(_MIN_CELLS_DEFAULT)`, `spread_minimum = $APPLIED_ELEVATION_SPREAD_MINIMUM`,
-  `lapse_rate_window = $APPLIED_LAPSE_RATE_WINDOW`: the lapse-rate acceptance tests.
+- `min_cells = $(_MIN_CELLS_DEFAULT)`, `stderr_maximum = $APPLIED_LAPSE_RATE_STDERR_MAXIMUM` K/km,
+  `lapse_rate_window = $APPLIED_LAPSE_RATE_WINDOW` K/km,
+  `spread_minimum = $APPLIED_ELEVATION_SPREAD_MINIMUM` m: the lapse-rate acceptance tests, in the order
+  described above. `stderr_maximum` is the one to tune; `spread_minimum` applies only to tiles carrying
+  no standard error.
 - `lapse_rate_prior = $(_DEFAULT_LAPSE_RATE)`: a scalar or a 12-element monthly cycle (January first),
   used where no fit and no climatology exists. `GREENLAND_LAPSE_RATE`, `ARCTIC_LAPSE_RATE` and
   `ANTARCTICA_LAPSE_RATE` from `GEMB_ClimateForcing` are the published cycles to pass here when the
@@ -271,6 +307,7 @@ function resolve_downscaling(fit, intervals, run_time;
                              basis::Symbol = :climatology,
                              min_cells::Int = _MIN_CELLS_DEFAULT,
                              spread_minimum::Real = APPLIED_ELEVATION_SPREAD_MINIMUM,
+                             stderr_maximum::Real = APPLIED_LAPSE_RATE_STDERR_MAXIMUM,
                              lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                              lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                              decoupling_factor_prior = nothing)
@@ -288,6 +325,8 @@ function resolve_downscaling(fit, intervals, run_time;
         "would accept a fit that is then rejected at the point of use"))
     spread_minimum >= 0 ||
         throw(ArgumentError("spread_minimum must be >= 0 m, got $spread_minimum"))
+    stderr_maximum > 0 ||
+        throw(ArgumentError("stderr_maximum must be > 0 K/km, got $stderr_maximum"))
 
     lapse_prior = _monthly_prior(lapse_rate_prior, "lapse_rate_prior", _LAPSE_RATE_LIMITS;
                                  open_lower = false)
@@ -310,10 +349,19 @@ function resolve_downscaling(fit, intervals, run_time;
     lapse_cells = collect(Int, fit.lapse_rate.n_cells)
     spread = collect(Float64, fit.lapse_rate.elevation_spread)
 
-    # The lapse-rate acceptance screen, including the joint one against `k`.
+    # How well determined each slope is. A tile derived before the temperature second moments were
+    # accumulated carries none, and falls back to the elevation-spread test below.
+    stderr = hasproperty(fit, :lapse_rate_uncertainty) ?
+             collect(Float64, fit.lapse_rate_uncertainty.lapse_rate_stderr) : fill(NaN, length(lapse))
+
+    # The lapse-rate acceptance screen: finite, enough cells, physically credible, not corrupted by an
+    # out-of-domain `k`, and **well enough determined**. The last test prefers the standard error, which
+    # varies with time, over the elevation spread, which is a tile constant and so can only accept or
+    # reject a tile's entire series.
     accepted = [isfinite(lapse[t]) && lapse_cells[t] >= min_cells &&
-                isfinite(spread[t]) && spread[t] >= spread_minimum &&
-                lo_w <= lapse[t] <= hi_w && _lapse_uncorrupted(k_reference[t])
+                lo_w <= lapse[t] <= hi_w && _lapse_uncorrupted(k_reference[t]) &&
+                (isfinite(stderr[t]) ? stderr[t] <= stderr_maximum :
+                 (isfinite(spread[t]) && spread[t] >= spread_minimum))
                 for t in eachindex(lapse)]
 
     lapse_rate, lapse_rate_source =
@@ -358,6 +406,8 @@ function resolve_downscaling(fit, intervals, run_time;
         "downscaling_basis" => string(basis),
         "downscaling_min_cells" => min_cells,
         "downscaling_elevation_spread_minimum" => Float64(spread_minimum),
+        "downscaling_lapse_rate_stderr_maximum" => Float64(stderr_maximum),
+        "downscaling_n_lapse_rate_stderr_available" => count(isfinite, stderr),
         "downscaling_lapse_rate_window" => [lo_w, hi_w],
         "downscaling_lapse_rate_prior" => lapse_prior,
         "downscaling_decoupling_factor_prior" =>
@@ -499,7 +549,7 @@ function _cyclic_lookup(c::_CyclicMedian, t::DateTime)
 end
 
 # A prior is either absent, a scalar, or a monthly cycle indexed by calendar month.
-_prior_at(prior::Nothing, ::DateTime) = nothing
+_prior_at(::Nothing, ::DateTime) = nothing
 _prior_at(prior::Real, ::DateTime) = Float64(prior)
 _prior_at(prior::AbstractVector, t::DateTime) = Float64(prior[month(t)])
 

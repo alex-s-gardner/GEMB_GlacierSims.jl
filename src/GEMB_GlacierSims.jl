@@ -66,6 +66,7 @@ export read_glacier_cell_parameters, read_glacier_cell_status
 include("applied_downscaling.jl")
 export hypsometry_intervals, resolve_downscaling, AppliedDownscaling
 export DOWNSCALING_SOURCES, downscaling_source_counts, decoupling_factor_prior
+export APPLIED_LAPSE_RATE_STDERR_MAXIMUM, APPLIED_LAPSE_RATE_WINDOW
 
 include("forcing_cache.jl")
 export CachedForcingLoader, forcing_cache_capacity, forcing_cache_report
