@@ -2205,6 +2205,37 @@ end
         @test_throws ArgumentError surface_height_change(
             DimStack((melt = DimArray(precip, (ti,)),)))
 
+        @testset "reference discharge" begin
+            # Ten years of monthly output, accumulating at exactly 2 km³/yr, so the reference rate is
+            # checkable by hand. The total also loses 0.5 km³/yr, which is what the correction must
+            # leave behind once the assumed discharge is removed.
+            tt = collect(DateTime(2000, 1, 31):Month(1):DateTime(2009, 12, 31))
+            yrs = [Millisecond(x - first(tt)).value / (365.25 * 86_400_000) for x in tt]
+            dv_mass = 2.0 .* yrs
+            dv = dv_mass .- 0.5 .* yrs
+
+            @test reference_discharge_rate(dv_mass, tt; reference_years = 5) ≈ 2.0
+            # Exactly linear accumulation, so the reference length must not matter here. It does matter
+            # on real input, which is why it is a keyword rather than a constant.
+            @test reference_discharge_rate(dv_mass, tt; reference_years = 2) ≈ 2.0
+            @test reference_discharge_rate(dv_mass, tt; reference_years = 9) ≈ 2.0
+
+            c = discharge_corrected_volume_change(dv, dv_mass, tt; reference_years = 5)
+            @test c[1] == 0.0
+            @test (c[end] - c[1]) / (yrs[end] - yrs[1]) ≈ -0.5
+            # Without the correction the series walks off at the accumulation rate, which is the whole
+            # reason this exists: GEMB has no dynamics, so nothing balances the mean SMB.
+            @test (dv[end] - dv[1]) / (yrs[end] - yrs[1]) ≈ 1.5
+
+            # A reference period longer than the record divides by the wrong interval, scaling the rate
+            # by exactly that error. Refused rather than silently wrong on the figure it feeds.
+            @test_throws "reference period" reference_discharge_rate(dv_mass, tt;
+                                                                    reference_years = 25)
+            @test_throws ArgumentError reference_discharge_rate(dv_mass, tt; reference_years = 0)
+            @test_throws DimensionMismatch reference_discharge_rate(dv_mass[1:5], tt)
+            @test_throws ArgumentError reference_discharge_rate([1.0], tt[1:1])
+        end
+
         @testset "area weighting and units" begin
             areas = [10.0, 25.0, 4.0]
             dhb = [-1.0 -0.5 0.2; -2.0 -1.0 0.4]

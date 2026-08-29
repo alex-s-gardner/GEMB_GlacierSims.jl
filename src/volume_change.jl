@@ -170,6 +170,76 @@ compaction term and mass does not.
 tile_mass_total(flux, band_areas) = _band_weighted_total(flux, band_areas, _M2_PER_KM2 / _KG_PER_GT)
 
 """
+    reference_discharge_rate(dv_mass, time; reference_years = 5) -> Float64
+
+A stand-in ice discharge rate (km³ of ice equivalent per year), from the assumption that the glacier was
+in balance over the first `reference_years` of the record.
+
+Under that assumption whatever left as ice discharge matched what arrived as surface mass balance, so
+the rate is the cumulative SMB volume at the end of the reference period divided by its length.
+
+**This is a placeholder for making a figure readable, not a discharge model.** Real discharge is not
+constant, is not equal to early-record SMB, and is derived elsewhere. What it buys is the one thing a
+plot of modelled volume change needs: GEMB carries no ice dynamics, so nothing balances the mean SMB
+and the raw series walks off at the accumulation rate — a tile can gain 6 km³/yr indefinitely. Removing
+a constant rate leaves the variability about the reference state, which is the part that can be read
+against an altimetric `dv` at all.
+
+`reference_years` longer than the record throws rather than quietly using what is there: a rate divided
+by the wrong interval is off by exactly that factor, and silently returning it would put a wrong slope
+on the figure the correction exists to make readable.
+"""
+function reference_discharge_rate(dv_mass, time; reference_years::Real = 5)
+    reference_years > 0 ||
+        throw(ArgumentError("reference_years must be positive, got $reference_years"))
+    axes(dv_mass, 1) == axes(time, 1) || throw(DimensionMismatch(
+        "dv_mass $(axes(dv_mass, 1)) and time $(axes(time, 1)) must share a time axis"))
+    length(time) >= 2 || throw(ArgumentError("need at least two output times"))
+
+    span = _decimal_years(last(time) - first(time))
+    span >= reference_years || throw(ArgumentError(
+        "the record spans $(round(span, digits = 2)) yr but a $(reference_years) yr reference period " *
+        "was asked for. Shorten `reference_years`, or run a longer record: dividing the reference " *
+        "period's mass gain by the wrong interval scales the rate by exactly that error."))
+
+    # Last output time at or before the end of the reference period, and the elapsed time to it — not
+    # the nominal `reference_years`, since the output grid will not land exactly on it.
+    cutoff = first(time) + Millisecond(round(Int, reference_years * 365.25 * 86_400_000))
+    i = something(findlast(<=(cutoff), time), firstindex(time))
+    elapsed = _decimal_years(time[i] - first(time))
+    elapsed > 0 || throw(ArgumentError(
+        "the reference period covers no elapsed time; the output interval is coarser than " *
+        "$reference_years yr"))
+
+    # `dv_mass` is cumulative from the record start, so its value at `i` *is* the reference period's
+    # gain — no differencing needed.
+    return dv_mass[i] / elapsed
+end
+
+"""
+    discharge_corrected_volume_change(dv, dv_mass, time; reference_years = 5) -> Vector{Float64}
+
+Modelled volume change (km³ of ice equivalent) with a constant reference discharge removed, so it can be
+plotted against an altimetric `dv`.
+
+`dv - rate * elapsed`, with `rate` from [`reference_discharge_rate`](@ref). Zero at the first output
+time, and near zero on average across the reference period — after which it shows how the tile departs
+from the state it was assumed to be in balance with.
+
+See [`reference_discharge_rate`](@ref) for why this is a visualization aid rather than a mass budget.
+Nothing downstream of a figure should consume it: the tile's own `dv` and the separately derived
+discharge are what a real comparison uses.
+"""
+function discharge_corrected_volume_change(dv, dv_mass, time; reference_years::Real = 5)
+    rate = reference_discharge_rate(dv_mass, time; reference_years)
+    elapsed = [_decimal_years(t - first(time)) for t in time]
+    return dv .- rate .* elapsed
+end
+
+# A `Period` as decimal years, on the 365.25-day year the surrounding rate conversions use.
+_decimal_years(d) = Millisecond(d).value / (365.25 * 86_400_000)
+
+"""
     mie2cubickm(band_areas) -> Float64
 
 The factor converting a tile-mean thickness in metres of ice equivalent to a volume in km³:

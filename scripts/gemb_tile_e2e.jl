@@ -57,6 +57,17 @@ const PRECIPITATION_SCALINGS = [1.0, 1.5, 2.0]
 const SPINUP_MAX_ITERATIONS = 400
 const SPINUP_CONVERGENCE = 0.01
 
+# Reference period for the stand-in discharge the figures remove, in years.
+#
+# GEMB carries no ice dynamics, so nothing balances the mean surface mass balance and a tile's modelled
+# volume walks off at the accumulation rate — St Elias gains ~6 km³/yr indefinitely. Assuming the tile
+# was in balance over the first few years of the record gives a constant rate to remove, which leaves
+# the departure from that state: the part of the series that can be read against an altimetric `dv`.
+#
+# Real discharge is derived elsewhere and is neither constant nor equal to early-record SMB. This exists
+# so a figure is legible, and nothing but a figure should consume it.
+const DISCHARGE_REFERENCE_YEARS = 5
+
 fmt(x; digits = 2) = isfinite(x) ? string(round(x; digits)) : "  --"
 
 function main()
@@ -225,6 +236,23 @@ function report_volume(run)
                 "   (", fmt(run.totals[:fac][end, i_dt, i_ps] /
                             sum(b.area for b in run.bands) * 1000; digits = 3),
                 " m of air per column)")
+        if years >= DISCHARGE_REFERENCE_YEARS
+            rate = reference_discharge_rate(run.totals[:dv_mass][:, i_dt, i_ps], run.time;
+                                            reference_years = DISCHARGE_REFERENCE_YEARS)
+            corrected = discharge_corrected_volume_change(
+                run.totals[:dv][:, i_dt, i_ps], run.totals[:dv_mass][:, i_dt, i_ps], run.time;
+                reference_years = DISCHARGE_REFERENCE_YEARS)
+            println("\nassuming balance over the first $DISCHARGE_REFERENCE_YEARS yr " *
+                    "(a figure aid, not a discharge model):")
+            println("  reference discharge   ", fmt(rate; digits = 4), " km3 i.e./yr")
+            println("  dv less that discharge", lpad(fmt(corrected[end]; digits = 4), 12),
+                    " km3 i.e.   (", fmt(corrected[end] / years; digits = 4), " km3 i.e./yr)")
+        else
+            println("\nrecord is $(fmt(years)) yr, shorter than the " *
+                    "$DISCHARGE_REFERENCE_YEARS yr discharge reference period; " *
+                    "no reference discharge computed")
+        end
+
         println("\nper-band surface height change (m over the record), baseline:")
         println("  band m        area km²      dh      mass     water      firn")
         for (i, b) in enumerate(run.bands)
@@ -306,6 +334,18 @@ function write_figures(run)
     lines!(ax, t, run.totals[:dv][:, i_dt, i_ps]; color = :black, linewidth = 2, label = "total")
     lines!(ax, t, run.totals[:dv_mass][:, i_dt, i_ps]; linewidth = 1.5, label = "mass term")
     lines!(ax, t, run.totals[:dv_firn][:, i_dt, i_ps]; linewidth = 1.5, label = "firn term")
+    # With a reference discharge removed, so the series does not simply walk off at the accumulation
+    # rate. A placeholder for reading the figure, not a discharge model — see
+    # `reference_discharge_rate`. Only drawn when the record is long enough to define one.
+    if years >= DISCHARGE_REFERENCE_YEARS
+        rate = reference_discharge_rate(run.totals[:dv_mass][:, i_dt, i_ps], t;
+                                        reference_years = DISCHARGE_REFERENCE_YEARS)
+        lines!(ax, t, discharge_corrected_volume_change(run.totals[:dv][:, i_dt, i_ps],
+                                                       run.totals[:dv_mass][:, i_dt, i_ps], t;
+                                                       reference_years = DISCHARGE_REFERENCE_YEARS);
+               color = :firebrick, linewidth = 2, linestyle = :dash,
+               label = "less reference discharge ($(fmt(rate; digits = 2)) km³/yr)")
+    end
     axislegend(ax; position = :lb)
     save(joinpath(dir, "volume_change.png"), fig)
 
