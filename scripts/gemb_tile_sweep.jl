@@ -47,23 +47,85 @@ const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 2018
 const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2020
 const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 
-# The precipitation scalings the earlier MATLAB GEMB sweep used, so a fitted `pscale` is directly
-# comparable to the published one, against eight temperature offsets spanning the plausible reanalysis
-# bias in both directions.
-const PRECIPITATION_SCALINGS = [0.25, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
-const DELTA_TEMPERATURES = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]
+# The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
+# at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
+# far points exist to bracket it and to show the response is monotonic.
+#
+# `1.0` and `0.0` must be present. They are the baseline the reports and the reference discharge locate
+# with `findfirst`, and a grid without them silently loses both.
+#
+# Overridable so a timing probe or a re-fit does not need the file edited, but the defaults are the run:
+# they are what a re-run reproduces, and they are in git.
+const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
+    parse.(Float64, split(ENV["PRECIPITATION_SCALINGS"], ",")) :
+    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 4.0]
+const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
+    parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
+    [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0]
 
+# Ceiling on spinup cycles, not the convergence test: bands exit on the drift criterion well inside this
+# on glacier firn, so the ceiling only binds on an outlier and a generous one costs nothing.
 const SPINUP_MAX_ITERATIONS = parse(Int, get(ENV, "SPINUP_MAX_ITERATIONS", "400"))
-const SPINUP_CONVERGENCE = 0.01
+# Spinup exits when the FAC trend flattens; see `SPINUP_DRIFT_FAC` in `glacier_run.jl`, including why this
+# value is too loose for an ice-sheet plateau.
+const SPINUP_DRIFT_FAC = 1e-2
 
 const TILE_LIMIT = haskey(ENV, "TILE_LIMIT") ? parse(Int, ENV["TILE_LIMIT"]) : typemax(Int)
 const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? split(ENV["TILE_NAMES"], ",") : String[]
 const FORCE = get(ENV, "FORCE", "0") == "1"
 
+# Which slice of the tile list this process owns, as `TILE_BLOCK` of `TILE_BLOCKS`, 1-based.
+#
+# **Parallelise across processes, not threads.** A GEMB spinup cycle allocates about 460 MiB, and
+# Julia's garbage collector is per-process and stops every thread, so threads inside one process contend
+# for it rather than for cores: the collector takes 9% of one thread's wall clock, 38% of eight and 66%
+# of thirty-two. Tile throughput therefore peaks near 16 threads and *falls* beyond it, and per-core
+# throughput is highest at one thread per process:
+#
+#   threads/process     1     2     4     8    16    32    64
+#   throughput/core  1.00  0.91  0.67  0.48  0.25  0.11  0.05
+#
+# Separate processes have separate heaps and do not contend. At 32 concurrent single-threaded processes
+# the sweep reaches the same fraction of this machine's ceiling as a kernel that allocates nothing at
+# all, so at that width it is core-bound rather than collector-bound and there is nothing further to
+# recover. Past roughly 32 the allocation traffic itself becomes the limit: 48 processes add 18% more
+# throughput for 50% more memory, and the trend continues to worsen. 32 is the width to run.
+#
+# `--heap-size-hint` does not shift any of this, and `Threads.@threads` and `Threads.@spawn` perform
+# identically, so neither is a place to look for headroom.
+#
+# Within-tile threading is for the *latency* of a single tile — what `gemb_tile_e2e.jl` wants — not for
+# throughput. At 25% efficiency, 16 threads still finish one tile 4x sooner.
+#
+# **Contiguous blocks, not a stride.** Tiles are ordered by forcing chunk so neighbours share cells; a
+# modulo split would scatter neighbours across processes and each process's cache would miss what
+# another already holds. A contiguous block keeps one process's run spatially coherent.
+#
+#   for i in $(seq 1 32); do
+#       TILE_BLOCKS=32 TILE_BLOCK=$i FORCING_CACHE_GIB=1 \
+#           julia --project=. -t 1 scripts/gemb_tile_sweep.jl &
+#   done
+#
+# Each process writes its own summary, so give them distinct names or merge afterwards.
+const TILE_BLOCKS = haskey(ENV, "TILE_BLOCKS") ? parse(Int, ENV["TILE_BLOCKS"]) : 1
+const TILE_BLOCK = haskey(ENV, "TILE_BLOCK") ? parse(Int, ENV["TILE_BLOCK"]) : 1
+
 function main()
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
     cache = joinpath(CLIMATE_CACHE, "cache")
+
+    # The baseline corner has to exist: it is what the summary's `dv_rate_baseline` and every downstream
+    # anomaly are measured against, and `findfirst` returning `nothing` would drop them silently rather
+    # than fail.
+    1.0 in PRECIPITATION_SCALINGS || error(
+        "PRECIPITATION_SCALINGS must include 1.0, the unperturbed baseline; got " *
+        string(PRECIPITATION_SCALINGS))
+    0.0 in DELTA_TEMPERATURES || error(
+        "DELTA_TEMPERATURES must include 0.0, the unperturbed baseline; got " *
+        string(DELTA_TEMPERATURES))
+    all(>=(0), PRECIPITATION_SCALINGS) || error(
+        "a negative precipitation scaling is not a scenario; got " * string(PRECIPITATION_SCALINGS))
 
     isfile(PARQUET) || error("no glacier elevation-class table at $PARQUET")
     isdir(PARAMETER_DIR) || error("no downscaling parameters at $PARAMETER_DIR; run " *
@@ -79,6 +141,7 @@ function main()
     isempty(TILE_NAMES) ||
         (tiles = filter(t -> replace(t.name, ".nc" => "") in TILE_NAMES, tiles))
     selected = first(tiles, min(TILE_LIMIT, length(tiles)))
+    selected = _tile_block(selected)
 
     mkpath(OUTPUT_DIR)
     mp = GEMB.initialize_parameters(output_frequency = :monthly)
@@ -109,7 +172,11 @@ function main()
     end
 
     summary = DataFrame(rows)
-    GEMB_GlacierSims.Parquet2.writefile(joinpath(OUTPUT_DIR, "tile_runs_summary.parquet"), summary)
+    # One summary per block, or concurrent processes would overwrite each other's. A single-block run
+    # keeps the unsuffixed name so nothing that reads it has to know about blocks.
+    suffix = TILE_BLOCKS == 1 ? "" : "_block$(lpad(TILE_BLOCK, 3, '0'))of$(TILE_BLOCKS)"
+    GEMB_GlacierSims.Parquet2.writefile(
+        joinpath(OUTPUT_DIR, "tile_runs_summary$suffix.parquet"), summary)
 
     @info "Sweep finished" minutes=round((time() - t_start) / 60; digits = 1) written=count(==("written"), summary.status) skipped=count(==("skipped"), summary.status) empty=count(==("empty"), summary.status) no_parameters=count(==("no_parameters"), summary.status) failed=count(==("failed"), summary.status)
 
@@ -119,6 +186,56 @@ function main()
         @info "Volume change rate across written tiles (baseline, km3 i.e./yr)" median=round(median(skipmissing(done.dv_rate_baseline)); digits = 4) min=round(minimum(skipmissing(done.dv_rate_baseline)); digits = 4) max=round(maximum(skipmissing(done.dv_rate_baseline)); digits = 4)
     end
     return summary
+end
+
+# This process's contiguous slice of the tile list, balanced by the work each tile carries rather than
+# by tile count.
+#
+# The sweep is embarrassingly parallel across blocks and finishes when the slowest block does, so what
+# matters is the *cost* of a block. A tile's cost is its band count times the perturbation grid, and band
+# count is not uniform: over the 816 runnable tiles it runs 1 to 63 with a median of 12 and a 95th
+# percentile of 35. Splitting the list into equal-length runs therefore leaves the heaviest block doing
+# 2.25x the mean at 32 blocks, which idles most of the machine through the tail. Equalising total band
+# count instead brings that to 1.14x.
+#
+# Contiguous runs, still: tiles are ordered by forcing chunk so neighbours share donor cells, and a
+# scattered assignment would make each process miss what another already holds. A contiguous
+# weight-balanced partition keeps both properties, and beats a dynamic work queue, whose balance is
+# floored by the single 63-band tile it cannot subdivide.
+#
+# Every process computes the same partition from the same inputs, so no coordination is needed.
+function _tile_block(tiles)
+    TILE_BLOCKS >= 1 || error("TILE_BLOCKS must be at least 1, got $TILE_BLOCKS")
+    1 <= TILE_BLOCK <= TILE_BLOCKS ||
+        error("TILE_BLOCK must be in 1..$TILE_BLOCKS, got $TILE_BLOCK")
+    TILE_BLOCKS == 1 && return tiles
+
+    # Band count is the cost proxy: the perturbation grid is the same for every tile, and the record
+    # length is too, so simulations per tile is proportional to it. Cheap to compute — hypsometry comes
+    # from the already-loaded table, with no forcing read.
+    weights = Float64[length(hypsometry_intervals(t.core)) for t in tiles]
+    block = _weight_balanced_blocks(weights, TILE_BLOCKS)[TILE_BLOCK]
+    @info "Tile block" block="$TILE_BLOCK/$TILE_BLOCKS" tiles=length(block) range="$block of $(length(tiles))" bands=Int(sum(weights[block])) bands_mean_per_block=round(sum(weights) / TILE_BLOCKS; digits = 1)
+    return tiles[block]
+end
+
+# Split `1:length(w)` into `k` contiguous ranges of as near equal total weight as the item granularity
+# allows, by closing each range as the running total crosses its share. Ranges may be empty when `k`
+# exceeds the number of non-zero weights, which is why callers must tolerate an empty block.
+function _weight_balanced_blocks(w, k::Int)
+    total = sum(w)
+    blocks = UnitRange{Int}[]
+    lo = 1
+    acc = zero(eltype(w))
+    for i in eachindex(w)
+        acc += w[i]
+        if length(blocks) < k - 1 && acc >= total * (length(blocks) + 1) / k
+            push!(blocks, lo:i)
+            lo = i + 1
+        end
+    end
+    push!(blocks, lo:length(w))
+    return blocks
 end
 
 function run_tile(i, tile, name, path, mp; token, cache)
@@ -167,7 +284,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                             delta_temperatures = DELTA_TEMPERATURES,
                             precipitation_scalings = PRECIPITATION_SCALINGS,
                             max_iterations = SPINUP_MAX_ITERATIONS,
-                            convergence_delta_density = SPINUP_CONVERGENCE)
+                            convergence_drift_fac = SPINUP_DRIFT_FAC)
     t_gemb = time() - t0 - t_forcing
 
     write_glacier_tile_netcdf(path, run; institution = "NASA Jet Propulsion Laboratory")
