@@ -230,6 +230,14 @@ function _write_tile_run_globals!(ds, run::GlacierTileRun; institution, referenc
         "so, and the negation of that flux is surface elevation change against a datum fixed in " *
         "the ice at the start of the run. dh is NOT a proxy for surface mass balance and can carry " *
         "the opposite sign: compaction lowers the surface while accumulation raises it."
+    ds.attrib["reference_frame_comment"] =
+        "dh and the volume totals dv/dv_mass/dv_firn are cumulative from the start of the run, " *
+        "against a datum fixed in the ice at that time; no reference state has been removed, so " *
+        "adding an independently derived discharge to dv gives total volume change. The " *
+        "decomposition terms dh_mass, dh_water, dh_firn and dh_residual are instead anomalies " *
+        "referenced to the FIRST OUTPUT TIME, which is what makes their closure exact. The " *
+        "identity therefore holds on the anomaly: dh - dh[1] = dh_mass + dh_water + dh_firn + " *
+        "dh_residual. dv_mass and dv_firn inherit that frame from their series; dv does not."
     ds.attrib["volume_and_mass_comment"] =
         "Volume totals are the area-weighted height change and mass totals the area-weighted " *
         "fluxes. They are not interconvertible: dh carries the firn compaction term, so " *
