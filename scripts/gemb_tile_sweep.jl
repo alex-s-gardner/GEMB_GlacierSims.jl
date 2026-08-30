@@ -13,13 +13,15 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and the parameter tiles. Forcing is read
 # from the shared Zarr cache under `CLIMATE_CACHE`, so tiles are visited in chunk order.
 #
-# Run:  julia --project=. -t 64 scripts/gemb_tile_sweep.jl [start_year] [end_year]
+# Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start_year] [end_year]
+# Run the sweep:  scripts/run_tile_sweep.sh [start_year] [end_year]
 #
-# Environment overrides:  TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1, SPINUP_MAX_ITERATIONS
+# Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
+# SPINUP_MAX_ITERATIONS, PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, FORCING_CACHE_GIB
 #
-# Sizing: a 60-band tile over the full 8x8 grid is 3,840 simulations. At the 2018-2020 window that is
-# minutes per tile on this machine; at the full record it is hours, so start with a narrow window and a
-# TILE_LIMIT before committing to a global pass.
+# Sizing: a 60-band tile over the 7x7 grid is 2,940 simulations, and one simulation is the spinup plus
+# the transient. Over a 7-year record that is about 10 s each, so the largest tiles are hours and the
+# global pass is days. Start with a TILE_LIMIT or a TILE_NAMES subset before committing to one.
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
@@ -76,7 +78,7 @@ const FORCE = get(ENV, "FORCE", "0") == "1"
 
 # Which slice of the tile list this process owns, as `TILE_BLOCK` of `TILE_BLOCKS`, 1-based.
 #
-# **Parallelise across processes, not threads.** A GEMB spinup cycle allocates about 460 MiB, and
+# **Parallelise across processes, not threads.** A GEMB spinup cycle allocates about 100 MiB, and
 # Julia's garbage collector is per-process and stops every thread, so threads inside one process contend
 # for it rather than for cores: the collector takes 9% of one thread's wall clock, 38% of eight and 66%
 # of thirty-two. Tile throughput therefore peaks near 16 threads and *falls* beyond it, and per-core
@@ -85,11 +87,10 @@ const FORCE = get(ENV, "FORCE", "0") == "1"
 #   threads/process     1     2     4     8    16    32    64
 #   throughput/core  1.00  0.91  0.67  0.48  0.25  0.11  0.05
 #
-# Separate processes have separate heaps and do not contend. At 32 concurrent single-threaded processes
-# the sweep reaches the same fraction of this machine's ceiling as a kernel that allocates nothing at
-# all, so at that width it is core-bound rather than collector-bound and there is nothing further to
-# recover. Past roughly 32 the allocation traffic itself becomes the limit: 48 processes add 18% more
-# throughput for 50% more memory, and the trend continues to worsen. 32 is the width to run.
+# Separate processes have separate heaps and do not contend, so the width to run is one process per
+# physical core. Each holds about 2.5 GB — a fixed Julia runtime, the 1 GiB forcing cache, the
+# elevation-class table, and the current tile's band forcing — and that total barely moves with the
+# record length, since only the band forcing scales with it.
 #
 # `--heap-size-hint` does not shift any of this, and `Threads.@threads` and `Threads.@spawn` perform
 # identically, so neither is a place to look for headroom.
@@ -101,12 +102,8 @@ const FORCE = get(ENV, "FORCE", "0") == "1"
 # modulo split would scatter neighbours across processes and each process's cache would miss what
 # another already holds. A contiguous block keeps one process's run spatially coherent.
 #
-#   for i in $(seq 1 32); do
-#       TILE_BLOCKS=32 TILE_BLOCK=$i FORCING_CACHE_GIB=1 \
-#           julia --project=. -t 1 scripts/gemb_tile_sweep.jl &
-#   done
-#
-# Each process writes its own summary, so give them distinct names or merge afterwards.
+# `run_tile_sweep.sh` launches the blocks and collects their logs. Each process writes its own summary
+# parquet, suffixed with its block, so they merge afterwards rather than overwriting.
 const TILE_BLOCKS = haskey(ENV, "TILE_BLOCKS") ? parse(Int, ENV["TILE_BLOCKS"]) : 1
 const TILE_BLOCK = haskey(ENV, "TILE_BLOCK") ? parse(Int, ENV["TILE_BLOCK"]) : 1
 
@@ -269,7 +266,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    spinup_window = default_spinup_window(probe_time))
 
     status = read_glacier_tile_status(path)
-    if !FORCE && status !== nothing && tile_run_is_current(status, requested, probe_time, intervals)
+    if !FORCE && status !== nothing && tile_run_is_current(status, requested, probe_time, intervals, mp)
         @info "Tile already covers the request; skipping" tile=i name last_time=status.time
         return summary_row(tile, name, :skipped, time() - t0)
     end
@@ -308,13 +305,37 @@ end
 default_spinup_window(run_time) =
     (DateTime(year(first(run_time)), 1, 1), DateTime(year(first(run_time)) + 29, 12, 31))
 
+# The longest span one output period can cover. An upper bound is the safe direction for the window
+# test below: understating it would declare a complete file short and re-run it, which is the failure
+# this exists to prevent. `nothing` means the output axis lands on the forcing axis, so the window end
+# can be compared exactly.
+function output_period_bound(mp)
+    f = mp.output_frequency
+    f === :monthly && return Day(31)
+    f === :daily && return Day(1)
+    f === :yearly && return Day(366)
+    return nothing
+end
+
 # Whether an existing tile file already answers this request. Decided from the file's coordinates and
 # attributes only — the point of the check is to avoid the forcing pass, so it must not read one.
-function tile_run_is_current(status, requested, run_time, intervals)
+function tile_run_is_current(status, requested, run_time, intervals, mp)
     status.n_timesteps == 0 && return false
-    # The window: the file must already reach the end of what was asked for.
     status.time === nothing && return false
-    status.time < last(run_time) && return false
+    # The window: the file must cover it to within one output period. The stored time is the last
+    # *output* sample while `run_time` is the last *forcing* step, and a coarser output grid never
+    # reaches the forcing's final step — monthly output for a window ending 2023-01-01T00:00 lands on
+    # 2022-12-31T23:00. Comparing the two directly is what made every file look stale.
+    #
+    # The tolerance means a window extended by less than one output period counts as covered. That is
+    # the intended reading: such an extension spans no further output interval, so re-running would
+    # reproduce the same series.
+    period = output_period_bound(mp)
+    if period === nothing
+        status.time < last(run_time) && return false
+    else
+        status.time + period < last(run_time) && return false
+    end
     # The run grid: a changed band set or perturbation grid means the stored arrays describe something
     # else entirely.
     status.band_centers == [x.center for x in intervals] || return false
