@@ -5,12 +5,11 @@
 #
 #   scripts/run_tile_sweep.sh [start_year] [end_year]
 #
-# One thread per process, and as many processes as physical cores, is the throughput optimum. A GEMB
-# spinup cycle allocates about 100 MiB and Julia's collector is per-process and stops every thread, so
-# threads inside one process contend for the collector while separate processes do not: tile throughput
-# peaks near 16 threads and falls beyond it, while 32 single-threaded processes reach the same fraction
-# of this machine's ceiling as a kernel that allocates nothing at all. The measured curve is in the
-# TILE_BLOCKS comment in gemb_tile_sweep.jl.
+# One thread per process, one process per physical core. A GEMB spinup cycle allocates about 100 MiB and
+# Julia's collector is per-process and stops every thread, so threads inside one process contend for the
+# collector while separate processes do not: tile throughput peaks near 16 threads and falls beyond it.
+# The measured curve is in the TILE_BLOCKS comment in gemb_tile_sweep.jl. Each process holds about
+# 2.5 GB, nearly all of it independent of the record length, so memory is not what bounds the width.
 #
 # Blocks are contiguous runs of the chunk-ordered tile list carrying equal total band count, so they
 # cost the same without breaking the forcing-cache locality that chunk order buys. Each process derives
@@ -26,7 +25,7 @@ set -uo pipefail
 
 START_YEAR="${1:-1950}"
 END_YEAR="${2:-2026}"
-BLOCKS="${TILE_BLOCKS:-32}"
+BLOCKS="${TILE_BLOCKS:-64}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIMATE_CACHE="${CLIMATE_CACHE:-/mnt/bylot-r3/data/era5land}"
