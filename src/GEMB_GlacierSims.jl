@@ -43,7 +43,7 @@ export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
 include("volume_change.jl")
 export surface_height_change, height_change_components, column_reaches_ice_density
-export tile_volume_change, tile_mass_total, mie2cubickm
+export tile_volume_change, tile_mass_total, mie2cubickm, convergence_density_from_fac
 export reference_discharge_rate, discharge_corrected_volume_change
 
 include("glacier_elevation_class.jl")

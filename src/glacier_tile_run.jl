@@ -130,7 +130,17 @@ published 2° products exclude rain from their aggregates.
 - `delta_temperatures = [0.0]`, `precipitation_scalings = [1.0]`: the perturbation grid.
 - `spinup_window`: `(start, stop)` averaged into the repeating climatological year each band is spun up
   on. Defaults to the first 30 complete years of the band forcing.
-- `max_iterations`, `convergence_delta_density`: passed to `gemb_spinup`.
+- `max_iterations`: spinup cycle ceiling, passed to `gemb_spinup`.
+- `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
+  when the least-squares slope of firn air content against cycle, over the trailing `drift_window`
+  cycles, falls below `convergence_drift_fac` metres per cycle. Equilibrium is the absence of a trend,
+  which a step between consecutive cycles does not measure: a step test passes a column still drifting
+  steadily, and fails a settled column whose jitter exceeds it. Converted per band into the mean-density
+  drift `gemb_spinup` tests, exactly, because the column depth is pinned
+  ([`convergence_density_from_fac`](@ref)). Note `gemb_spinup` cannot judge a slope until it has
+  `drift_window` samples and will not exit by abstention, so that is also the minimum cycle count. The
+  default is sized for mountain-glacier firn; a dry ice-sheet plateau relaxes more slowly and changes by
+  centimetres per year, and needs 1e-4 or tighter with `max_iterations` at 200 or above.
 - `threaded = true`: run the (band × delta × scaling) simulations on all available threads. Each is
   independent, and the area-weighted reduction happens afterwards in a fixed index order, so the
   threaded result is identical to the serial one including bit-for-bit totals.
@@ -146,7 +156,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            precipitation_scalings = [1.0],
                            spinup_window = nothing,
                            max_iterations::Int = 1000,
-                           convergence_delta_density = 0.01,
+                           convergence_drift_fac = SPINUP_DRIFT_FAC,
+                           drift_window::Int = SPINUP_DRIFT_WINDOW,
                            threaded::Bool = true,
                            on_output = nothing)
     delta_temperatures = collect(Float64, delta_temperatures)
@@ -180,7 +191,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
 
     window = spinup_window === nothing ?
              _default_spinup_window(first(bands).forcing) : spinup_window
-    parameters = tile_run_parameters(mp, applied; spinup_window = window)
+    parameters = tile_run_parameters(mp, applied; spinup_window = window, max_iterations,
+                                     convergence_drift_fac, drift_window)
 
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
@@ -203,8 +215,17 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         cf = initialize_forcing(adjusted)
 
         cf_spinup = _spinup_climatology(cf, window)
-        profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
-                              max_iterations, convergence_delta_density)
+        # The depth is fixed by the initial profile, so the firn-air tolerance can only be converted
+        # into the density one `gemb_spinup` tests once that profile exists.
+        initial = initialize_profile(mp, cf_spinup)
+        # The FAC trend is the *only* convergence criterion. `convergence_delta_density` is passed
+        # explicitly as `nothing` rather than left out, so that the single-criterion design is visible
+        # here and not mistaken for an omission: a step between consecutive cycles both passes a column
+        # that is still drifting and fails a settled one whose jitter exceeds it.
+        profile = gemb_spinup(initial, cf_spinup, mp; max_iterations, drift_window,
+                              convergence_delta_density = nothing,
+                              convergence_drift_density = _spinup_drift_tolerance(
+                                  initial, mp, convergence_drift_fac))
         output = gemb(profile, cf, mp)
 
         if length(dims(output, Ti)) == 0
@@ -446,9 +467,18 @@ The downscaling settings from `applied` are included for the same reason: two ru
 resolved their lapse rate differently are different experiments, and a file that recorded only the
 model parameters could not tell them apart.
 """
-function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window)
+function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
+                             max_iterations = nothing, convergence_drift_fac = nothing,
+                             drift_window = nothing)
     params = Dict{String,Any}("spinup_window_start" => string(spinup_window[1]),
                               "spinup_window_stop" => string(spinup_window[2]))
+    # How the columns were settled. Two runs that spun up to different tolerances, or under different
+    # ceilings, are different experiments — and with a hard ceiling "converged" and "ran out of cycles"
+    # are the same outcome unless the ceiling is on record.
+    max_iterations === nothing || (params["spinup_max_iterations"] = max_iterations)
+    convergence_drift_fac === nothing ||
+        (params["spinup_convergence_drift_fac"] = Float64(convergence_drift_fac))
+    drift_window === nothing || (params["spinup_drift_window"] = drift_window)
     merge!(params, applied.settings)
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue

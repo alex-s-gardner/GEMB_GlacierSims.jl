@@ -170,6 +170,40 @@ compaction term and mass does not.
 tile_mass_total(flux, band_areas) = _band_weighted_total(flux, band_areas, _M2_PER_KM2 / _KG_PER_GT)
 
 """
+    convergence_density_from_fac(delta_fac, column_depth, density_ice) -> Float64
+
+The spinup density tolerance (kg m-3 per cycle) equivalent to a firn-air-content tolerance
+`delta_fac` (m per cycle), for a column of `column_depth` metres.
+
+`gemb` pins the column depth, so across spinup cycles firn air content is an **exact** linear function
+of the column's mass-weighted mean density:
+
+    FAC = column_depth * (1 - mean_density / density_ice)
+
+and therefore `ΔFAC = -column_depth * Δmean_density / density_ice`. Verified against
+[`firn_air_content`](@ref) on 1,035 stored spun-up columns, agreeing to 6e-14 m. `gemb_spinup` tests
+the density form, so this is what converts a tolerance stated the useful way into the one it accepts.
+
+Stating it in firn air content is worth the conversion because a density tolerance means a **different
+thing on every column**: it scales with depth, so 0.01 kg m-3 is 0.14 mm of FAC on a 13 m column and
+0.54 mm on a 49 m one — a factor of four looser on the deeper column, for no reason a caller intended.
+Firn air content is also the quantity the spinup exists to settle, since it is the compaction term of
+the height change (see [`height_change_components`](@ref)).
+
+The identity assumes no cell exceeds `density_ice`, which `firn_air_content` clamps at. GEMB's
+densification tops out there, so it holds in practice.
+"""
+function convergence_density_from_fac(delta_fac::Real, column_depth::Real, density_ice::Real)
+    delta_fac > 0 || throw(ArgumentError(
+        "the firn-air tolerance must be positive, got $delta_fac m"))
+    column_depth > 0 ||
+        throw(ArgumentError("column_depth must be positive, got $column_depth m"))
+    density_ice > 0 ||
+        throw(ArgumentError("density_ice must be positive, got $density_ice kg m-3"))
+    return Float64(density_ice) * Float64(delta_fac) / Float64(column_depth)
+end
+
+"""
     reference_discharge_rate(dv_mass, time; reference_years = 5) -> Float64
 
 A stand-in ice discharge rate (km³ of ice equivalent per year), from the assumption that the glacier was

@@ -51,11 +51,14 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 const DELTA_TEMPERATURES = [-1.0, 0.0, 1.0]
 const PRECIPITATION_SCALINGS = [1.0, 1.5, 2.0]
 
-# Enough cycles for a temperate column to settle. `convergence_delta_density` stops earlier where it
-# can; the report says how many bands actually converged, which is the thing to watch — a cold-started
-# column drifts several metres over a run and that drift is not a response to the forcing.
+# Ceiling on spinup cycles. The drift criterion below exits earlier wherever the column has settled; the
+# report says how many bands actually converged, which is the thing to watch — a column that ran out of
+# cycles is still relaxing, and that relaxation is not a response to the forcing.
 const SPINUP_MAX_ITERATIONS = 400
-const SPINUP_CONVERGENCE = 0.01
+# Spinup exits when the trend in firn air content flattens: the least-squares slope over the trailing
+# window falls below this, in metres of FAC per cycle. See `SPINUP_DRIFT_FAC` in `glacier_run.jl` for the
+# drift the transient inherits at this value, and for why it is too loose for an ice-sheet plateau.
+const SPINUP_DRIFT_FAC = 1e-2
 
 # Reference period for the stand-in discharge the figures remove, in years.
 #
@@ -145,7 +148,7 @@ function main()
                             delta_temperatures = DELTA_TEMPERATURES,
                             precipitation_scalings = PRECIPITATION_SCALINGS,
                             max_iterations = SPINUP_MAX_ITERATIONS,
-                            convergence_delta_density = SPINUP_CONVERGENCE)
+                            convergence_drift_fac = SPINUP_DRIFT_FAC)
     simulations = length(run.bands) * length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS)
     @info "GEMB finished" minutes=round((time() - t0) / 60; digits = 2) simulations seconds_per_simulation=round((time() - t0) / simulations; digits = 2)
 

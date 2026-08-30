@@ -113,7 +113,7 @@ report("band forcing identical under batching", batch_same)
 # --- stage 2: the simulations ------------------------------------------------------------------
 mp = initialize_parameters(output_frequency = :monthly)
 kw = (; delta_temperatures = [0.0, 1.0], precipitation_scalings = [1.0, 1.5],
-      max_iterations = 20, convergence_delta_density = 0.01)
+      max_iterations = 20, convergence_drift_fac = 1e-2)
 
 t0 = time(); serial = gemb_glacier_tile(tile, applied, bands_a, mp; kw..., threaded = false)
 t_serial = time() - t0

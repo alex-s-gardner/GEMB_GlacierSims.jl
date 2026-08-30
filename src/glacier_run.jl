@@ -35,6 +35,48 @@ const CELL_TOTAL_VARIABLES = (CELL_MASS_VARIABLES..., :mass_change)
 # (`GEMB.jl/src/initialize_forcing.jl`), so a single step is as unrunnable as none at all.
 const MIN_FORCING_STEPS = 2
 
+# Spinup exits when the firn air content has stopped *trending*: the least-squares slope of FAC against
+# cycle, over the trailing `SPINUP_DRIFT_WINDOW` cycles, falls below `SPINUP_DRIFT_FAC` metres per cycle.
+#
+# A slope over a window rather than a step between consecutive cycles, because a step has two failure
+# modes and a slope has neither. A column creeping just under the threshold each cycle passes a step test
+# immediately while still drifting steadily; a settled column whose cycle-to-cycle jitter exceeds the
+# threshold fails a step test forever. Equilibrium is the absence of a trend, so that is what to measure.
+#
+# The threshold trades spinup error against cycles, and the value is set where mountain-glacier work can
+# afford it. A cycle is one climatological year, so a column leaving spinup with slope `s` carries roughly
+# `s` per year of continuing FAC change into the transient: over a 76-year record 1e-2 m/cycle is 0.76 m,
+# small against the metres of height change a glacier produces. Tightening it costs cycles steeply —
+# across a temperate maritime tile and a cold Antarctic one, bands exit within 90 cycles at 1e-2 but need
+# up to 143 at 1e-3 and up to 200 at 1e-4.
+#
+# **This value is too loose for an ice-sheet plateau.** The error it admits scales with how slowly the
+# column relaxes: at 1e-2 a temperate deep-firn column leaves spinup 0.16 m of FAC from where 1e-4 puts
+# it, and its cumulative volume change differs by 6%. On a dry, cold plateau the relaxation tail is longer
+# and the surface-height signal is centimetres per year, so the inherited drift is the whole quantity of
+# interest rather than a rounding term. Plateau work wants 1e-4 or tighter, with `max_iterations` at 200
+# or above so the criterion is reachable rather than a no-op that burns the whole budget.
+#
+# A cycle-count ceiling is a backstop, not the convergence test: raising it is free once the criterion is
+# reachable, since a settled column exits on its own.
+#
+# Stated as firn air content rather than density because a density threshold means a different thing on
+# every column — it scales with depth, so one value is four times looser on a 49 m column than on a
+# 13 m one. See [`convergence_density_from_fac`](@ref).
+const SPINUP_DRIFT_FAC = 1e-2
+
+# Cycles in the slope fit. Enough that ordinary model jitter cannot hold a settled column open, few
+# enough that it is not a large share of the cycle budget — and it sets a floor on the spinup, since
+# `gemb_spinup` cannot judge a slope before it has this many samples and refuses to exit by abstention.
+const SPINUP_DRIFT_WINDOW = 10
+
+# The drift threshold in the units `gemb_spinup` tests: mean density per cycle, not firn air per cycle.
+#
+# Converted per column rather than by the caller, because the factor is the column depth and that is
+# only known once the initial profile exists.
+_spinup_drift_tolerance(profile, mp, drift_fac) =
+    convergence_density_from_fac(drift_fac, sum(profile[:dz]), mp.density_ice)
+
 """
     run_parameters(mp::ModelParameters; coverage, lapse_rate, decoupling_factor = nothing)
         -> Dict{String,Any}
@@ -438,7 +480,17 @@ or perturbations.
   slice of forcing the continuation happened to fetch. If that window's years are outside the
   supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
   climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
-- `max_iterations`, `convergence_delta_density`: passed to `gemb_spinup`.
+- `max_iterations`: spinup cycle ceiling, passed to `gemb_spinup`.
+- `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
+  when the least-squares slope of firn air content against cycle, over the trailing `drift_window`
+  cycles, falls below `convergence_drift_fac` metres per cycle. A slope rather than a step between
+  consecutive cycles: a step test both passes a column that is still drifting steadily and fails a
+  settled column whose jitter exceeds the threshold. Converted per bin into the mean-density drift
+  `gemb_spinup` tests, exactly, because the column depth is pinned
+  ([`convergence_density_from_fac`](@ref)). The default is sized for mountain-glacier firn, where the
+  inherited drift is millimetres against metres of height change; a dry ice-sheet plateau relaxes more
+  slowly and changes by centimetres per year, and needs 1e-4 or tighter with `max_iterations` at 200 or
+  above.
 - `restart`: the value returned by [`read_glacier_cell_restart`](@ref), or `nothing`. When
   given, each run resumes from its saved profile over forcing newer than the saved time and
   the spinup is skipped. The restart's stored run parameters ([`run_parameters`](@ref)) must
@@ -469,7 +521,8 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            glacier_decoupling = true,
                            spinup_window = nothing,
                            max_iterations::Int = 1000,
-                           convergence_delta_density = 0.01,
+                           convergence_drift_fac = SPINUP_DRIFT_FAC,
+                           drift_window::Int = SPINUP_DRIFT_WINDOW,
                            restart = nothing,
                            force_restart::Bool = false,
                            threaded::Bool = true,
@@ -588,8 +641,13 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
             # reused rather than recomputed: that is the common path.
             cf_spinup = _spinup_climatology(
                 spinup_forcing === forcing_data ? cf : at_bin(spinup_forcing), spinup_window)
-            profile = gemb_spinup(initialize_profile(mp, cf_spinup), cf_spinup, mp;
-                                  max_iterations, convergence_delta_density)
+            initial = initialize_profile(mp, cf_spinup)
+            # The FAC trend is the only convergence criterion; see `gemb_glacier_tile`. Passed
+            # explicitly so the single-criterion design is not mistaken for an omission.
+            profile = gemb_spinup(initial, cf_spinup, mp; max_iterations, drift_window,
+                                  convergence_delta_density = nothing,
+                                  convergence_drift_density = _spinup_drift_tolerance(
+                                      initial, mp, convergence_drift_fac))
         end
 
         output = gemb(profile, cf, mp)
