@@ -14,7 +14,7 @@ using GEMB_ClimateForcing
 # silently reached for.
 using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
                            decoupling_factor_at_elevation,
-                           _make_applicable, _decouple_per_timestep,
+                           _decouple_per_timestep,
                            _cell_forcing_at_interval, _FORCING_VARIABLES,
                            _MIN_CELLS_DEFAULT, _DECOUPLING_FACTOR_LIMITS,
                            _LAPSE_RATE_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE,
@@ -41,6 +41,11 @@ include("util.jl")
 export era5_land_invariant, wrap_lon, forcing_at_elevation
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
+include("volume_change.jl")
+export surface_height_change, height_change_components, column_reaches_ice_density
+export tile_volume_change, tile_mass_total, mie2cubickm, convergence_density_from_fac
+export reference_discharge_rate, discharge_corrected_volume_change
+
 include("glacier_elevation_class.jl")
 export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypsometry
 
@@ -57,8 +62,19 @@ include("netcdf_output.jl")
 export write_glacier_cell_netcdf, append_glacier_cell_netcdf, read_glacier_cell_restart
 export read_glacier_cell_parameters, read_glacier_cell_status
 
+# Before `downscaling_parameters.jl`, which dispatches on `AppliedDownscaling` and interpolates this
+# file's thresholds into its docstrings — both of which are resolved when the method is defined.
+include("applied_downscaling.jl")
+export hypsometry_intervals, resolve_downscaling, AppliedDownscaling
+export DOWNSCALING_SOURCES, downscaling_source_counts, decoupling_factor_prior
+export APPLIED_LAPSE_RATE_STDERR_MAXIMUM, APPLIED_LAPSE_RATE_WINDOW
+
+include("forcing_cache.jl")
+export CachedForcingLoader, forcing_cache_capacity, forcing_cache_report
+
 include("downscaling_parameters.jl")
 export derive_downscaling_parameters, grid_cells_in_region, RegionForcingUnavailable
+export elevation_interval_forcing, derive_lapse_rate_uncertainty
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
 
 include("netcdf_downscaling_parameters.jl")
@@ -67,6 +83,14 @@ export read_downscaling_tile, read_downscaling_tile_status
 
 include("downscaling_tiles.jl")
 export downscaling_tiles, tile_index, tile_bounds, derive_downscaling_parameter_tiles
+
+include("glacier_tile_run.jl")
+export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id
+export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
+
+include("netcdf_tile_run.jl")
+export write_glacier_tile_netcdf, append_glacier_tile_netcdf
+export read_glacier_tile_status, read_glacier_tile_restart
 
 
 end # module

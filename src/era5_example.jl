@@ -88,7 +88,10 @@ begin
     gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "$(climate_model)_glacier_elevation_classes.parquet")
     #output_dir = joinpath(@__DIR__, "..", "data", "gemb_runs", string(climate_model))
     output_dir = joinpath("/Users/gardnera/data/gemb/gemb_runs/run_001", string(climate_model))
-    forcing_cache = joinpath(tempdir(), ".cache", "$(climate_model)")
+    # Persistent shared forcing cache — the ERA5-Land chunks are tens of GB and expensive to re-fetch,
+    # so they live off `tempdir()` and survive a reboot. Override with `ENV["CLIMATE_CACHE"]`.
+    climate_cache = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", string(climate_model)))
+    forcing_cache = joinpath(climate_cache, "cache")
 
     #disable_logging(Logging.Info)
 

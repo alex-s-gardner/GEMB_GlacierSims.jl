@@ -36,6 +36,7 @@
 #   ALASKA_SAMPLE       "first" (default) or "random": how a partial cell set is drawn
 #   ALASKA_SEED         RNG seed for the random draw       (default 1234)
 #   ALASKA_PARALLEL     "cell" (default) or "sim": which level gets the threads
+#   CLIMATE_CACHE       root of the persistent forcing cache (default /mnt/bylot-r3/data/era5land)
 #
 # Threads come from `julia -t N`, and go to exactly one of two levels (never both, which would
 # oversubscribe the machine):
@@ -75,7 +76,11 @@ const CLASSES_FILE = joinpath(@__DIR__, "..", "data",
                               "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
 const OUTPUT_DIR = get(ENV, "ALASKA_OUTPUT_DIR",
                        joinpath(@__DIR__, "..", "data", "gemb_runs", "alaska_timing"))
-const FORCING_CACHE = joinpath(tempdir(), ".cache", "$(CLIMATE_MODEL)")
+# Shared persistent forcing cache: the ERA5-Land chunks are tens of GB and expensive to re-fetch, so
+# they live off `tempdir()` and survive a reboot.
+const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
+                          joinpath("/mnt/bylot-r3/data", string(CLIMATE_MODEL)))
+const FORCING_CACHE = joinpath(CLIMATE_CACHE, "cache")
 
 # Same filename convention as `src/era5_example.jl`, so a cell file is traceable to its cell.
 _degrees_tag(x) = replace(string(round(x, digits = 3)), '.' => 'p', '-' => 'm')

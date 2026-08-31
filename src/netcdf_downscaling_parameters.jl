@@ -21,7 +21,25 @@
 # roster (the same convention `_write_run_parameters!` uses for a cell run) so the status reader
 # names them from the file rather than recomputing a key set that a future version might extend.
 const _TILE_PARAMETER_KEYS = ("climate_model", "tile_size", "tile_buffer", "min_cells",
-                              "area_minimum", "elevation_interval_forcing")
+                              "area_minimum", "elevation_interval_forcing",
+                              "downscaling_schema_version")
+
+# What the file *contains*, as distinct from the settings it was derived under. Bumped whenever the set
+# of stored variables changes.
+#
+# It belongs in the roster above because the sweep's skip check compares stored settings against
+# requested ones, and a schema change is invisible to that: adding a variable changes none of
+# `climate_model`, `tile_size`, `tile_buffer`, `min_cells`, `area_minimum` or
+# `elevation_interval_forcing`. Without a version here, every existing file still looks current and a
+# global sweep skips all 819 tiles rather than writing the variable that was just added.
+#
+# **Bump this whenever a stored variable is added, removed or redefined**, and only then — a bump
+# invalidates every tile on disk and a global re-derivation is hours of forcing reads.
+#
+#   1 — the two raw fits, their diagnostics, `fit_usable`, the cell tables, optional interval forcing.
+#   2 — adds `lapse_rate_stderr`, `lapse_rate_r2` and `lapse_rate_residual_sd`, the lapse fit's
+#       conditioning; and replaces the interval fill/clamp counts with per-source provenance counts.
+const _TILE_SCHEMA_VERSION = 2
 
 """
     write_downscaling_tile_netcdf(path, tile, p; climate_model, time_range, tile_size, buffer,
@@ -217,9 +235,32 @@ function _write_lapse_rate!(ds, p, precision, deflatelevel)
                   "grid cells contributing to the lapse-rate fit at this timestep", deflatelevel)
     _defvar_time!(ds, "elevation_spread", precision, lr.elevation_spread, "m",
                   "standard deviation of contributing cell reanalysis elevations", deflatelevel;
-                  comment = "How much elevation range the slope was identified from at this " *
-                            "timestep. A small spread means a poorly constrained lapse rate even " *
-                            "where the fit itself succeeded.")
+                  comment = "How much elevation range the slope was identified from. Note this is a " *
+                            "TILE CONSTANT: the contributing cell set is fixed by forcing " *
+                            "completeness, which is screened per cell, so every timestep sees the " *
+                            "same cells at the same elevations. A small spread means a poorly " *
+                            "constrained lapse rate even where the fit itself succeeded.")
+
+    # How well determined the slope is — the only conditioning diagnostic here that varies with time.
+    # `elevation_spread` and `lapse_rate_n_cells` are tile constants (see above), so on their own they
+    # cannot say that a slope is well determined in one hour and not the next. The standard error
+    # factors as `residual_sd / sqrt(Szz)`: leverage the tile always has, times scatter it has now.
+    if hasproperty(p, :lapse_rate_uncertainty)
+        un = p.lapse_rate_uncertainty
+        _defvar_time!(ds, "lapse_rate_stderr", precision, un.lapse_rate_stderr, "K km-1",
+                      "standard error of the fitted lapse rate", deflatelevel;
+                      comment = "Of the same regression `lapse_rate` reports, under the same " *
+                                "out-of-domain-k screen, so the error belongs to that slope. Not a " *
+                                "sampling error in the textbook sense — the residuals are real " *
+                                "spatial structure rather than iid noise — so read it as how well " *
+                                "ONE linear lapse rate describes these cells at this timestep, " *
+                                "which is the question behind accepting the fit.")
+        _defvar_time!(ds, "lapse_rate_r2", precision, un.lapse_rate_r2, "1",
+                      "fraction of cross-cell temperature variance the slope explains", deflatelevel)
+        _defvar_time!(ds, "lapse_rate_residual_sd", precision, un.residual_sd, "K",
+                      "residual scatter of cell temperatures about the fitted line", deflatelevel;
+                      comment = "The time-varying half of lapse_rate_stderr.")
+    end
 
     # The joint screen, as a variable rather than a comment.
     #
@@ -300,11 +341,11 @@ end
 
 # The optional bulk: glacier-area weighted forcing per elevation interval.
 #
-# This is the one part of the output that *applies* the fits rather than reporting them, so it is
-# also the only part affected by the fill/clamp settings — which is why the applied `k` is stored
-# alongside the forcing instead of being left to be recomputed from the coefficients. It cannot be
-# recomputed: it has been filled where the fit was absent and clamped into the domain its consumer
-# accepts, and neither is recoverable from the raw fit.
+# This is the one part of the output that *applies* the fits rather than reporting them, which is why
+# the applied `k` is stored alongside the forcing instead of being left to be recomputed from the
+# coefficients. It cannot be recomputed: `resolve_downscaling` substituted a climatology or a prior
+# wherever the fit was absent or out of domain, and which value it chose is not recoverable from the
+# raw fit. The per-source counts stored beside it say how often each tier was reached.
 function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
     NCDatasets.defDim(ds, "elevation_interval", length(intervals))
     n_time = ds.dim["time"]
@@ -347,42 +388,71 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
     ex[:] = [Float64(meta(iv, "extrapolation_above_reanalysis")) for iv in intervals]
 
     for (name, key, long_name) in (
-        ("interval_decoupling_factor_n_held", "glacier_decoupling_factor_n_held",
-         "timesteps whose k was evaluated at a held elevation"),
-        ("interval_decoupling_factor_n_filled", "glacier_decoupling_factor_n_filled",
-         "timesteps whose k was filled because the fit measured none"),
-        ("interval_decoupling_factor_n_clamped", "glacier_decoupling_factor_n_clamped",
-         "timesteps whose k was clamped into the accepted domain"))
+        ("interval_decoupling_factor_n_fit_held", "glacier_decoupling_factor_n_fit_held",
+         "usable fits at this interval that were evaluated at a held elevation"),
+        ("interval_decoupling_factor_n_fit_in_domain", "glacier_decoupling_factor_n_fit_in_domain",
+         "timesteps whose fitted k at this interval was inside (0, 1]"),
+        ("interval_n_timesteps_above_freezing", "n_timesteps_above_freezing",
+         "timesteps whose interval-mean air temperature exceeded the melting point"))
         v = NCDatasets.defVar(ds, name, Int32, ("elevation_interval",))
         v.attrib["units"] = "1"
         v.attrib["long_name"] = long_name
         v[:] = Int32[Int(meta(iv, key, 0)) for iv in intervals]
     end
-    ds["interval_decoupling_factor_n_filled"].attrib["comment"] =
-        "How much of the applied k was substituted rather than measured. A mostly-filled interval " *
-        "carries decoupling_factor_fill, not a fit."
+    ds["interval_decoupling_factor_n_fit_held"].attrib["comment"] =
+        "Approaching interval_decoupling_factor_n_fit_in_domain means this interval's k is the " *
+        "ceiling value the tile's ambient warm excess still supports rather than a fit at this " *
+        "elevation. Held rather than reverted to 1, because a step in the vertical temperature " *
+        "profile is read downstream as a mass-balance signal. This describes the fits; the " *
+        "interval_decoupling_factor_n_* counts below describe the series actually applied."
+    ds["interval_n_timesteps_above_freezing"].attrib["comment"] =
+        "The denominator for the source counts below. The decoupling correction scales " *
+        "max(T - 273.15, 0), so below freezing every value of k gives bit-identical forcing and a " *
+        "substitution there changes nothing."
+
+    # Where each applied value came from, per source and per interval — the provenance that replaces
+    # a fill count. Written for `k` at this interval, for the same restricted to the timesteps where
+    # `k` mattered, and for the tile's single lapse-rate series (identical across intervals, stored
+    # per interval so one variable read answers the question without a second lookup).
+    for source in DOWNSCALING_SOURCES
+        for (suffix, key_suffix, long_name) in (
+            ("", "", "timesteps whose applied k came from this source"),
+            ("_above_freezing", "_above_freezing",
+             "above-freezing timesteps whose applied k came from this source"))
+            v = NCDatasets.defVar(ds, "interval_decoupling_factor_n_$(source)$suffix", Int32,
+                                  ("elevation_interval",))
+            v.attrib["units"] = "1"
+            v.attrib["long_name"] = "$long_name ($source)"
+            v[:] = Int32[Int(meta(iv, "glacier_decoupling_factor_n_$(source)$key_suffix", 0))
+                         for iv in intervals]
+        end
+        v = NCDatasets.defVar(ds, "interval_lapse_rate_n_$source", Int32, ("elevation_interval",))
+        v.attrib["units"] = "1"
+        v.attrib["long_name"] = "timesteps whose applied lapse rate came from this source ($source)"
+        v[:] = Int32[Int(meta(iv, "temperature_lapse_rate_n_$source", 0)) for iv in intervals]
+    end
 
     # The applied k, per interval per timestep.
     #
     # Float64 regardless of `precision`, and this one is not a precision nicety but a correctness
-    # requirement. `_make_applicable` clamps a below-domain fit to `nextfloat(0.0)` — 5e-324, the
-    # smallest Float64 above zero — precisely so the value still satisfies the half-open `(0, 1]`
-    # domain `climate_adjust_for_glacier` validates. Float32's smallest subnormal is ~1e-45, so that
-    # sentinel underflows to exactly 0.0 on the way to disk and the value read back is *outside* the
-    # domain it was clamped into: the stored forcing would be rejected by the very check the clamp
-    # exists to pass. Observed on real Wrangell forcing, where a clamped timestep is ordinary.
+    # requirement. `k`'s domain is the half-open `(0, 1]`, so a value must read back *strictly* above
+    # zero to still be applicable. Float32's smallest subnormal is ~1e-45, and a fit reporting near-total
+    # decoupling can land below that and flush to exactly 0.0 on the way to disk — at which point the
+    # stored forcing is rejected by the very check the domain exists to express, several frames from
+    # the write that caused it.
     ak = NCDatasets.defVar(ds, "interval_decoupling_factor", Float64,
                            ("time", "elevation_interval"); deflatelevel = deflate,
                            fillvalue = NC_FILL)
     ak.attrib["units"] = "1"
     ak.attrib["long_name"] = "decoupling factor applied to this interval's forcing"
     ak.attrib["comment"] =
-        "k evaluated at this interval's center, then filled and clamped into (0, 1]. NOT " *
-        "recoverable from the coef_* variables, which are the raw fit: this is what was actually " *
-        "applied to the temperature below. Not yet weighted by each cell's glm, which the " *
-        "aggregation applies per cell as 1 - (1 - k)*(1 - glm). Stored double-precision because a " *
-        "clamped value can sit one float above zero, which single precision would flatten to zero " *
-        "and so out of the domain its consumer accepts."
+        "k as resolved at this interval's center: a fit where one was accepted, otherwise a " *
+        "month-and-hour climatology of accepted fits or a prior. NOT recoverable from the coef_* " *
+        "variables, which are the raw fit: this is what was actually applied to the temperature " *
+        "below, and the interval_decoupling_factor_n_* counts say which tier each timestep came " *
+        "from. Not yet weighted by each cell's glm, which the aggregation applies per cell as " *
+        "1 - (1 - k)*(1 - glm). Stored double-precision because the domain is open at zero and " *
+        "single precision can flush a very small factor to exactly zero, and so outside it."
     for (j, iv) in enumerate(intervals)
         ak[:, j] = convert(Vector{Float64}, collect(iv.decoupling_factor))
     end
@@ -485,11 +555,14 @@ function _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size,
     has_intervals = elevation_interval_forcing === nothing ? n_intervals !== nothing :
                     elevation_interval_forcing
     ds.attrib["elevation_interval_forcing"] = _encode_attribute(has_intervals)
+    ds.attrib["downscaling_schema_version"] = _TILE_SCHEMA_VERSION
     ds.attrib["downscaling_parameters"] = join(_TILE_PARAMETER_KEYS, " ")
     ds.attrib["downscaling_parameters_comment"] =
-        "The settings that define this derivation. A sweep re-derives the tile rather than reusing " *
-        "this file when any of them differs, because the file name records only the tile corner " *
-        "and cannot distinguish two griddings or two forcing windows."
+        "The settings that define this derivation, plus the schema version, which records what the " *
+        "file *contains*. A sweep re-derives the tile rather than reusing this file when any of them " *
+        "differs: the file name records only the tile corner, so it cannot distinguish two griddings " *
+        "or two forcing windows, and a settings comparison alone cannot tell that a newer version " *
+        "would store a variable this file lacks."
 
     # Requested vs actual window. The requested one is what a sparse tile has instead of a time
     # axis, so it is written for every tile rather than only for those.
@@ -657,6 +730,13 @@ function read_downscaling_tile(path::AbstractString)
                                n_cells = DimArray(i32("lapse_rate_n_cells"), (ti,)),
                                elevation_spread = DimArray(f64("elevation_spread"), (ti,)));
                               metadata = dmeta)
+        # A file written before the lapse fit carried an uncertainty has none of these; they read back
+        # as all-`NaN` rather than as absent, so a consumer screens on `isfinite` either way.
+        lapse_rate_uncertainty =
+            DimStack((lapse_rate_stderr = DimArray(f64("lapse_rate_stderr"), (ti,)),
+                      lapse_rate_r2 = DimArray(f64("lapse_rate_r2"), (ti,)),
+                      residual_sd = DimArray(f64("lapse_rate_residual_sd"), (ti,)));
+                     metadata = dmeta)
 
         cells = DataFrame(latitude = f64("cell_latitude"), longitude = f64("cell_longitude"),
                           glacier_area = f64("cell_glacier_area"), glm = f64("cell_glm"))
@@ -669,7 +749,7 @@ function read_downscaling_tile(path::AbstractString)
 
         intervals = haskey(ds.dim, "elevation_interval") ? _read_tile_intervals(ds, ti) : nothing
 
-        (; time, decoupling, lapse_rate,
+        (; time, decoupling, lapse_rate, lapse_rate_uncertainty,
          fit_usable = (v = get1("fit_usable"); v === nothing ? nothing : Bool[x == 1 for x in v]),
          cells, fit_cells, intervals, attributes = dmeta)
     end
@@ -690,6 +770,25 @@ function _read_tile_intervals(ds, ti)
             "elevation_interval_upper" => Float64(ds["interval_upper"][j]),
             "extrapolation_above_reanalysis" =>
                 Float64(ds["interval_extrapolation_above_reanalysis"][j]))
+        # The provenance counts, under the same metadata keys the in-memory interval carries, so a
+        # stored interval and a freshly aggregated one are read the same way. Only the counts survive
+        # a round trip — the per-timestep source labels they summarize are not stored.
+        for (key, var) in (("glacier_decoupling_factor_n_fit_held",
+                            "interval_decoupling_factor_n_fit_held"),
+                           ("glacier_decoupling_factor_n_fit_in_domain",
+                            "interval_decoupling_factor_n_fit_in_domain"),
+                           ("n_timesteps_above_freezing", "interval_n_timesteps_above_freezing"))
+            haskey(ds, var) && (meta[key] = Int(ds[var][j]))
+        end
+        for source in DOWNSCALING_SOURCES
+            for (key, var) in (("glacier_decoupling_factor_n_$source",
+                                "interval_decoupling_factor_n_$source"),
+                               ("glacier_decoupling_factor_n_$(source)_above_freezing",
+                                "interval_decoupling_factor_n_$(source)_above_freezing"),
+                               ("temperature_lapse_rate_n_$source", "interval_lapse_rate_n_$source"))
+                haskey(ds, var) && (meta[key] = Int(ds[var][j]))
+            end
+        end
         (; lo = Int(ds["interval_lower"][j]), hi = Int(ds["interval_upper"][j]),
          center = Float64(ds["interval_center"][j]),
          area = Float64(ds["interval_area"][j]),

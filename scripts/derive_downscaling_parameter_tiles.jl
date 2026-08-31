@@ -10,7 +10,7 @@
 # re-running the same command, and only the incomplete tiles cost anything.
 #
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Forcing is cached as Zarr
-# chunks under `tempdir()` and shared between tiles, which is why the tiles are visited in chunk order.
+# chunks under `CLIMATE_CACHE` and shared between tiles, which is why tiles are visited in chunk order.
 #
 # Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start_year] [end_year]
 #
@@ -24,11 +24,9 @@ using GEMB_ClimateForcing
 using DataFrames
 using Dates
 import GeoDataFrames
-const GI = GeoDataFrames.GeoInterface
 
+const BASE_CLIMATE_DIR = "/mnt/bylot-r3/data";
 const CLIMATE_MODEL = :era5land
-const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
-const OUTPUT_DIR = joinpath(@__DIR__, "..", "data", "downscaling_parameters", string(CLIMATE_MODEL))
 
 # The grid. 2° tiles with a 1° buffer means each tile's fits see a 4°×4° neighbourhood: both fits are
 # regressions across cells, and a bare 2° tile often carries too little elevation and glacier-fraction
@@ -59,10 +57,36 @@ const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 2018
 const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2020
 const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 
+
+const GI = GeoDataFrames.GeoInterface
+
+# Where the forcing cache and the tile outputs live. Kept outside the repo and off `tempdir()`: the
+# ERA5-Land chunks are tens of GB and expensive to re-fetch, so they must survive a reboot. Override
+# with `ENV["CLIMATE_CACHE"]` on a machine without this mount.
+const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
+                          joinpath(BASE_CLIMATE_DIR, string(CLIMATE_MODEL)))
+
+const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
+const OUTPUT_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
+
+# In-memory budget for the cross-tile forcing cache, in GiB.
+#
+# Each tile fits over a `BUFFER`-widened window, so at 2°/1° every cell falls inside four tiles'
+# buffered sets: a global sweep asks for 170,474 cells to derive 47,121 distinct ones, a factor of 3.62.
+# The Zarr cache keeps the compressed bytes local but each load still decompresses them, extracts the
+# record across four variable groups, derives vapour pressure and wind speed, and validates units —
+# ~200 ms per cell, which is 99.8% of a tile's time. Holding recently-loaded cells removes most of that
+# repeat, because tiles are visited in chunk order so the tiles sharing a cell are neighbours in visit
+# order.
+#
+# Sized against the working set rather than the whole sweep: a few tiles' buffered windows. Set to 0 to
+# disable, e.g. on a machine where the memory is needed elsewhere.
+const CACHE_BUDGET_GIB = parse(Float64, get(ENV, "FORCING_CACHE_GIB", "8"))
+
 function main()
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
-    cache = joinpath(tempdir(), ".cache", string(CLIMATE_MODEL))
+    cache = joinpath(CLIMATE_CACHE, "cache")
 
     isfile(PARQUET) || error("no glacier elevation-class table at $PARQUET; build it with " *
                              "src/era5_example.jl first")
@@ -74,11 +98,22 @@ function main()
     table[!, :longitude] = GI.x.(table.geometry)
     table[!, :latitude] = GI.y.(table.geometry)
 
+    # Hourly, so the record length follows from the window. Used only to turn the memory budget into a
+    # cell count, which is what the cache is sized in.
+    n_time = round(Int, Dates.value(TIME_RANGE[2] - TIME_RANGE[1]) / 3_600_000)
+    loader = climate_forcing
+    if CACHE_BUDGET_GIB > 0
+        capacity = forcing_cache_capacity(CACHE_BUDGET_GIB * 2^30, n_time)
+        loader = CachedForcingLoader(climate_forcing; capacity)
+        @info "Cross-tile forcing cache" budget_GiB=CACHE_BUDGET_GIB capacity_cells=capacity MiB_per_cell=round(CACHE_BUDGET_GIB * 1024 / capacity, digits = 1)
+    end
+
     @info "Global downscaling-parameter sweep" cells=nrow(table) tile_size=TILE_SIZE buffer=BUFFER time_range=TIME_RANGE output=OUTPUT_DIR
 
     t0 = time()
     summary = derive_downscaling_parameter_tiles(CLIMATE_MODEL, TIME_RANGE, table, OUTPUT_DIR;
                                                 token, cache_path = cache,
+                                                forcing_loader = loader,
                                                 tile_size = TILE_SIZE,
                                                 buffer = BUFFER,
                                                 min_cells = MIN_CELLS,
@@ -87,6 +122,11 @@ function main()
                                                     RETAIN_ELEVATION_INTERVAL_FORCING,
                                                 institution = "NASA Jet Propulsion Laboratory")
     @info "Sweep finished" minutes=round((time() - t0) / 60, digits = 1)
+
+    # The hit rate against the 3.62 requests per cell the tiling implies: the ceiling is ~0.72, and a
+    # rate well below it means the capacity is smaller than the working set the visit order produces.
+    loader isa CachedForcingLoader &&
+        @info "Forcing cache" forcing_cache_report(loader)...
 
     # The fitted fraction is the thing to look at before trusting a global pass: a tile whose `k` was
     # fitted at almost no timestep is a tile whose forcing carried no warm excess to damp, which is
