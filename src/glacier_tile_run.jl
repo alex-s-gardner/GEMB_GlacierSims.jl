@@ -241,12 +241,6 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         @info "Resuming tile from saved profiles" restart_time=restart.time new_steps=n_new bands=n_band
     end
 
-    # The bare-ice albedo each band runs at, matched to `applied.bands` by elevation edges rather
-    # than by position: `_runnable_bands` and `_bands_after` both reshape `bands`, so an index into
-    # one is not an index into the other. A band the resolution does not cover keeps `mp`'s own
-    # albedo, which is the same fallback `resolve_albedo_ice` applies.
-    band_albedo = _band_albedo_ice(applied, bands, mp.albedo_ice)
-
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
     # One flat task list rather than nested threaded loops: bands per tile range from a handful to
@@ -267,10 +261,11 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         adjusted = precipitation_adjust(temperature_adjust(band.forcing, delta), pscale)
         cf = initialize_forcing(adjusted)
 
-        # The band's own bare-ice albedo. Built per task, so concurrent tasks never share it, and
-        # used for the spinup as well as the run: a column spun up at one ice albedo and then run at
-        # another starts from a state the run's own physics would not have produced.
-        mp_band = _with_albedo_ice(mp, band_albedo[i_band])
+        # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
+        # task, so concurrent tasks never share it, and used for the spinup as well as the run: a
+        # column spun up at one ice albedo and then run at another starts from a state the run's own
+        # physics would not have produced.
+        mp_band = _with_albedo_ice(mp, band.albedo_ice)
 
         # A saved column is the point of a restart: it carries the spun-up state forward, so the spinup
         # is skipped rather than repeated over a window this forcing may not even contain.
@@ -628,16 +623,8 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     # Only when the resolution actually had a profile. Without one every band runs at `mp.albedo_ice`
     # exactly as before, and a tile written then must still compare as current.
     if get(applied.settings, "downscaling_bare_ice_albedo_available", false) === true
-        albedo = _band_albedo_ice(applied, applied.bands, mp.albedo_ice)
-        if !isempty(albedo)
-            params["applied_bare_ice_albedo"] = albedo
-            # Where each of those came from, so a finished file answers "which classes were measured
-            # and which fell back" without the downscaling tile it was derived from. Codes, with the
-            # vocabulary stored beside them, since a NetCDF attribute holds no symbols.
-            params["applied_bare_ice_albedo_source"] = _band_albedo_source(applied, applied.bands)
-            params["applied_bare_ice_albedo_source_meanings"] =
-                join(BARE_ICE_ALBEDO_SOURCES, " ")
-        end
+        _record_bare_ice_albedo!(params, [(b.albedo_ice, b.albedo_ice_source)
+                                          for b in applied.bands])
     end
     return params
 end

@@ -1118,5 +1118,10 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
             area_unrecovered = unrecovered, max_donor_distance_km = donor_distance,
             decoupling_factor = interval.decoupling_factor,
             decoupling_factor_source = interval.decoupling_factor_source,
+            # Carried on the band rather than looked up again downstream: `_runnable_bands` and
+            # `_bands_after` both reshape this list, so a band's index here is not its index in
+            # `applied.bands`, and re-matching by elevation edges is how the two fall out of step.
+            albedo_ice = interval.albedo_ice,
+            albedo_ice_source = interval.albedo_ice_source,
             forcing = DimStack(layers; metadata = meta))
 end

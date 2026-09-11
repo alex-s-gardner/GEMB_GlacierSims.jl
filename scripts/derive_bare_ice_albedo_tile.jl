@@ -58,10 +58,6 @@ const EXTRAPOLATE = 0.0
 # Black-sky (directional-hemispherical) albedo, which is what a surface energy-balance model wants.
 const SKY = :bsa
 
-# The range GEMB asserts for `albedo_ice`, drawn on the figure. Nothing is clamped to it: above the
-# ELA the darkest-percentile statistic is measuring snow, and that is a real surface.
-const GEMB_ALBEDO_ICE_RANGE = (0.2, 0.6)
-
 const DEFAULT_TILE = "N60_W142.nc"
 
 # Persistent shared cache, off `tempdir()` so a reboot does not throw it away.
@@ -162,6 +158,8 @@ fig = Figure(size = (1250, 950))
 ax1 = Axis(fig[1, 1]; xlabel = "elevation (m)", ylabel = "bare-ice albedo ($(SKY))",
            title = "$(stem): albedo vs elevation, $(nrow(observed)) observed (cell, bin) pairs")
 # The range GEMB accepts for albedo_ice, for reference only.
+# `GEMB_ALBEDO_ICE_RANGE` is the range GEMB asserts for `albedo_ice`, drawn for reference only:
+# nothing here is clamped to it, since above the ELA the statistic is measuring snow.
 hspan!(ax1, GEMB_ALBEDO_ICE_RANGE[1], GEMB_ALBEDO_ICE_RANGE[2]; color = (:seagreen, 0.12))
 hlines!(ax1, collect(GEMB_ALBEDO_ICE_RANGE); color = (:seagreen, 0.5), linestyle = :dash)
 if !isempty(observed)

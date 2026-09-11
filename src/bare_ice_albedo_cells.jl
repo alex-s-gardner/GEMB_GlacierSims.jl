@@ -78,11 +78,6 @@ function era5_land_cell_key(lon, lat; cell_size::Real = 0.1)
     return (round(Int, float(wrap_lon(Float64(lon))) / s), round(Int, Float64(lat) / s))
 end
 
-# The 1° DEM window a set of points is read in, keyed by integer southwest corner. Same tiling as
-# `_tile_key` in glacier_elevation_class.jl, and for the same reason: the Copernicus DEM is
-# published as 1° tiles, so a window aligned to them fetches each tile once.
-_bia_dem_key(lon, lat) = (floor(Int, float(wrap_lon(Float64(lon)))), floor(Int, Float64(lat)))
-
 """
     _bia_densified_box(xmin, xmax, ymin, ymax, step) -> GeoInterface.Polygon
 
@@ -323,9 +318,9 @@ function resolve_albedo_ice(profile, z::Real; default::Real,
         "default albedo_ice must be finite, got $(default); pass `mp.albedo_ice`"))
 
     value, source = NaN, :default
-    if !isnothing(profile) && isfinite(z)
-        b = searchsortedlast(profile.edges, Float64(z))
-        if 1 <= b <= length(profile.albedo) && isfinite(profile.albedo[b])
+    if !isnothing(profile)
+        b = _bia_hyps_bin(profile, z)
+        if b != 0 && isfinite(profile.albedo[b])
             value, source = profile.albedo[b], profile.sources[b]
         end
     end
@@ -357,22 +352,31 @@ _with_albedo_ice(mp, albedo::Real) =
     ConstructionBase.setproperties(mp, (; albedo_ice = Float64(albedo)))
 
 """
-    _band_albedo_ice(applied, bands, default) -> Vector{Float64}
+    _record_bare_ice_albedo!(params, resolved)
 
-The bare-ice albedo for each of `bands`, looked up in `applied.bands` by elevation edges.
+Record the resolved bare-ice albedo of every band or bin in a run's stored parameters.
 
-Matched on `(lo, hi)` rather than by position because a run's band list is not the resolution's:
-`_runnable_bands` drops bands whose forcing no perturbation can use, so index `i` into one is not
-index `i` into the other. A band the resolution does not cover falls back to `default` — the same
-value [`resolve_albedo_ice`](@ref) would have given it.
+`resolved` is a vector of `(albedo, source)` pairs, as [`resolve_albedo_ice`](@ref) returns — the one
+shape both the tile and the cell path produce, so the three attribute names and the code encoding are
+written in exactly one place.
+
+The values go in because `model_albedo_ice` cannot express them: that field is only the fallback for a
+band the observations did not resolve. Re-deriving the albedo therefore invalidates a restart, as it
+must — the same forcing under a different `albedo_ice` per band is a different experiment. The sources
+go in so a finished file answers "which classes were measured and which fell back" on its own, without
+the downscaling tile it came from.
+
+Sources are stored as [`BARE_ICE_ALBEDO_SOURCES`](@ref) codes with the vocabulary beside them, since a
+NetCDF attribute holds no symbols. An empty `resolved` writes nothing at all: a run with no albedo
+product must still compare as current against the file it wrote before these keys existed.
 """
-function _band_albedo_ice(applied, bands, default::Real)
-    lookup = Dict{Tuple{Int,Int},Float64}()
-    for b in applied.bands
-        hasproperty(b, :albedo_ice) || continue
-        lookup[(Int(b.lo), Int(b.hi))] = Float64(b.albedo_ice)
-    end
-    return [get(lookup, (Int(b.lo), Int(b.hi)), Float64(default)) for b in bands]
+function _record_bare_ice_albedo!(params::AbstractDict, resolved)
+    isempty(resolved) && return params
+    params["applied_bare_ice_albedo"] = [Float64(first(r)) for r in resolved]
+    params["applied_bare_ice_albedo_source"] =
+        [bare_ice_albedo_source_code(last(r)) for r in resolved]
+    params["applied_bare_ice_albedo_source_meanings"] = join(BARE_ICE_ALBEDO_SOURCES, " ")
+    return params
 end
 
 """
@@ -404,17 +408,6 @@ function bare_ice_albedo_source_name(code::Real)
     return 1 <= c <= length(BARE_ICE_ALBEDO_SOURCES) ? BARE_ICE_ALBEDO_SOURCES[c] : :unknown
 end
 
-# The provenance of each band's resolved albedo, as codes, matched by elevation edges the same way
-# `_band_albedo_ice` matches the values. A band the resolution does not cover got the default.
-function _band_albedo_source(applied, bands)
-    lookup = Dict{Tuple{Int,Int},Symbol}()
-    for b in applied.bands
-        hasproperty(b, :albedo_ice_source) || continue
-        lookup[(Int(b.lo), Int(b.hi))] = b.albedo_ice_source
-    end
-    return [bare_ice_albedo_source_code(get(lookup, (Int(b.lo), Int(b.hi)), :default))
-            for b in bands]
-end
 
 # ------------------------------------------------------------------------- shared sampling
 
@@ -505,7 +498,7 @@ function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
         lat = parent(a[:latitude])[keep]
         windows = Dict{Tuple{Int,Int},Vector{Int}}()
         for j in eachindex(lon)
-            push!(get!(() -> Int[], windows, _bia_dem_key(lon[j], lat[j])), j)
+            push!(get!(() -> Int[], windows, _tile_key(lon[j], lat[j])), j)
         end
         window_list = collect(windows)
         verbose && @info "Reading Copernicus DEM" points = length(keep) windows =

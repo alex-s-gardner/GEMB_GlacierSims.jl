@@ -318,10 +318,11 @@ function bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000;
         isnan(z[i]) && (n_no_elevation += 1; continue)
         push!(fit_z, z[i])
         push!(fit_a, Float64(alb))
-        b = searchsortedlast(edges, z[i])
-        # The top edge is exclusive, so a value sitting exactly on it belongs to no bin. It still
-        # informs the fit — it is a real observation, just outside the binning.
-        1 <= b <= n_bins || continue
+        # `_bin_index` returns 0 outside the binning. The top edge is exclusive, so a value sitting
+        # exactly on it belongs to no bin — it still informs the fit, being a real observation, just
+        # outside the binning.
+        b = _bin_index(z[i], edges, n_bins)
+        b == 0 && continue
         sum_albedo[b] += Float64(alb)
         sum_valid[b] += counts[i]
         n_cells[b] += 1
@@ -340,11 +341,10 @@ function bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000;
     hold = extrapolate === :hold
     reach = hold ? 0.0 : Float64(extrapolate)
     # With a numeric `extrapolate`, a bin may be fit-filled only if its centre is within that
-    # distance of the elevations that
-    # informed the fit. The fit is linear and unbounded, so filling far outside that span returns
-    # albedos beyond 0-1 — a negative "best estimate" is worse than no estimate. Both bounds are
-    # `NaN` when no fit was identifiable, which makes this comparison false and lands on `:none`
-    # with no special case.
+    # distance of the elevations that informed the fit. The fit is linear and unbounded, so filling
+    # far outside that span returns albedos beyond 0-1, and a negative "best estimate" is worse than
+    # no estimate. Both bounds are `NaN` when no fit was identifiable, which makes the comparison
+    # false and lands on `:none` with no special case.
     zlo, zhi = fit.elevation_range
     for b in 1:n_bins
         centre = (edges[b] + edges[b + 1]) / 2
@@ -374,13 +374,11 @@ end
 
 # ------------------------------------------------------------------------------ evaluation
 
-# The bin holding `z`, or 0 when it falls outside the binning. Shared by the call operator and
-# `bare_ice_albedo_source` so the two can never disagree about which bin a value is in.
-@inline function _bia_hyps_bin(f::BareIceAlbedoHyps, z::Real)
-    isfinite(z) || return 0
-    b = searchsortedlast(f.edges, z)
-    return 1 <= b <= length(f.albedo) ? b : 0
-end
+# The bin of `f` holding `z`, or 0 when `z` is outside the binning or not finite. The one place a
+# profile's bin is located: the call operator, `bare_ice_albedo_source` and `resolve_albedo_ice` all
+# go through it, so none of them can disagree about which bin a value is in.
+@inline _bia_hyps_bin(f::BareIceAlbedoHyps, z::Real) =
+    isfinite(z) ? _bin_index(z, f.edges, length(f.albedo)) : 0
 
 function (f::BareIceAlbedoHyps)(z::Real)
     b = _bia_hyps_bin(f, z)

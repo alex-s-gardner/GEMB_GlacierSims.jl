@@ -136,18 +136,7 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
     end
-    # The albedo each bin was run at, which `model_albedo_ice` cannot express — that field is only
-    # the fallback for a bin the observations did not resolve. Absent, rather than a vector of the
-    # default, when no albedo product was supplied: a cell run without one must still compare as
-    # current against the file it wrote before this key existed.
-    if bare_ice_albedo !== nothing && !isempty(bare_ice_albedo)
-        params["applied_bare_ice_albedo"] = collect(Float64, first.(bare_ice_albedo))
-        # Where each bin's albedo came from, so a finished cell file answers "measured or fallback?"
-        # on its own. Codes, with the vocabulary beside them: a NetCDF attribute holds no symbols.
-        params["applied_bare_ice_albedo_source"] =
-            [bare_ice_albedo_source_code(s) for s in last.(bare_ice_albedo)]
-        params["applied_bare_ice_albedo_source_meanings"] = join(BARE_ICE_ALBEDO_SOURCES, " ")
-    end
+    bare_ice_albedo === nothing || _record_bare_ice_albedo!(params, bare_ice_albedo)
     return params
 end
 
