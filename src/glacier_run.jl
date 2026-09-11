@@ -44,9 +44,9 @@ const MIN_FORCING_STEPS = 2
 # threshold fails a step test forever. Equilibrium is the absence of a trend, so that is what to measure.
 #
 # The threshold trades spinup error against cycles, and the value is set where mountain-glacier work can
-# afford it. A cycle is one climatological year, so a column leaving spinup with slope `s` carries roughly
-# `s` per year of continuing FAC change into the transient: over a 76-year record 1e-2 m/cycle is 0.76 m,
-# small against the metres of height change a glacier produces. Tightening it costs cycles steeply —
+# afford it. It is stated **per year** and scaled to the cycle by `_spinup_drift_tolerance`, so a column
+# leaving spinup with slope `s` carries roughly `s` per year of continuing FAC change into the transient:
+# over a 76-year record 1e-2 m/yr is 0.76 m, small against the metres of height change a glacier produces. Tightening it costs cycles steeply —
 # across a temperate maritime tile and a cold Antarctic one, bands exit within 90 cycles at 1e-2 but need
 # up to 143 at 1e-3 and up to 200 at 1e-4.
 #
@@ -54,11 +54,11 @@ const MIN_FORCING_STEPS = 2
 # column relaxes: at 1e-2 a temperate deep-firn column leaves spinup 0.16 m of FAC from where 1e-4 puts
 # it, and its cumulative volume change differs by 6%. On a dry, cold plateau the relaxation tail is longer
 # and the surface-height signal is centimetres per year, so the inherited drift is the whole quantity of
-# interest rather than a rounding term. Plateau work wants 1e-4 or tighter, with `max_iterations` at 200
-# or above so the criterion is reachable rather than a no-op that burns the whole budget.
+# interest rather than a rounding term. Plateau work wants 1e-4 or tighter, with `simulation_years_maximum`
+# raised so the criterion is reachable rather than a no-op that burns the whole budget.
 #
-# A cycle-count ceiling is a backstop, not the convergence test: raising it is free once the criterion is
-# reachable, since a settled column exits on its own.
+# The ceiling is a backstop, not the convergence test: raising it is free once the criterion is reachable,
+# since a settled column exits on its own.
 #
 # Stated as firn air content rather than density because a density threshold means a different thing on
 # every column — it scales with depth, so one value is four times looser on a 49 m column than on a
@@ -70,12 +70,36 @@ const SPINUP_DRIFT_FAC = 1e-2
 # `gemb_spinup` cannot judge a slope before it has this many samples and refuses to exit by abstention.
 const SPINUP_DRIFT_WINDOW = 10
 
-# The drift threshold in the units `gemb_spinup` tests: mean density per cycle, not firn air per cycle.
+# How the repeating spinup cycle is built from the climatology window.
 #
-# Converted per column rather than by the caller, because the factor is the column depth and that is
-# only known once the initial profile exists.
-_spinup_drift_tolerance(profile, mp, drift_fac) =
-    convergence_density_from_fac(drift_fac, sum(profile[:dz]), mp.density_ice)
+# `:representative` repeats a block of `SPINUP_CLIMATOLOGY_N_YEARS` real consecutive years; `:average`
+# would collapse the window into one averaged year. Averaging is the cheaper choice and preserves
+# accumulation almost exactly, but melt is rectified — zero until the skin reaches the melt point — so
+# averaging pairs one year's warm excursions against another's cold ones and the peaks that carried the
+# melt stop crossing the threshold. Measured over 12 glacierized Greenland sites it retains a median 12%
+# of the record's melt, with 5 of 10 sites melting not at all, and the failure tracks elevation rather
+# than the melt/accumulation ratio. A column spun up that way equilibrates as a melt-free column, with
+# its firn air content and refreeze wrong by construction — which is exactly what altimetry reads. See
+# `forcing_climatology`'s docstring for the per-site table.
+const SPINUP_CLIMATOLOGY_METHOD = :representative
+# Three years, because one recovers the melt but carries an 18.5% accumulation error against 6.9% for
+# three; beyond three the extra model-years buy no further fidelity.
+const SPINUP_CLIMATOLOGY_N_YEARS = 3
+
+# The drift threshold in the units `gemb_spinup` tests: mean density per *cycle*, from a tolerance stated
+# as firn air per *year*.
+#
+# Both conversions are needed and neither is cosmetic. The depth factor is the column's own, so a single
+# density threshold would be four times looser on a 49 m column than on a 13 m one. The cycle factor is
+# `years_per_cycle`, which is 1 under `:average` but `n_years` under `:representative` — so the same
+# numeric tolerance would silently be `n_years` times stricter there, and a tolerance the caller stated
+# per year would not mean per year.
+#
+# Converted per column rather than by the caller, because the depth is only known once the initial
+# profile exists.
+_spinup_drift_tolerance(profile, cf_spinup, mp, drift_fac_per_year) =
+    convergence_density_from_fac(drift_fac_per_year * GEMB._years_per_cycle(cf_spinup),
+                                 sum(profile[:dz]), mp.density_ice)
 
 """
     run_parameters(mp::ModelParameters; coverage, lapse_rate, decoupling_factor = nothing)
@@ -100,7 +124,7 @@ given — see [`gemb_glacier_cell`](@ref) for why the per-timestep form `climate
 also accepts is not one of them.
 """
 function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
-                        decoupling_factor = nothing)
+                        decoupling_factor = nothing, bare_ice_albedo = nothing)
     params = Dict{String,Any}("hypsometry_coverage" => Float64(coverage),
                               "temperature_lapse_rate" => _lapse_rate_parameter(lapse_rate),
                               # 1.0 (the identity) rather than an absent key when no correction
@@ -111,6 +135,18 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
+    end
+    # The albedo each bin was run at, which `model_albedo_ice` cannot express — that field is only
+    # the fallback for a bin the observations did not resolve. Absent, rather than a vector of the
+    # default, when no albedo product was supplied: a cell run without one must still compare as
+    # current against the file it wrote before this key existed.
+    if bare_ice_albedo !== nothing && !isempty(bare_ice_albedo)
+        params["applied_bare_ice_albedo"] = collect(Float64, first.(bare_ice_albedo))
+        # Where each bin's albedo came from, so a finished cell file answers "measured or fallback?"
+        # on its own. Codes, with the vocabulary beside them: a NetCDF attribute holds no symbols.
+        params["applied_bare_ice_albedo_source"] =
+            [bare_ice_albedo_source_code(s) for s in last.(bare_ice_albedo)]
+        params["applied_bare_ice_albedo_source_meanings"] = join(BARE_ICE_ALBEDO_SOURCES, " ")
     end
     return params
 end
@@ -480,7 +516,8 @@ or perturbations.
   slice of forcing the continuation happened to fetch. If that window's years are outside the
   supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
   climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
-- `max_iterations`: spinup cycle ceiling, passed to `gemb_spinup`.
+- `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to
+  `gemb_spinup`, which divides by the cycle length to get its own cycle ceiling.
 - `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
   when the least-squares slope of firn air content against cycle, over the trailing `drift_window`
   cycles, falls below `convergence_drift_fac` metres per cycle. A slope rather than a step between
@@ -489,7 +526,7 @@ or perturbations.
   `gemb_spinup` tests, exactly, because the column depth is pinned
   ([`convergence_density_from_fac`](@ref)). The default is sized for mountain-glacier firn, where the
   inherited drift is millimetres against metres of height change; a dry ice-sheet plateau relaxes more
-  slowly and changes by centimetres per year, and needs 1e-4 or tighter with `max_iterations` at 200 or
+  slowly and changes by centimetres per year, and needs 1e-4 or tighter with `simulation_years_maximum` at
   above.
 - `restart`: the value returned by [`read_glacier_cell_restart`](@ref), or `nothing`. When
   given, each run resumes from its saved profile over forcing newer than the saved time and
@@ -519,8 +556,9 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
                            coverage::Real = 0.95,
                            lapse_rate = _DEFAULT_LAPSE_RATE,
                            glacier_decoupling = true,
+                           bare_ice_albedo = nothing,
                            spinup_window = nothing,
-                           max_iterations::Int = 1000,
+                           simulation_years_maximum::Real = 1000,
                            convergence_drift_fac = SPINUP_DRIFT_FAC,
                            drift_window::Int = SPINUP_DRIFT_WINDOW,
                            restart = nothing,
@@ -535,11 +573,28 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     # of the perturbation or the elevation interval. `nothing` here means every run stays ambient.
     decoupling_factor = resolve_decoupling_factor(row, glacier_decoupling)
 
-    parameters = run_parameters(mp; coverage, lapse_rate, decoupling_factor)
-
     cov = glacier_hypsometry_coverage(row; coverage)
     isempty(cov.modeled) &&
         throw(ArgumentError("cell has no populated hypsometry bins"))
+
+    # One resolved bare-ice albedo per modeled bin. `bare_ice_albedo === nothing` — the default —
+    # gives every bin `mp.albedo_ice`, so a cell run without an albedo product behaves exactly as it
+    # did before. Resolved once per cell rather than per (bin x delta x scaling): the albedo product
+    # is pooled over the whole record and does not vary with a perturbation.
+    #
+    # Computed before `run_parameters` because it belongs *in* the recorded parameters: two runs of
+    # one cell at different per-bin ice albedos are different experiments, and a restart must refuse
+    # to splice them.
+    bin_resolved = [resolve_albedo_ice(bare_ice_albedo, b.center; default = mp.albedo_ice)
+                    for b in cov.modeled]
+    bin_albedo = first.(bin_resolved)
+
+    # Recorded only when an albedo product was supplied. With none, every bin runs at `mp.albedo_ice`
+    # exactly as it did before this keyword existed, and a file written then must still compare as
+    # current rather than as a parameter change.
+    parameters = run_parameters(mp; coverage, lapse_rate, decoupling_factor,
+                                bare_ice_albedo = bare_ice_albedo === nothing ? nothing :
+                                                  bin_resolved)
 
     # A cell whose reanalysis grid point is on water carries no forcing at all; catch that here
     # rather than letting GEMB's range assertions report it as a units problem.
@@ -629,6 +684,11 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
 
         cf = at_bin(forcing_data)
 
+        # This bin's bare-ice albedo. Built per task so concurrent tasks never share it, and used for
+        # the spinup too: a column settled at one ice albedo and then run at another starts from a
+        # state the run's own physics would not have produced.
+        mp_bin = _with_albedo_ice(mp, bin_albedo[i_bin])
+
         profile = restart === nothing ? nothing :
                   get(restart.profiles, (i_bin, i_dt, i_ps), nothing)
 
@@ -640,17 +700,17 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
             # start `spinup_forcing === forcing_data` and `cf` is already that stack, so it is
             # reused rather than recomputed: that is the common path.
             cf_spinup = _spinup_climatology(
-                spinup_forcing === forcing_data ? cf : at_bin(spinup_forcing), spinup_window)
-            initial = initialize_profile(mp, cf_spinup)
+                spinup_forcing === forcing_data ? cf : at_bin(spinup_forcing), spinup_window, mp_bin)
+            initial = initialize_profile(mp_bin, cf_spinup)
             # The FAC trend is the only convergence criterion; see `gemb_glacier_tile`. Passed
             # explicitly so the single-criterion design is not mistaken for an omission.
-            profile = gemb_spinup(initial, cf_spinup, mp; max_iterations, drift_window,
+            profile = gemb_spinup(initial, cf_spinup, mp_bin; simulation_years_maximum, drift_window,
                                   convergence_delta_density = nothing,
                                   convergence_drift_density = _spinup_drift_tolerance(
-                                      initial, mp, convergence_drift_fac))
+                                      initial, cf_spinup, mp_bin, convergence_drift_fac))
         end
 
-        output = gemb(profile, cf, mp)
+        output = gemb(profile, cf, mp_bin)
 
         # `gemb` only warns when the forcing is shorter than one output period; that
         # leaves an empty time axis, which would otherwise silently contribute nothing.
@@ -800,19 +860,25 @@ _parse_datetime(_) = nothing
 # `SpinupWindowUnavailable` names the window and the remedy, because the alternative — silently
 # spinning this bin up on a different climate than every other bin in the file — is the bug being
 # avoided here.
-function _spinup_climatology(cf, window)
+function _spinup_climatology(cf, window, mp::ModelParameters;
+                             method = SPINUP_CLIMATOLOGY_METHOD,
+                             n_years = SPINUP_CLIMATOLOGY_N_YEARS)
     times = lookup(cf, Ti)
     selected = filter(t -> window[1] <= t <= window[2], times)
 
-    # A year of span, not a step count: `forcing_climatology` calls whichever years hold the most
-    # timesteps "complete", so a selection covering one partial year passes any count test and
-    # averages into a climatological "year" of however few steps that partial happened to hold.
-    # Spanning a year is what actually distinguishes a climatology from a fragment of one.
-    spans_a_year = !isempty(selected) && last(selected) - first(selected) >= Day(365)
-    spans_a_year ||
+    # A span, not a step count: `forcing_climatology` calls whichever years hold the most timesteps
+    # "complete", so a selection covering one partial year passes any count test and yields a
+    # climatological "year" of however few steps that partial happened to hold. Spanning the block
+    # length is what actually distinguishes a climatology from a fragment of one — and `n_years` is
+    # silently clamped to the complete years available, so a short window would quietly reduce the
+    # block rather than fail.
+    needed = Day(365) * (method === :representative ? n_years : 1)
+    spans_the_block = !isempty(selected) && last(selected) - first(selected) >= needed
+    spans_the_block ||
         throw(SpinupWindowUnavailable(window, length(selected), (first(times), last(times))))
 
-    return forcing_climatology(cf, window)
+    method === :representative || return forcing_climatology(cf, window; method)
+    return forcing_climatology(cf, window; method, model_parameters = mp, n_years)
 end
 
 # What counts as spinup/climatology provenance, by name. GEMB names these keys itself
@@ -863,6 +929,23 @@ _validate_restart(restart, modeled, delta_temperatures, precipitation_scalings) 
                              (restart.bin_centers, restart.delta_temperatures,
                               restart.precipitation_scalings),
                              _run_grid(modeled, delta_temperatures, precipitation_scalings))
+
+# The tile form of the same check. A tile's first axis is `band_center`, so it names that rather than
+# `bin_center`: the axes are compared positionally, and a mismatched name in the error would send a reader
+# looking for a variable the file does not have.
+_validate_tile_restart(restart, bands, delta_temperatures, precipitation_scalings) =
+    _assert_run_grid_matches("the saved restart state",
+                             (restart.band_centers, restart.delta_temperatures,
+                              restart.precipitation_scalings),
+                             ([b.center for b in bands], delta_temperatures,
+                              precipitation_scalings);
+                             axes = TILE_RUN_GRID_AXES, what = "tile")
+
+# Each band's forcing, restricted to the steps a continuation has not already consumed. Rebuilt rather
+# than mutated so the caller's `bands` stays usable as the un-trimmed record — the fallback spinup path
+# needs it when a run has no saved column.
+_bands_after(bands, t_restart::DateTime) =
+    [merge(b, (; forcing = b.forcing[Ti(Where(t -> t > t_restart))])) for b in bands]
 
 """
     RestartParameterMismatch(differences)
@@ -919,10 +1002,10 @@ end
 
 # Compare the stored run parameters against this run's, and refuse the append on a disagreement
 # unless the caller has forced it.
-function _validate_restart_parameters(restart, parameters; force_restart::Bool)
+function _validate_restart_parameters(restart, parameters; force_restart::Bool, what = "cell")
     saved = restart.parameters
     if isempty(saved)
-        @warn "The existing cell file stores no run parameters; cannot verify that this " *
+        @warn "The existing $what file stores no run parameters; cannot verify that this " *
               "continuation matches it"
         return nothing
     end
@@ -931,7 +1014,7 @@ function _validate_restart_parameters(restart, parameters; force_restart::Bool)
 
     missing_keys = setdiff(keys(parameters), keys(saved))
     isempty(missing_keys) ||
-        @warn "The existing cell file does not store every run parameter; these could not be verified" unverified=sort!(collect(missing_keys))
+        @warn "The existing $what file does not store every run parameter; these could not be verified" unverified=sort!(collect(missing_keys))
 
     isempty(differences) && return nothing
 

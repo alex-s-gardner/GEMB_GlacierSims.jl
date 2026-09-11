@@ -129,9 +129,13 @@ value.
   rate is a property of the tile's air column rather than of a band, so there is one series.
 - `lapse_rate_source`: the [`DOWNSCALING_SOURCES`](@ref) code behind each of those.
 - `bands`: one entry per elevation interval, ascending, each
-  `(; lo, hi, center, decoupling_factor, decoupling_factor_source, n_fit_in_domain, n_fit_held)`.
-  `decoupling_factor` is `k` at that band's centre per timestep, inside `(0, 1]`. The two counts
-  describe the *fit* series the band was resolved from, not the applied one.
+  `(; lo, hi, center, decoupling_factor, decoupling_factor_source, n_fit_in_domain, n_fit_held,
+  albedo_ice, albedo_ice_source)`. `decoupling_factor` is `k` at that band's centre per timestep,
+  inside `(0, 1]`. The two counts describe the *fit* series the band was resolved from, not the
+  applied one. `albedo_ice` is the band's bare-ice albedo, a scalar inside
+  [`GEMB_ALBEDO_ICE_RANGE`](@ref) — the albedo product is pooled over the whole record, so unlike
+  the other two it does not vary with time — and `albedo_ice_source` is its
+  [`BARE_ICE_ALBEDO_SOURCES`](@ref) provenance.
 - `basis`: `:climatology` or `:fitted`, as requested.
 - `settings`: the thresholds and priors this resolution used, for the record.
 
@@ -310,7 +314,9 @@ function resolve_downscaling(fit, intervals, run_time;
                              stderr_maximum::Real = APPLIED_LAPSE_RATE_STDERR_MAXIMUM,
                              lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                              lapse_rate_prior = _DEFAULT_LAPSE_RATE,
-                             decoupling_factor_prior = nothing)
+                             decoupling_factor_prior = nothing,
+                             albedo_ice_default = _DEFAULT_ALBEDO_ICE,
+                             albedo_ice_range = GEMB_ALBEDO_ICE_RANGE)
     basis in (:climatology, :fitted) ||
         throw(ArgumentError("basis must be :climatology or :fitted, got :$basis"))
     run_time = _plain_times(run_time)
@@ -377,6 +383,11 @@ function resolve_downscaling(fit, intervals, run_time;
     alpha = collect(Float64, fit.decoupling.coef_alpha)
     beta = collect(Float64, fit.decoupling.coef_beta)
 
+    # The tile's pooled bare-ice albedo profile, absent from any tile derived before it was stored.
+    # `resolve_albedo_ice` handles `nothing` by falling every band back to `albedo_ice_default`, so
+    # an older tile still resolves — with the tuned constant, exactly as it ran before.
+    albedo_profile = hasproperty(fit, :bare_ice_albedo) ? fit.bare_ice_albedo : nothing
+
     bands = map(intervals) do interval
         raw = decoupling_factor_at_elevation(fit.decoupling, interval.center;
                                              elevation_range = z_range)
@@ -395,11 +406,16 @@ function resolve_downscaling(fit, intervals, run_time;
         _assert_applicable(factor, _DECOUPLING_FACTOR_LIMITS,
                            "decoupling factor at $(interval.center) m"; open_lower = true)
 
+        albedo_ice, albedo_ice_source = resolve_albedo_ice(albedo_profile, interval.center;
+                                                          default = albedo_ice_default,
+                                                          range = albedo_ice_range)
+
         (; interval.lo, interval.hi, interval.center,
          decoupling_factor = factor,
          decoupling_factor_source = source,
          n_fit_in_domain = count(in_domain),
-         n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)))
+         n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)),
+         albedo_ice, albedo_ice_source)
     end
 
     settings = Dict{String,Any}(
@@ -416,7 +432,13 @@ function resolve_downscaling(fit, intervals, run_time;
         "downscaling_fit_time_coverage_end" => isempty(fit_time) ? "none" : string(last(fit_time)),
         "downscaling_n_fit_timesteps" => length(fit_time),
         "downscaling_n_lapse_rate_accepted" => count(accepted),
+        "downscaling_albedo_ice_default" => Float64(albedo_ice_default),
+        "downscaling_albedo_ice_range" => [Float64(albedo_ice_range[1]), Float64(albedo_ice_range[2])],
+        "downscaling_bare_ice_albedo_available" => albedo_profile !== nothing,
     )
+    for s in BARE_ICE_ALBEDO_SOURCES
+        settings["downscaling_n_albedo_ice_$(s)"] = count(b -> b.albedo_ice_source === s, bands)
+    end
 
     return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings)
 end

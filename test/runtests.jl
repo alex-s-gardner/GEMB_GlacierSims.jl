@@ -5,6 +5,7 @@ using GeoDataFrames
 using Dates
 using DimensionalData
 using Statistics
+import GeoInterface
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
 using GEMB_ClimateForcing: climate_adjust_for_elevation
@@ -182,13 +183,25 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
                                  "model_densification_method" => :Arthern,
                                  "model_albedo_ice" => 0.48)
 
+    # Per-run spinup provenance: distinct in every slot, so a round-trip that transposed the grid or
+    # broadcast one column over the rest would show up. One slot is left `NaN` to stand for a run that
+    # produced no output, and one column is marked unconverged so the tile-level `all` reduction is
+    # false rather than trivially true.
+    run_provenance = Dict{String,Array{Float64,3}}(
+        "spinup_smb_rate" => [0.1b - 0.4d + 0.02s for b in 1:n_band, d in 1:n_dt, s in 1:n_ps],
+        "spinup_cycles" => [30.0 + b + d + s for b in 1:n_band, d in 1:n_dt, s in 1:n_ps],
+        "spinup_converged" => ones(n_band, n_dt, n_ps),
+        "spinup_performed" => ones(n_band, n_dt, n_ps),
+    )
+    run_provenance["spinup_converged"][1, 1, 1] = 0.0
+    run_provenance["spinup_smb_rate"][n_band, n_dt, n_ps] = NaN
+
     return GlacierTileRun(
         (-142, 60), "N60_W142.nc", "lat[+60+62]lon[-142-140]",
         (lon_min = -142.0, lon_max = -140.0, lat_min = 60.0, lat_max = 62.0),
         335, 716, band_tuples, collect(Float64, deltas), collect(Float64, scalings),
-        collect(time), bands_series, totals, profiles, band_provenance, parameters,
-        Dict{String,Any}("spinup_performed" => true, "spinup_cycles" => 37,
-                         "spinup_converged" => false,
+        collect(time), bands_series, totals, profiles, band_provenance, run_provenance, parameters,
+        Dict{String,Any}("spinup_converged" => false,
                          "climatology_window_start" => DateTime(1990, 1, 1),
                          "max_dh_residual" => 1.2e-14),
     )
@@ -862,8 +875,9 @@ end
         t = collect(DateTime(1995, 1, 1):Day(1):DateTime(1999, 12, 31))
         cf = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
         window = (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+        mp = GEMB.initialize_parameters()
         err = try
-            GEMB_GlacierSims._spinup_climatology(cf, window)
+            GEMB_GlacierSims._spinup_climatology(cf, window, mp)
             nothing
         catch e
             e
@@ -880,7 +894,7 @@ end
         # months of daily data would average into a 182-step "climatological year" without
         # complaint.
         partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
-        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial)
+        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
     end
 
     @testset "NetCDF append" begin
@@ -2491,6 +2505,182 @@ end
                                                        bins = Tuple{Int,Float64}[])])))
     end
 
+    @testset "donor substitution for cells outside the land mask" begin
+        # Four cells 0.1° apart at 46°N — about 7.7 km, so every pair is inside the default 50 km cap
+        # — each carrying its own elevation interval. `applied` comes from the usable-everywhere
+        # derivation, so the bands are the same in every case below and only which cells can supply
+        # forcing changes.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0,  bins = [(1050, 10.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5,  bins = [(1550, 10.0)]),
+                 (lon = 10.2, lat = 46.0, z = 2000.0, glm = 1.0,  bins = [(2050, 10.0)]),
+                 (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.25, bins = [(2550, 10.0)])]
+        table = _cp_table(cells)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+        warm(c) = fill(280.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
+        masked(_) = fill(NaN, length(_CP_TIME))
+
+        applied = derive_downscaling_parameters(:synthetic, time_range, table;
+                                               token = nothing, cache_path = nothing,
+                                               min_cells = 4,
+                                               forcing_loader = _cp_loader(cells, warm)).applied
+
+        # Cell 2 is outside the land mask: it carries 10 km² at 1550 m and no forcing at all.
+        hole(c) = c.lon == 10.1 ? masked(c) : warm(c)
+        bands(; kwargs...) = collect(elevation_interval_forcing(
+            table, applied; climate_model = :synthetic, time_range,
+            token = nothing, cache_path = nothing, elevation_interval_batch = 0,
+            forcing_loader = _cp_loader(cells, hole), kwargs...))
+
+        @testset "the masked cell's ice is kept, from the nearest usable cell" begin
+            b = bands()
+            # Four bands, not three: without a donor the 1550 m band accumulates no area and is not
+            # emitted at all, so its ice leaves the total silently.
+            @test length(b) == 4
+            @test sum(x.area for x in b) ≈ 40.0
+            sub = only(filter(x -> x.center == 1550.0, b))
+            @test sub.area ≈ 10.0
+            @test sub.n_cells_substituted == 1
+            @test sub.area_substituted ≈ 10.0
+            @test sub.area_unrecovered == 0.0
+            # Cell 1 at 10.0°E is the nearest usable cell, one 0.1° step away.
+            @test sub.max_donor_distance_km ≈ GEMB_GlacierSims._haversine_km(46.0, 10.1, 46.0, 10.0)
+            # The bands that had their own forcing report no substitution, so the flag distinguishes
+            # a borrowed band from a plain one rather than marking the whole tile.
+            @test all(x.n_cells_substituted == 0 for x in b if x.center != 1550.0)
+            @test all(x.area_substituted == 0.0 for x in b if x.center != 1550.0)
+        end
+
+        @testset "the donor's reference elevation is what the lapse starts from" begin
+            # `extrapolation_above_reanalysis` is the band centre above the highest contributing
+            # surface. The donor sits at 1000 m and the masked cell's own row says 1500 m, so this
+            # separates "lapsed from the donor's surface" (550 m) from "lapsed from the recipient's"
+            # (50 m) without recomputing the adjustment.
+            sub = only(filter(x -> x.center == 1550.0, bands()))
+            @test DimensionalData.metadata(sub.forcing)["extrapolation_above_reanalysis"] ≈ 550.0
+        end
+
+        @testset "the donor's glm is what weights the decoupling" begin
+            # `glm` says how much of the decoupling the reanalysis already applied to *this* series, so
+            # it must follow the forcing rather than the cell that borrowed it. Moving the donor's glm
+            # therefore has to move the substituted band's temperature; the recipient's row is
+            # untouched between these two tables, so a dependence on it could not show up here.
+            #
+            # Two conditions have to hold for `glm` to be observable at all, and both are asserted
+            # below rather than assumed: `k` must not be the identity, since
+            # `_effective_decoupling_factor(1, glm)` is 1 whatever `glm` is, and the band must be above
+            # freezing, since the correction scales `max(T - 273.15, 0)`.
+            half = [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
+                    for b in applied.bands]
+            applied_k = GEMB_GlacierSims.AppliedDownscaling(
+                applied.time, applied.lapse_rate, applied.lapse_rate_source, half,
+                applied.basis, applied.settings)
+            hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
+            hot_hole(c) = c.lon == 10.1 ? masked(c) : hot(c)
+
+            temp(donor_glm) = begin
+                shifted = [c.lon == 10.0 ? merge(c, (; glm = donor_glm)) : c for c in cells]
+                b = collect(elevation_interval_forcing(
+                    _cp_table(shifted), applied_k; climate_model = :synthetic, time_range,
+                    token = nothing, cache_path = nothing, elevation_interval_batch = 0,
+                    forcing_loader = _cp_loader(shifted, hot_hole)))
+                collect(only(filter(x -> x.center == 1550.0, b)).forcing.temperature_air)
+            end
+            @test all(≈(0.5), only(filter(x -> x.center == 1550.0, half)).decoupling_factor)
+            @test all(>(273.15), temp(1.0))
+            @test temp(0.0) != temp(1.0)
+        end
+
+        @testset "donor_max_distance_km = 0 keeps the pre-substitution behaviour" begin
+            b = bands(donor_max_distance_km = 0)
+            # The masked cell's band is dropped, exactly as it is without the feature, and its ice is
+            # named as unrecovered rather than left as the difference between two areas.
+            @test length(b) == 3
+            @test sum(x.area for x in b) ≈ 30.0
+            @test all(x.center != 1550.0 for x in b)
+            @test all(x.n_cells_substituted == 0 for x in b)
+            # Bit-for-bit the same forcing as when every cell is usable, for the bands that were never
+            # masked: the substitution must not perturb a band it does not touch.
+            plain = collect(elevation_interval_forcing(
+                table, applied; climate_model = :synthetic, time_range,
+                token = nothing, cache_path = nothing, elevation_interval_batch = 0,
+                forcing_loader = _cp_loader(cells, warm)))
+            for x in b
+                y = only(filter(p -> p.center == x.center, plain))
+                @test collect(x.forcing.temperature_air) == collect(y.forcing.temperature_air)
+                @test x.area == y.area
+            end
+        end
+
+        @testset "a donor beyond the cap leaves the area unrecovered" begin
+            # 1 km admits nothing: the cells are 7.7 km apart.
+            b = bands(donor_max_distance_km = 1.0)
+            @test length(b) == 3
+            @test all(x.center != 1550.0 for x in b)
+        end
+
+        @testset "a partly masked band keeps the whole band's ice" begin
+            # Two cells in one interval, the second masked. The band survives on the first either way,
+            # so this is the case that loses area *silently* without a donor.
+            shared = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0)]),
+                      (lon = 10.1, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 4.0)])]
+            shared_hole(c) = c.lon == 10.1 ? masked(c) : warm(c)
+            partial(; kwargs...) = only(collect(elevation_interval_forcing(
+                _cp_table(shared), applied; climate_model = :synthetic, time_range,
+                token = nothing, cache_path = nothing, elevation_interval_batch = 0,
+                forcing_loader = _cp_loader(shared, shared_hole), kwargs...)))
+
+            b = partial()
+            @test b.center == 1050.0
+            @test b.area ≈ 14.0
+            @test b.n_cells_substituted == 1
+            @test b.area_substituted ≈ 4.0
+            @test b.area_unrecovered == 0.0
+
+            off = partial(donor_max_distance_km = 0)
+            @test off.area ≈ 10.0
+            @test off.area_unrecovered ≈ 4.0
+        end
+
+        @testset "every cell masked still throws, and says why" begin
+            # No cell of the region has forcing and no donor can be found, so there is nothing to
+            # average and nothing to borrow — the region is genuinely unrunnable.
+            @test_throws "no grid cell in the region yielded usable forcing" collect(
+                elevation_interval_forcing(table, applied; climate_model = :synthetic, time_range,
+                                           token = nothing, cache_path = nothing,
+                                           elevation_interval_batch = 0,
+                                           forcing_loader = _cp_loader(cells, masked)))
+            # The cap is named, because raising it is the remedy when a usable cell exists further out.
+            @test_throws "no donor within 50.0 km had any either" collect(
+                elevation_interval_forcing(table, applied; climate_model = :synthetic, time_range,
+                                           token = nothing, cache_path = nothing,
+                                           elevation_interval_batch = 0,
+                                           forcing_loader = _cp_loader(cells, masked)))
+        end
+
+        @testset "donors may come from outside the area cells" begin
+            # What a tiled sweep does: area over the core, donors over the buffered neighbourhood. The
+            # core's only cell is masked, so the tile runs solely because the buffer reaches a donor.
+            core = _cp_table(cells[2:2])
+            b = only(collect(elevation_interval_forcing(
+                core, applied; climate_model = :synthetic, time_range,
+                token = nothing, cache_path = nothing, elevation_interval_batch = 0,
+                forcing_loader = _cp_loader(cells, hole),
+                donor_cells = table)))
+            @test b.center == 1550.0
+            @test b.area ≈ 10.0
+            @test b.n_cells_substituted == 1
+            # Only the core cell's ice is counted; the donor contributes forcing, never area, or the
+            # buffer's ice would be charged to this tile and to its neighbour.
+            @test b.n_cells == 1
+        end
+
+        @testset "a negative cap is a caller error" begin
+            @test_throws "donor_max_distance_km must be >= 0" elevation_interval_forcing(
+                table, applied; climate_model = :synthetic, time_range,
+                token = nothing, cache_path = nothing, donor_max_distance_km = -1.0)
+        end
+    end
+
     @testset "tile run NetCDF" begin
         run = _fake_tile_run()
         dir = mktempdir()
@@ -2551,6 +2741,36 @@ end
                 held = ds["band_glacier_decoupling_factor_n_fit_held"][:]
                 @test ismissing(held[end])
                 @test held[1] == run.band_provenance[1]["glacier_decoupling_factor_n_fit_held"]
+
+                # The spinup outcome is per run, over the whole grid, because every column spins up on
+                # its own. A single scalar would be one column's history standing for the tile.
+                for key in ("spinup_smb_rate", "spinup_cycles", "spinup_converged")
+                    v = ds[key]
+                    @test size(v) == (length(run.bands), length(run.delta_temperatures),
+                                      length(run.precipitation_scalings))
+                    @test dimnames(v) == ("band", "delta_temperature", "precipitation_scaling")
+                end
+                @test collect(ds["spinup_cycles"][:, :, :]) == run.run_provenance["spinup_cycles"]
+                @test ds["spinup_smb_rate"].attrib["units"] == "m yr-1"
+                @test ds["spinup_cycles"].attrib["units"] == "1"
+                @test occursin("Do not read one element as a property of the tile",
+                               ds["spinup_smb_rate"].attrib["comment"])
+                # A run that produced no output is the fill, not a number.
+                @test ismissing(ds["spinup_smb_rate"][end, end, end])
+                # Flags carry their meaning rather than leaving 0/1 to be guessed.
+                @test ds["spinup_converged"].attrib["flag_meanings"] == "not_converged converged"
+
+                # Exactly one spinup scalar survives, and it is the honest reduction: this fixture has
+                # one unconverged column out of the grid, so the tile is not converged.
+                @test ds.attrib["spinup_converged"] == "false"
+                @test collect(ds["spinup_converged"][:, :, :]) == run.run_provenance["spinup_converged"]
+                # The rest are gone, so no reader can mistake one column's value for the tile's.
+                for gone in ("spinup_smb_rate", "spinup_cycles", "spinup_performed")
+                    @test !haskey(ds.attrib, gone)
+                end
+                # The climatology window stays an attribute: it is constant across runs, and a slot with
+                # no profile has nowhere else to read it from.
+                @test ds.attrib["climatology_window_start"] == "1990-01-01T00:00:00"
             end
         end
 
@@ -2567,9 +2787,30 @@ end
                 @test collect(profile[:dz]) == collect(saved[:dz])
                 @test collect(profile[:density]) == collect(saved[:density])
             end
-            # The spinup provenance is restored onto each profile, so a continuation reports the
-            # spinup it inherited rather than none at all.
-            @test DimensionalData.metadata(first(values(r.profiles)))["spinup_cycles"] == 37
+            # Each profile carries *its own* spinup provenance, not the tile's. `gemb` copies profile
+            # metadata onto the output a continuation produces, so one column's history standing for
+            # every column would put it into the appended record for all of them.
+            for key in [(1, 1, 1), (2, 2, 1)]
+                pm = DimensionalData.metadata(r.profiles[key])
+                @test pm["spinup_cycles"] == run.run_provenance["spinup_cycles"][key...]
+                @test pm["spinup_smb_rate"] == run.run_provenance["spinup_smb_rate"][key...]
+                # The tile-level constants come along too, since the climatology window is not per run.
+                @test pm["climatology_window_start"] == "1990-01-01T00:00:00"
+                # Flags come back in the encoded form the file uses, so re-encoding on append is
+                # idempotent. Run (1,1,1) is the one the fixture marks unconverged.
+                @test pm["spinup_converged"] == (key == (1, 1, 1) ? "false" : "true")
+            end
+            # Two different columns disagree, which is the whole point of storing them per run.
+            @test DimensionalData.metadata(r.profiles[(1, 1, 1)])["spinup_cycles"] !=
+                  DimensionalData.metadata(r.profiles[(2, 2, 1)])["spinup_cycles"]
+            # A slot the run never recorded reads as absent rather than as a number.
+            @test !haskey(DimensionalData.metadata(r.profiles[(1, 1, 1)]), "hypsometry_coverage")
+            # And it survives the second hop, which is what the appender writes back.
+            @test GEMB_GlacierSims._stack_provenance(r.profiles[(2, 2, 1)])["spinup_cycles"] ==
+                  run.run_provenance["spinup_cycles"][2, 2, 1]
+            # File-level provenance is still returned, because a slot with no profile has nothing else
+            # to read the climatology window from.
+            @test r.provenance["climatology_window_start"] == "1990-01-01T00:00:00"
             @test read_glacier_tile_restart(joinpath(dir, "absent.nc")) === nothing
         end
 
@@ -2588,8 +2829,144 @@ end
         end
     end
 
+    @testset "ERA5-Land cell geometry for bare-ice albedo" begin
+        @testset "cell polygon" begin
+            # Native 0-359.9°E in, (-180, 180] out: `bare_ice_albedo` works on the wrapped grid.
+            p = era5_land_cell_polygon(220.5, 60.5)
+            pts = collect(GeoInterface.getpoint(first(GeoInterface.getring(p))))
+            @test length(pts) == 5                       # closed ring: 4 corners + repeat
+            xs = GeoInterface.x.(pts)
+            ys = GeoInterface.y.(pts)
+            @test extrema(xs) == (-139.55, -139.45)
+            @test extrema(ys) == (60.45, 60.55)
+            @test (xs[1], ys[1]) == (xs[end], ys[end])
+            # The wrapped longitude names the same box.
+            q = era5_land_cell_polygon(-139.5, 60.5)
+            @test GeoInterface.x.(collect(GeoInterface.getpoint(first(GeoInterface.getring(q))))) == xs
+
+            # A different grid spacing scales the box, and the size must be real.
+            wide = era5_land_cell_polygon(-139.5, 60.5; cell_size = 0.25)
+            @test extrema(GeoInterface.x.(collect(GeoInterface.getpoint(first(GeoInterface.getring(wide)))))) ==
+                  (-139.625, -139.375)
+            @test_throws "cell_size must be positive" era5_land_cell_polygon(0.0, 0.0; cell_size = 0)
+        end
+
+        @testset "cell key" begin
+            # Native and wrapped longitudes give one key, so a table row and a MODIS centre agree.
+            @test era5_land_cell_key(220.5, 60.5) == era5_land_cell_key(-139.5, 60.5)
+            @test era5_land_cell_key(-139.5, 60.5) == (-1395, 605)
+
+            # The key agrees with the polygon it names: a point inside the box maps to that cell,
+            # a point past the edge maps to the neighbour. This is the property that lets one
+            # tile-wide burn stand in for a burn per cell.
+            for (lon, lat, want) in ((-139.549, 60.549, (-1395, 605)),   # just inside NW
+                                     (-139.451, 60.451, (-1395, 605)),   # just inside SE
+                                     (-139.449, 60.5, (-1394, 605)),     # past the east edge
+                                     (-139.551, 60.5, (-1396, 605)),     # past the west edge
+                                     (-139.5, 60.449, (-1395, 604)),     # past the south edge
+                                     (-139.5, 60.551, (-1395, 606)))     # past the north edge
+                @test era5_land_cell_key(lon, lat) == want
+            end
+
+            # Round trip: the key's own centre lands back on the key.
+            for k in ((-1395, 605), (0, 0), (1799, -899))
+                @test era5_land_cell_key(k[1] * 0.1, k[2] * 0.1) == k
+            end
+            @test_throws "cell_size must be positive" era5_land_cell_key(0.0, 0.0; cell_size = -1)
+        end
+
+        @testset "densified query box" begin
+            # A tile-wide box is queried with a vertex every `step` degrees along its meridian
+            # edges. Without that, projecting into the MODIS sinusoidal grid chords a 2.1° edge and
+            # pulls it ~1.3 km inside the true meridian, dropping cells along the tile's margins.
+            p = GEMB_GlacierSims._bia_densified_box(-142.05, -139.95, 59.95, 62.05, 0.1)
+            pts = collect(GeoInterface.getpoint(first(GeoInterface.getring(p))))
+            xs = GeoInterface.x.(pts)
+            ys = GeoInterface.y.(pts)
+            @test (xs[1], ys[1]) == (xs[end], ys[end])           # closed
+            @test extrema(xs) == (-142.05, -139.95)              # same box as the plain ring
+            @test minimum(ys) ≈ 59.95
+            @test maximum(ys) ≈ 62.05
+            @test Set(xs) == Set([-142.05, -139.95])             # only the two meridians
+            # 2.1° of latitude at 0.1° spacing is 21 segments, so 22 distinct vertices per meridian
+            # edge. Counted distinctly because the west edge also carries the ring-closing repeat of
+            # the first vertex.
+            west = sort(unique(ys[xs .== -142.05]))
+            east = sort(unique(ys[xs .== -139.95]))
+            @test length(west) == 22
+            @test length(east) == 22
+            # Every meridian step is at most `step`, which is what bounds the chord error.
+            @test maximum(diff(west)) <= 0.1 + 1e-9
+            @test maximum(diff(east)) <= 0.1 + 1e-9
+
+            # A box shorter than one step still yields a valid closed ring.
+            small = GEMB_GlacierSims._bia_densified_box(-1.0, 1.0, 0.0, 0.05, 0.1)
+            spts = collect(GeoInterface.getpoint(first(GeoInterface.getring(small))))
+            @test length(spts) >= 4
+            @test (GeoInterface.x(spts[1]), GeoInterface.y(spts[1])) ==
+                  (GeoInterface.x(spts[end]), GeoInterface.y(spts[end]))
+            @test_throws "step must be positive" GEMB_GlacierSims._bia_densified_box(
+                0.0, 1.0, 0.0, 1.0, 0.0)
+        end
+
+        @testset "resolve_albedo_ice" begin
+            # Observed over 2000-2500 m with one bin above GEMB's ceiling, held outside that span,
+            # and one interior bin under min_cells so the fit shows through. Every source is reached
+            # by construction rather than by hoping the data happens to produce it.
+            z = vcat(fill(2050.0, 20), fill(2450.0, 20))
+            a = vcat(fill(0.45, 20), fill(0.70, 20))
+            f = bare_ice_albedo_hyps(a, z, 0:100:10000; extrapolate = :hold)
+
+            @test resolve_albedo_ice(f, 2050; default = 0.48) == (0.45, :observed)
+            # Held from the *fit* at the lowest observed elevation, so this is the fit's value there
+            # rather than the end bin's mean copied verbatim — equal only to rounding.
+            let (v, s) = resolve_albedo_ice(f, 500; default = 0.48)
+                @test v ≈ 0.45
+                @test s === :hold
+            end
+            @test last(resolve_albedo_ice(f, 2250; default = 0.48)) === :fit
+            # 0.70 is a real snow albedo above the ELA, and GEMB will not accept it.
+            @test resolve_albedo_ice(f, 2450; default = 0.48) == (0.6, :clamped)
+            @test resolve_albedo_ice(f, 8000; default = 0.48) == (0.6, :clamped)
+
+            # No profile at all, and a profile that resolves nothing, both fall back to the default.
+            @test resolve_albedo_ice(nothing, 1500; default = 0.48) == (0.48, :default)
+            empty = bare_ice_albedo_hyps([0.4, 0.5], [1000.0, 1200.0], 0:100:3000; min_cells = 3)
+            @test resolve_albedo_ice(empty, 1050; default = 0.33) == (0.33, :default)
+
+            # The default is the caller's, not a constant hidden in here.
+            @test first(resolve_albedo_ice(nothing, 1500; default = 0.31)) == 0.31
+            # And it is clamped too, so this can never hand GEMB a value it refuses.
+            @test resolve_albedo_ice(nothing, 1500; default = 0.9) == (0.6, :clamped)
+            @test resolve_albedo_ice(nothing, 1500; default = 0.05) == (0.2, :clamped)
+
+            # Every result is inside the range GEMB.validate_parameters asserts, whatever is asked.
+            for zz in 0:250:9750, d in (0.2, 0.48, 0.6)
+                v, s = resolve_albedo_ice(f, zz; default = d)
+                @test GEMB_ALBEDO_ICE_RANGE[1] <= v <= GEMB_ALBEDO_ICE_RANGE[2]
+                @test s in BARE_ICE_ALBEDO_SOURCES
+            end
+
+            # An elevation outside the binning has no bin to read, so the default stands.
+            @test last(resolve_albedo_ice(f, 20_000; default = 0.48)) === :default
+            @test last(resolve_albedo_ice(f, NaN; default = 0.48)) === :default
+
+            @test_throws "range must be (low, high) with low < high" resolve_albedo_ice(
+                f, 2050; default = 0.48, range = (0.6, 0.2))
+            @test_throws "default albedo_ice must be finite" resolve_albedo_ice(
+                f, 2050; default = NaN)
+        end
+
+        @testset "a tile that owns nothing is a caller error" begin
+            empty_tile = (; name = "N00_E000.nc", bounds = tile_bounds((0, 0)),
+                          core = DataFrame(longitude = Float64[], latitude = Float64[]))
+            @test_throws "owns no cells" bare_ice_albedo_tile(empty_tile, nothing)
+        end
+    end
+
     # Note: end-to-end simulation tests need CDS API credentials and network access to the
-    # Copernicus DEM, so the runfile builder, `gemb_glacier_cell` and `gemb_glacier_tile` are
-    # exercised by `src/era5_example.jl`, `scripts/derive_downscaling_parameters_e2e.jl` and
-    # `scripts/gemb_tile_e2e.jl` rather than here.
+    # Copernicus DEM, so the runfile builder, `gemb_glacier_cell`, `gemb_glacier_tile` and
+    # `bare_ice_albedo_tile` are exercised by `src/era5_example.jl`,
+    # `scripts/derive_downscaling_parameters_e2e.jl`, `scripts/gemb_tile_e2e.jl` and
+    # `scripts/derive_bare_ice_albedo_tile.jl` rather than here.
 end

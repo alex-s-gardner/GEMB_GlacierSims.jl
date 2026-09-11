@@ -30,6 +30,10 @@ using Dates
 using Extents
 import GeoInterface
 import GeometryOps as GO
+# `setproperties` is how a band's `albedo_ice` is set: `GEMB.ModelParameters` is an immutable
+# `@kwdef` struct with a derived field, so it cannot be rebuilt field-by-field through
+# `initialize_parameters`.
+import ConstructionBase
 import Tables
 import NCDatasets
 # The sweep's summary and point->tile index are plain tables with no geometry column, so they are
@@ -38,6 +42,7 @@ import GeoParquet
 import GeoParquet.Parquet2
 
 include("util.jl")
+export claim_tile!, claim_order, weight_balanced_blocks
 export era5_land_invariant, wrap_lon, forcing_at_elevation
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
@@ -48,6 +53,24 @@ export reference_discharge_rate, discharge_corrected_volume_change
 
 include("glacier_elevation_class.jl")
 export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypsometry
+
+# Observed bare-ice albedo binned by elevation. GEMB_ClimateForcing's job ends at the per-cell pooled
+# albedo `bare_ice_albedo` returns; both halves of the elevation reduction live here, because the
+# binning is this package's — it is the glacier hypsometry.
+#
+# `_hyps` bins a set of (albedo, elevation) pairs into a callable best estimate; `_cells` knows what
+# an ERA5-Land cell is, pools a tile's cells into one profile, and resolves that onto an elevation
+# class. Must follow glacier_elevation_class.jl, whose hypsometry decoder `_cells` reads, and precede
+# applied_downscaling.jl, which resolves a band's `albedo_ice` through it. `bare_ice_albedo` and
+# `bare_ice_albedo_points` are re-exported so a caller need not know which package holds which piece.
+include("bare_ice_albedo_hyps.jl")
+include("bare_ice_albedo_cells.jl")
+export era5_land_cell_polygon, era5_land_cell_key, bare_ice_albedo_tile
+export derive_bare_ice_albedo, resolve_albedo_ice
+export BARE_ICE_ALBEDO_SOURCES, GEMB_ALBEDO_ICE_RANGE
+export bare_ice_albedo_source_code, bare_ice_albedo_source_name
+export bare_ice_albedo, bare_ice_albedo_points, bare_ice_albedo_hyps, BareIceAlbedoHyps
+export AlbedoElevationFit, bare_ice_albedo_source, bare_ice_albedo_table
 
 include("glacier_run.jl")
 export glacier_hypsometry_coverage, glacier_area_total, glacier_area_column,

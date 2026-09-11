@@ -2,6 +2,12 @@
 # per-bin adjustment, the sweep driver, and the interval aggregation's gap fill cannot drift apart.
 const _DEFAULT_LAPSE_RATE = 6.5
 
+# Fallback bare-ice albedo for an elevation class the observations cannot resolve, matching GEMB's
+# own `ModelParameters` default. Restated here rather than read from GEMB because `resolve_downscaling`
+# resolves a tile without ever being handed a `ModelParameters`; a caller who tuned `albedo_ice` should
+# pass `mp.albedo_ice` as `albedo_ice_default` so their value is what the gaps fall back to.
+const _DEFAULT_ALBEDO_ICE = 0.48
+
 # Is this exception a broken *caller* rather than a bad cell?
 #
 # A typo, an undefined name, a stale session whose loaded package predates a function being called, a
@@ -125,6 +131,29 @@ end
 # while both stayed finite and in-domain, so the drift would be invisible.
 _effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)
 
+# How far a cell that carries ice but no forcing of its own may borrow a neighbour's, by default:
+# about four to five ERA5-Land cells (the grid is 0.1°, ~11 km). Loose enough to reach the nearest
+# land cell on an Antarctic or Arctic-archipelago coast, where a masked cell's neighbours are often
+# 20–40 km away, and tight enough that a donor still shares the synoptic regime. Every substitution
+# records its actual distance, so a stricter screen can be applied afterwards without re-running.
+# Consumed by `elevation_interval_forcing`.
+const _DONOR_MAX_DISTANCE_KM_DEFAULT = 50.0
+
+# Great-circle distance between two points, km, on a sphere of the mean Earth radius.
+#
+# Longitudes need no seam handling and no `wrap_lon`: the formula uses `sin(Δλ/2)^2`, which is
+# unchanged by adding 360° to Δλ, so the table's native 0–359.9°E values give the same distance as
+# the (-180, 180] convention would. The tiler next door does need explicit seam logic (`_lon_delta`)
+# because membership in a longitude interval is not periodic in the same way.
+function _haversine_km(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
+    R = 6371.0088                       # mean Earth radius, km
+    φ1, φ2 = deg2rad(lat1), deg2rad(lat2)
+    Δφ = φ2 - φ1
+    Δλ = deg2rad(lon2 - lon1)
+    a = sin(Δφ / 2)^2 + cos(φ1) * cos(φ2) * sin(Δλ / 2)^2
+    return 2R * asin(min(1.0, sqrt(a)))
+end
+
 # --- output file naming -------------------------------------------------------------------------
 #
 # Per-cell and per-tile output files are named by position, so a file is traceable to what it
@@ -237,4 +266,101 @@ function parse_tile_index(path::AbstractString)
     m === nothing && return nothing
     return (parse(Int, m[4]) * (m[3] == "W" ? -1 : 1),
             parse(Int, m[2]) * (m[1] == "S" ? -1 : 1))
+end
+
+"""
+    claim_tile!(claim_dir, tile_name, output_path; stale_after = Hour(24)) -> Bool
+
+Take ownership of a tile for this process, or report that another already has it.
+
+`mkdir` is atomic on POSIX — exactly one caller can create a given name — so a directory per tile is a
+whole mutual exclusion mechanism with no lock server, no shared file to corrupt, and nothing to clean up
+beyond the directory. That is what lets a sweep run as N independent processes that steal work from each
+other rather than being handed a fixed partition up front, which matters when per-tile cost is not
+predictable in advance.
+
+A claim left behind by a process that died would drop its tile from the sweep silently, so a claim older
+than `stale_after` whose tile still has no output is reclaimed: removed and re-created, the re-creation
+deciding the winner if two callers race. `stale_after` must exceed the longest a single tile can
+legitimately take, because reclaiming a *running* tile would put two writers on one output file — hence
+hours rather than minutes, and hence the output file being checked first. `stale_after <= 0` disables
+reclaiming.
+"""
+function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
+                     output_path::AbstractString; stale_after::Period = Hour(24))
+    path = joinpath(claim_dir, tile_name)
+    try
+        mkdir(path)
+        return true
+    catch err
+        err isa Base.IOError || rethrow()
+    end
+
+    stale_after <= Hour(0) && return false
+    isfile(output_path) && return false            # finished, not abandoned
+    age = try
+        Millisecond(round(Int, (time() - mtime(path)) * 1000))
+    catch
+        return false                               # vanished under us: another caller owns it
+    end
+    age > stale_after || return false
+
+    @warn "Reclaiming a stale tile claim" tile=tile_name age=canonicalize(age)
+    try
+        rm(path; force = true, recursive = true)
+        mkdir(path)                                # atomic: only one reclaimer wins
+        return true
+    catch err
+        err isa Base.IOError || rethrow()
+        return false
+    end
+end
+
+"""
+    weight_balanced_blocks(w, k) -> Vector{UnitRange{Int}}
+
+Split `1:length(w)` into `k` contiguous ranges of as near equal total weight as the item granularity
+allows, by closing each range as the running total crosses its share.
+
+Ranges may be empty when `k` exceeds the number of non-zero weights, so callers must tolerate an empty
+block. Contiguous rather than scattered because the tile lists these partition are ordered by forcing
+chunk: neighbours share cached cells, and a modulo split would make each process miss what another
+already holds.
+"""
+function weight_balanced_blocks(w, k::Int)
+    total = sum(w)
+    blocks = UnitRange{Int}[]
+    lo = 1
+    acc = zero(eltype(w))
+    for i in eachindex(w)
+        acc += w[i]
+        if length(blocks) < k - 1 && acc >= total * (length(blocks) + 1) / k
+            push!(blocks, lo:i)
+            lo = i + 1
+        end
+    end
+    push!(blocks, lo:length(w))
+    return blocks
+end
+
+"""
+    claim_order(weights, block, n_blocks) -> Vector{Int}
+
+The order a worker should try to claim tiles in: its own contiguous weight-balanced block first, then
+everything else heaviest-first.
+
+Affinity first keeps a worker's run spatially coherent, which is what the chunk ordering buys. Stealing
+afterwards removes the tail a static partition cannot: a worker that finishes early takes the heaviest
+tile still unclaimed instead of idling, and heaviest-first (longest-processing-time-first) is what keeps
+the last tile started small.
+"""
+function claim_order(weights, block::Int, n_blocks::Int)
+    n_blocks >= 1 || throw(ArgumentError("n_blocks must be at least 1, got $n_blocks"))
+    1 <= block <= n_blocks ||
+        throw(ArgumentError("block must be in 1..$n_blocks, got $block"))
+    n_blocks == 1 && return collect(eachindex(weights))
+    mine = weight_balanced_blocks(weights, n_blocks)[block]
+    rest = setdiff(eachindex(weights), mine)
+    sort!(rest; by = i -> weights[i], rev = true)
+    return vcat(collect(mine), rest)
 end

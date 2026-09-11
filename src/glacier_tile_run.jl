@@ -47,8 +47,14 @@ Result of [`gemb_glacier_tile`](@ref) for one 2° tile.
   mass from the fluxes — never one from the other, since height carries the firn compaction term.
 - `profiles`: `Array{Union{Nothing,DimStack},3}` indexed `(band, delta_temperature,
   precipitation_scaling)`, the final firn column of each run, for restart.
-- `provenance`: the `spinup_*`/`climatology_*` keys `gemb` attached, plus the downscaling settings and
-  per-band parameter source counts.
+- `run_provenance`: `String => Array{Float64,3}` indexed `(band, delta_temperature,
+  precipitation_scaling)`, the numeric `spinup_*`/`climatology_*` outcome of each run. Every column
+  spins up on its own, so these differ across the grid by more than an order of magnitude and no scalar
+  stands for the tile. `NaN` where a run produced no output or did not record the key. Booleans are
+  stored as `0.0`/`1.0`.
+- `provenance`: the tile-level aggregates, the `spinup_*`/`climatology_*` keys that are constant across
+  runs, and `spinup_converged` reduced with `all` — plus the downscaling settings and per-band parameter
+  source counts.
 - `parameters`: the settings that define how the tile was run, checked against on restart.
 """
 struct GlacierTileRun
@@ -66,6 +72,7 @@ struct GlacierTileRun
     totals::Dict{Symbol,Array{Float64,3}}
     profiles::Array{Union{Nothing,DimStack},3}
     band_provenance::Vector{Dict{String,Any}}
+    run_provenance::Dict{String,Array{Float64,3}}
     parameters::Dict{String,Any}
     provenance::Dict{String,Any}
 end
@@ -128,22 +135,37 @@ published 2° products exclude rain from their aggregates.
 
 # Keywords
 - `delta_temperatures = [0.0]`, `precipitation_scalings = [1.0]`: the perturbation grid.
-- `spinup_window`: `(start, stop)` averaged into the repeating climatological year each band is spun up
-  on. Defaults to the first 30 complete years of the band forcing.
-- `max_iterations`: spinup cycle ceiling, passed to `gemb_spinup`.
+- `spinup_window`: `(start, stop)` the repeating spinup cycle is built from, by
+  `SPINUP_CLIMATOLOGY_METHOD` (`:representative`, a block of `SPINUP_CLIMATOLOGY_N_YEARS` real years).
+  Defaults to the first 30 complete years of the band forcing, but a sweep should fix it: tying it to the
+  record means extending the record changes the spinup, and an appended segment then does not continue
+  the record it is appended to.
+- `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to
+  `gemb_spinup`, which divides by the measured cycle length to get its own cycle ceiling.
 - `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
   when the least-squares slope of firn air content against cycle, over the trailing `drift_window`
-  cycles, falls below `convergence_drift_fac` metres per cycle. Equilibrium is the absence of a trend,
+  cycles, falls below `convergence_drift_fac` metres per *year* (scaled to the cycle internally). Equilibrium is the absence of a trend,
   which a step between consecutive cycles does not measure: a step test passes a column still drifting
   steadily, and fails a settled column whose jitter exceeds it. Converted per band into the mean-density
   drift `gemb_spinup` tests, exactly, because the column depth is pinned
   ([`convergence_density_from_fac`](@ref)). Note `gemb_spinup` cannot judge a slope until it has
   `drift_window` samples and will not exit by abstention, so that is also the minimum cycle count. The
   default is sized for mountain-glacier firn; a dry ice-sheet plateau relaxes more slowly and changes by
-  centimetres per year, and needs 1e-4 or tighter with `max_iterations` at 200 or above.
+  centimetres per year, and needs 1e-4 or tighter with `simulation_years_maximum` raised to match.
 - `threaded = true`: run the (band × delta × scaling) simulations on all available threads. Each is
   independent, and the area-weighted reduction happens afterwards in a fixed index order, so the
   threaded result is identical to the serial one including bit-for-bit totals.
+- `donor_max_distance_km = nothing`: the cap `band_forcing` was built under, recorded in the run
+  parameters. It changes nothing here — the substitution happens in
+  [`elevation_interval_forcing`](@ref), and these bands no longer know which cells borrowed — but two
+  runs under different caps rest on different forcing and must not compare as the same experiment.
+- `restart = nothing`: the value [`read_glacier_tile_restart`](@ref) returns, or `nothing`. Each run
+  inherits its saved column and the spinup is skipped; the forcing is trimmed to the steps after the
+  saved time, so pass only the new forcing rather than refetching the record. Throws
+  [`ForcingUpToDate`](@ref) when fewer than `$(MIN_FORCING_STEPS)` new steps remain, and
+  `RestartParameterMismatch` when the saved run parameters disagree with this call's.
+- `force_restart = false`: append even across a run-parameter disagreement, warning instead of throwing.
+  The record before the seam then does not reflect the new parameters.
 - `on_output = nothing`: called as `on_output(output; band, delta, pscale)` with each simulation's full
   output stack, for inspection. Called from inside the task, so with `threaded = true` it runs
   concurrently and in an unspecified order.
@@ -155,10 +177,13 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            delta_temperatures = [0.0],
                            precipitation_scalings = [1.0],
                            spinup_window = nothing,
-                           max_iterations::Int = 1000,
+                           simulation_years_maximum::Real = 1000,
                            convergence_drift_fac = SPINUP_DRIFT_FAC,
                            drift_window::Int = SPINUP_DRIFT_WINDOW,
                            threaded::Bool = true,
+                           donor_max_distance_km = nothing,
+                           restart = nothing,
+                           force_restart::Bool = false,
                            on_output = nothing)
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
@@ -191,8 +216,36 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
 
     window = spinup_window === nothing ?
              _default_spinup_window(first(bands).forcing) : spinup_window
-    parameters = tile_run_parameters(mp, applied; spinup_window = window, max_iterations,
-                                     convergence_drift_fac, drift_window)
+    parameters = tile_run_parameters(mp, applied; spinup_window = window, simulation_years_maximum,
+                                     convergence_drift_fac, drift_window, donor_max_distance_km,
+                                     climatology_method = SPINUP_CLIMATOLOGY_METHOD,
+                                     climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS)
+
+    # Resuming: keep only forcing newer than the saved state, and let each run inherit its saved column
+    # instead of spinning up again. The saved time is the last *output* time, and every forcing step up to
+    # and including it has already been consumed.
+    #
+    # A continuation is expected to have fetched only the new steps, so the spinup window will usually not
+    # be present in this forcing at all. That is fine while every run has a saved profile, and
+    # `_spinup_climatology` throws `SpinupWindowUnavailable` naming the window if one does not — which is
+    # the honest outcome, since the alternative is spinning one band up on a different climate than the
+    # rest of the file and saying nothing.
+    if restart !== nothing
+        _validate_tile_restart(restart, bands, delta_temperatures, precipitation_scalings)
+        # Checked before the timestep subset, so a parameter change is reported as such rather than
+        # masked by a `ForcingUpToDate` from a record that was never extended.
+        _validate_restart_parameters(restart, parameters; force_restart, what = "tile")
+        bands = _bands_after(bands, restart.time)
+        n_new = length(dims(first(bands).forcing, Ti))
+        n_new >= MIN_FORCING_STEPS || throw(ForcingUpToDate(restart.time, n_new))
+        @info "Resuming tile from saved profiles" restart_time=restart.time new_steps=n_new bands=n_band
+    end
+
+    # The bare-ice albedo each band runs at, matched to `applied.bands` by elevation edges rather
+    # than by position: `_runnable_bands` and `_bands_after` both reshape `bands`, so an index into
+    # one is not an index into the other. A band the resolution does not cover keeps `mp`'s own
+    # albedo, which is the same fallback `resolve_albedo_ice` applies.
+    band_albedo = _band_albedo_ice(applied, bands, mp.albedo_ice)
 
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
@@ -214,19 +267,33 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         adjusted = precipitation_adjust(temperature_adjust(band.forcing, delta), pscale)
         cf = initialize_forcing(adjusted)
 
-        cf_spinup = _spinup_climatology(cf, window)
-        # The depth is fixed by the initial profile, so the firn-air tolerance can only be converted
-        # into the density one `gemb_spinup` tests once that profile exists.
-        initial = initialize_profile(mp, cf_spinup)
-        # The FAC trend is the *only* convergence criterion. `convergence_delta_density` is passed
-        # explicitly as `nothing` rather than left out, so that the single-criterion design is visible
-        # here and not mistaken for an omission: a step between consecutive cycles both passes a column
-        # that is still drifting and fails a settled one whose jitter exceeds it.
-        profile = gemb_spinup(initial, cf_spinup, mp; max_iterations, drift_window,
-                              convergence_delta_density = nothing,
-                              convergence_drift_density = _spinup_drift_tolerance(
-                                  initial, mp, convergence_drift_fac))
-        output = gemb(profile, cf, mp)
+        # The band's own bare-ice albedo. Built per task, so concurrent tasks never share it, and
+        # used for the spinup as well as the run: a column spun up at one ice albedo and then run at
+        # another starts from a state the run's own physics would not have produced.
+        mp_band = _with_albedo_ice(mp, band_albedo[i_band])
+
+        # A saved column is the point of a restart: it carries the spun-up state forward, so the spinup
+        # is skipped rather than repeated over a window this forcing may not even contain.
+        profile = restart === nothing ? nothing :
+                  get(restart.profiles, (i_band, i_dt, i_ps), nothing)
+
+        if profile === nothing
+            restart === nothing ||
+                @warn "No saved profile for this run; spinning up over the tile's spinup window" band=band.center delta pscale window
+            cf_spinup = _spinup_climatology(cf, window, mp_band)
+            # The depth is fixed by the initial profile, so the firn-air tolerance can only be converted
+            # into the density one `gemb_spinup` tests once that profile exists.
+            initial = initialize_profile(mp_band, cf_spinup)
+            # The FAC trend is the *only* convergence criterion. `convergence_delta_density` is passed
+            # explicitly as `nothing` rather than left out, so that the single-criterion design is visible
+            # here and not mistaken for an omission: a step between consecutive cycles both passes a column
+            # that is still drifting and fails a settled one whose jitter exceeds it.
+            profile = gemb_spinup(initial, cf_spinup, mp_band; simulation_years_maximum, drift_window,
+                                  convergence_delta_density = nothing,
+                                  convergence_drift_density = _spinup_drift_tolerance(
+                                      initial, cf_spinup, mp_band, convergence_drift_fac))
+        end
+        output = gemb(profile, cf, mp_band)
 
         if length(dims(output, Ti)) == 0
             @warn "GEMB produced no output for this run; dropping band" band=band.center delta pscale
@@ -275,6 +342,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     out_time = DateTime[]
     bands_series = Dict{Symbol,Array{Float64,4}}()
     provenance = Dict{String,Any}()
+    run_provenance = Dict{String,Array{Float64,3}}()
     shallow_base = Int[]
 
     for res in results
@@ -284,12 +352,12 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...)
                 bands_series[v] = zeros(length(out_time), n_band, n_dt, n_ps)
             end
-            merge!(provenance, res.provenance)
         elseif res.time != out_time
             throw(ErrorException(
                 "output time axis differs between bands of the same tile (band " *
                 "$(bands[res.i_band].center) m); cannot aggregate"))
         end
+        _collect_run_provenance!(run_provenance, provenance, res, parameters, (n_band, n_dt, n_ps))
         res.base_at_ice_density || push!(shallow_base, res.i_band)
         for (v, values) in res.series
             @views bands_series[v][:, res.i_band, res.i_dt, res.i_ps] .= values
@@ -316,19 +384,71 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     provenance["glacier_area_km2"] = sum(band_areas)
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
     provenance["max_dh_residual"] = maximum(abs, bands_series[:dh_residual])
+    # How much of this tile's forcing was borrowed from a neighbouring cell, because the cell holding
+    # the ice falls outside the reanalysis land mask, and from how far away the furthest loan came.
+    # `unrecovered` is ice no cell could supply forcing for at all: it is *not* in `glacier_area_km2`,
+    # so a total computed from this tile understates its hypsometry by that much.
+    provenance["n_cells_substituted"] = sum(Int(b.n_cells_substituted) for b in bands)
+    provenance["substituted_area_km2"] = sum(Float64(b.area_substituted) for b in bands)
+    provenance["unrecovered_area_km2"] = sum(Float64(b.area_unrecovered) for b in bands)
+    provenance["max_donor_distance_km"] = maximum(Float64(b.max_donor_distance_km) for b in bands)
     # Ice this tile holds but did not model, so the gap between the tile's totals and its hypsometry is
     # a recorded number rather than something a reader has to notice. Zero on a tile whose every band
     # was runnable, which is the common case.
     provenance["n_bands_dropped"] = length(dropped)
     provenance["dropped_area_km2"] = isempty(dropped) ? 0.0 : sum(d.area for d in dropped)
+    # One tile-level convergence verdict, and the only spinup outcome reduced to a scalar: a tile is
+    # settled when every one of its columns is, so this is `all` and not a sample. The per-run detail is
+    # in `run_provenance["spinup_converged"]`, which is where a reader finds *which* column failed. A
+    # `NaN` slot is a run that produced no output rather than one that failed to settle — those are
+    # counted by `n_bands_dropped` — so it does not make the tile unconverged.
+    if haskey(run_provenance, "spinup_converged")
+        flags = run_provenance["spinup_converged"]
+        provenance["spinup_converged"] = all(f -> isnan(f) || f == 1.0, flags)
+    end
 
     return GlacierTileRun(
         tile.index, tile.name, geotile_id(tile.bounds), tile.bounds,
         nrow(tile.core), length(applied.bands),
         [(; b.lo, b.hi, b.center, area = Float64(b.area), n_cells = Int(b.n_cells)) for b in bands],
         delta_temperatures, precipitation_scalings, out_time,
-        bands_series, totals, profiles, band_provenance, parameters, provenance,
+        bands_series, totals, profiles, band_provenance, run_provenance, parameters, provenance,
     )
+end
+
+# Sort one run's `spinup_*`/`climatology_*` provenance into the per-run arrays and the tile-level
+# constants.
+#
+# Three cases, in this order. A key that is a *setting* — listed in `parameters`, and so compared by
+# `tile_run_disposition` — is already a global and is left alone; `gemb` echoes several of those back on
+# its output, so they arrive here mixed in with the outcomes. What remains and is numeric is a per-run
+# outcome: every column spins up independently, so it gets a slot at its own `(band, delta_temperature,
+# precipitation_scaling)`. What remains and is not numeric describes the climatology the whole tile was
+# built on, so it stays a scalar — and disagreeing across runs would mean flattening something that is
+# genuinely per-run, which throws rather than keeping whichever value landed last.
+function _collect_run_provenance!(run_provenance, provenance, res, parameters, dims::NTuple{3,Int})
+    for (key, value) in res.provenance
+        haskey(parameters, key) && continue
+        # `Bool <: Real`, so this covers the convergence flags; `nothing` is not `Real` and falls through
+        # to the scalar branch, where the writer omits it as it does today.
+        if value isa Real
+            slots = get!(() -> fill(NaN, dims), run_provenance, key)
+            slots[res.i_band, res.i_dt, res.i_ps] = Float64(value)
+            # A key some runs report as a number and others as `nothing` belongs to the per-run array
+            # alone, or it would also stand as a scalar with one run's value.
+            delete!(provenance, key)
+        elseif haskey(run_provenance, key)
+            continue                      # numeric for some other run; the array owns it
+        elseif haskey(provenance, key)
+            provenance[key] == value || throw(ErrorException(
+                "provenance key $key differs between runs of the same tile ($(provenance[key]) vs " *
+                "$value) but is not numeric, so it cannot be stored per run; make it numeric or " *
+                "stop varying it"))
+        else
+            provenance[key] = value
+        end
+    end
+    return nothing
 end
 
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
@@ -441,7 +561,9 @@ function _band_provenance(band)
     meta = DimensionalData.metadata(band.forcing)
     keep = ("extrapolation_above_reanalysis", "temperature_lapse_rate",
             "glacier_decoupling_factor_mean", "glacier_decoupling_factor_n_fit_held",
-            "glacier_decoupling_factor_n_fit_in_domain", "n_timesteps_above_freezing")
+            "glacier_decoupling_factor_n_fit_in_domain", "n_timesteps_above_freezing",
+            "n_grid_cells_substituted", "substituted_area", "max_donor_distance_km",
+            "unrecovered_area")
     prov = Dict{String,Any}(k => meta[k] for k in keep if haskey(meta, k))
     for source in DOWNSCALING_SOURCES
         for key in ("glacier_decoupling_factor_n_$source",
@@ -468,21 +590,54 @@ resolved their lapse rate differently are different experiments, and a file that
 model parameters could not tell them apart.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
-                             max_iterations = nothing, convergence_drift_fac = nothing,
-                             drift_window = nothing)
+                             simulation_years_maximum = nothing, convergence_drift_fac = nothing,
+                             drift_window = nothing, donor_max_distance_km = nothing,
+                             climatology_method = nothing, climatology_n_years = nothing)
     params = Dict{String,Any}("spinup_window_start" => string(spinup_window[1]),
                               "spinup_window_stop" => string(spinup_window[2]))
     # How the columns were settled. Two runs that spun up to different tolerances, or under different
     # ceilings, are different experiments — and with a hard ceiling "converged" and "ran out of cycles"
     # are the same outcome unless the ceiling is on record.
-    max_iterations === nothing || (params["spinup_max_iterations"] = max_iterations)
+    simulation_years_maximum === nothing ||
+        (params["spinup_simulation_years_maximum"] = Float64(simulation_years_maximum))
     convergence_drift_fac === nothing ||
         (params["spinup_convergence_drift_fac"] = Float64(convergence_drift_fac))
     drift_window === nothing || (params["spinup_drift_window"] = drift_window)
+    # How the cycle was built from that window. `:average` and `:representative` produce columns
+    # equilibrated to different climates — averaging removes most of the melt — so this is a setting and
+    # not provenance, and a run that changes it must not compare as current against one that did not.
+    climatology_method === nothing ||
+        (params["spinup_climatology_method"] = string(climatology_method))
+    climatology_n_years === nothing ||
+        (params["spinup_climatology_n_years"] = Int(climatology_n_years))
+    # How far a masked cell was allowed to borrow forcing (see `elevation_interval_forcing`). Two runs
+    # under different caps rest on different forcing for the same cells, so they are not the same
+    # experiment even though every model parameter matches.
+    donor_max_distance_km === nothing ||
+        (params["forcing_donor_max_distance_km"] = Float64(donor_max_distance_km))
     merge!(params, applied.settings)
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
+    end
+    # The bare-ice albedo each band was actually run at, which `model_albedo_ice` cannot express —
+    # that field is now only the fallback for a band the observations did not resolve. Recorded as
+    # the whole vector so re-deriving the albedo product invalidates a restart, as it must: the same
+    # forcing under a different `albedo_ice` per band is a different experiment.
+    #
+    # Only when the resolution actually had a profile. Without one every band runs at `mp.albedo_ice`
+    # exactly as before, and a tile written then must still compare as current.
+    if get(applied.settings, "downscaling_bare_ice_albedo_available", false) === true
+        albedo = _band_albedo_ice(applied, applied.bands, mp.albedo_ice)
+        if !isempty(albedo)
+            params["applied_bare_ice_albedo"] = albedo
+            # Where each of those came from, so a finished file answers "which classes were measured
+            # and which fell back" without the downscaling tile it was derived from. Codes, with the
+            # vocabulary stored beside them, since a NetCDF attribute holds no symbols.
+            params["applied_bare_ice_albedo_source"] = _band_albedo_source(applied, applied.bands)
+            params["applied_bare_ice_albedo_source_meanings"] =
+                join(BARE_ICE_ALBEDO_SOURCES, " ")
+        end
     end
     return params
 end
