@@ -2829,6 +2829,58 @@ end
         end
     end
 
+    @testset "tile claim and work splitting" begin
+        @testset "weight_balanced_blocks returns exactly k blocks that partition the items" begin
+            # The count invariant is what `claim_order` indexes on. The crossing rule can run out of
+            # items before opening k-1 ranges, so short shapes are the interesting ones.
+            for (w, k) in ((Float64[], 1), (Float64[], 4), ([1.0], 1), ([1.0], 3),
+                           ([1.0, 1.0], 4), (fill(1.0, 3), 3), (zeros(5), 4),
+                           (fill(1.0, 7), 4), (Float64[1:120;], 40))
+                b = weight_balanced_blocks(w, k)
+                @test length(b) == k
+                # Contiguous, in order, nothing dropped or double-counted.
+                @test vcat(collect.(b)...) == collect(1:length(w))
+            end
+            # Two equal weights over four blocks: two singletons then two empties, not three ranges.
+            @test weight_balanced_blocks([1.0, 1.0], 4) == [1:1, 2:2, 3:2, 3:2]
+            @test_throws "k must be at least 1" weight_balanced_blocks([1.0], 0)
+        end
+
+        @testset "claim_order covers every tile, affinity block first" begin
+            w = Float64[5, 1, 9, 3, 7, 2]
+            # One block is the degenerate case: plain order, no stealing.
+            @test claim_order(w, 1, 1) == collect(1:6)
+            for k in 1:6, blk in 1:k
+                o = claim_order(w, blk, k)
+                @test sort(o) == collect(1:6)          # every tile is reachable
+                mine = weight_balanced_blocks(w, k)[blk]
+                @test o[1:length(mine)] == collect(mine)   # own block drained first
+                stolen = o[length(mine) + 1:end]
+                @test issorted(w[stolen]; rev = true)      # then heaviest-first
+            end
+            # A block index past the split is a caller error, not a BoundsError from inside.
+            @test_throws "block must be in 1..3" claim_order(w, 4, 3)
+            @test_throws "n_blocks must be at least 1" claim_order(w, 1, 0)
+        end
+
+        @testset "claim_tile! is mutually exclusive, and reclaims only abandoned work" begin
+            dir = mktempdir()
+            out = joinpath(dir, "tile.nc")
+            @test claim_tile!(dir, "t1", out) == true     # first caller wins
+            @test claim_tile!(dir, "t1", out) == false     # second is refused
+            @test claim_tile!(dir, "t2", out) == true      # a different tile is independent
+            # `stale_after <= 0` disables reclaiming outright.
+            @test claim_tile!(dir, "t1", out; stale_after = Hour(0)) == false
+            # A finished tile is never reclaimed, however old its claim looks.
+            touch(out)
+            @test claim_tile!(dir, "t1", out; stale_after = Millisecond(1)) == false
+            # With no output it is abandoned, and reclaimable once past the bound.
+            rm(out)
+            sleep(0.05)
+            @test claim_tile!(dir, "t1", out; stale_after = Millisecond(1)) == true
+        end
+    end
+
     @testset "ERA5-Land cell geometry for bare-ice albedo" begin
         @testset "cell polygon" begin
             # Native 0-359.9°E in, (-180, 180] out: `bare_ice_albedo` works on the wrapped grid.

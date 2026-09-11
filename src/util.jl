@@ -322,12 +322,17 @@ end
 Split `1:length(w)` into `k` contiguous ranges of as near equal total weight as the item granularity
 allows, by closing each range as the running total crosses its share.
 
-Ranges may be empty when `k` exceeds the number of non-zero weights, so callers must tolerate an empty
-block. Contiguous rather than scattered because the tile lists these partition are ordered by forcing
-chunk: neighbours share cached cells, and a modulo split would make each process miss what another
-already holds.
+**Always exactly `k` ranges**, so `blocks[i]` is in bounds for every `i in 1:k`. Ranges may be empty
+when `k` exceeds the number of items the crossing rule can separate — two equal weights split into
+four blocks yields two singletons and two empties — so callers must tolerate an empty block, but never
+a missing one.
+
+Contiguous rather than scattered because the tile lists these partition are ordered by forcing chunk:
+neighbours share cached cells, and a modulo split would make each process miss what another already
+holds.
 """
 function weight_balanced_blocks(w, k::Int)
+    k >= 1 || throw(ArgumentError("k must be at least 1, got $k"))
     total = sum(w)
     blocks = UnitRange{Int}[]
     lo = 1
@@ -340,6 +345,14 @@ function weight_balanced_blocks(w, k::Int)
         end
     end
     push!(blocks, lo:length(w))
+    # The crossing rule closes a range only when the running total reaches the next share, so it can
+    # run out of items before it has opened `k - 1` of them: two equal weights over four blocks closes
+    # twice and leaves two short. Padding past the end keeps the count exactly `k`, which is what lets
+    # `claim_order` index by block number without a bounds check of its own.
+    n = length(w)
+    while length(blocks) < k
+        push!(blocks, n + 1:n)
+    end
     return blocks
 end
 
