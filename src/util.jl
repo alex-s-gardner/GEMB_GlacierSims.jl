@@ -139,20 +139,13 @@ _effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)
 # Consumed by `elevation_interval_forcing`.
 const _DONOR_MAX_DISTANCE_KM_DEFAULT = 50.0
 
-# Great-circle distance between two points, km, on a sphere of the mean Earth radius.
+# `_haversine_km` is borrowed from GEMB_ClimateForcing (see the import in GEMB_GlacierSims.jl) rather
+# than reimplemented: it is one formula on one Earth radius, and two copies would be free to drift.
 #
-# Longitudes need no seam handling and no `wrap_lon`: the formula uses `sin(Δλ/2)^2`, which is
-# unchanged by adding 360° to Δλ, so the table's native 0–359.9°E values give the same distance as
-# the (-180, 180] convention would. The tiler next door does need explicit seam logic (`_lon_delta`)
-# because membership in a longitude interval is not periodic in the same way.
-function _haversine_km(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
-    R = 6371.0088                       # mean Earth radius, km
-    φ1, φ2 = deg2rad(lat1), deg2rad(lat2)
-    Δφ = φ2 - φ1
-    Δλ = deg2rad(lon2 - lon1)
-    a = sin(Δφ / 2)^2 + cos(φ1) * cos(φ2) * sin(Δλ / 2)^2
-    return 2R * asin(min(1.0, sqrt(a)))
-end
+# Longitudes need no seam handling and no `wrap_lon` before calling it: the formula uses
+# `sin(Δλ/2)^2`, which is unchanged by adding 360° to Δλ, so the table's native 0–359.9°E values give
+# the same distance as the (-180, 180] convention would. The tiler next door does need explicit seam
+# logic (`_lon_delta`) because membership in a longitude interval is not periodic in the same way.
 
 # --- output file naming -------------------------------------------------------------------------
 #
