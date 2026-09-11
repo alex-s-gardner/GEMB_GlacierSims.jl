@@ -457,7 +457,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                     derive_bare_ice_albedo(tile.buffered; bins = hypsometry_bin_edges(tile.buffered),
                                            dem_cache_path, label = tile.name, verbose = false)
                 catch err
-                    _is_caller_error(err) && rethrow()
+                    is_caller_error(err) && rethrow()
                     @warn "Could not derive bare-ice albedo for this tile; every band will fall back to the default albedo_ice" tile =
                         tile.name exception = err
                     nothing

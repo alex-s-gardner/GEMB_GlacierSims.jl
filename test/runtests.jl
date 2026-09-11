@@ -2961,6 +2961,28 @@ end
                 0.0, 1.0, 0.0, 1.0, 0.0)
         end
 
+        @testset "a tile whose albedo cannot be derived falls back, it does not crash" begin
+            # `derive_bare_ice_albedo` needs the pooled MODIS product, which GEMB_ClimateForcing
+            # gitignores (34.7 MB, regenerated from its sample cache). So a checkout resolved from git
+            # has no albedo to read, and the sweep must degrade to the default rather than throw. That
+            # path went untested until CI ran against the published dependency, and a misspelled
+            # `is_caller_error` inside the handler turned every such tile into an UndefVarError.
+            #
+            # Exercised here without any tile machinery: an empty cell selection is the cheapest way to
+            # make the derivation fail for a reason that is a *data* problem, not a broken caller.
+            @test_throws "no cells supplied" derive_bare_ice_albedo(
+                DataFrame(longitude = Float64[], latitude = Float64[]))
+            # The handler's predicate must exist and must reject a data error, or the rethrow above it
+            # fires on every tile.
+            @test GEMB_GlacierSims.is_caller_error(ArgumentError("no cells supplied")) == false
+            # ... while still rethrowing a genuinely broken caller.
+            @test GEMB_GlacierSims.is_caller_error(UndefVarError(:nope)) == true
+            @test GEMB_GlacierSims.is_caller_error(MethodError(sin, ())) == true
+            # And a resolution with no profile gives every class the default, which is the state a
+            # fallen-back tile ends up in.
+            @test resolve_albedo_ice(nothing, 1500; default = 0.48) == (0.48, :default)
+        end
+
         @testset "resolve_albedo_ice" begin
             # Observed over 2000-2500 m with one bin above GEMB's ceiling, held outside that span,
             # and one interior bin under min_cells so the fit shows through. Every source is reached
