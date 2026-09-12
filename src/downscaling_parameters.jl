@@ -230,6 +230,10 @@ measurements behind this.
   pass over the region. Peak memory is that many forcing stacks; cost is
   `ceil(n_intervals / elevation_interval_batch)` passes over the warm cache. `0` means one pass
   holding every interval at once.
+- `donor_max_distance_km = $_DONOR_MAX_DISTANCE_KM_DEFAULT`: how far a cell with ice but no usable
+  forcing may borrow a neighbour's, in the returned `elevation_interval_forcing` only — the fits
+  themselves screen such cells out, since a borrowed series carries no information about the
+  cross-cell gradient they measure. `0` disables it. See [`elevation_interval_forcing`](@ref).
 - `min_cells = $(_MIN_CELLS_DEFAULT)`: fewest usable grid cells the region needs before either fit is
   attempted; below it every timestep reports `NaN`. Note this is effectively a *per-region* gate,
   not a per-timestep one: forcing completeness is screened per cell, so the contributing cell count
@@ -310,6 +314,8 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                    lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                                    lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                                    decoupling_factor_prior = nothing,
+                                   bare_ice_albedo = nothing,
+                                   donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT,
                                    forcing_loader = climate_forcing)
     elevation_interval_batch >= 0 || throw(ArgumentError(
         "elevation_interval_batch must be >= 0, got $elevation_interval_batch"))
@@ -346,14 +352,17 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     # center from the fitted coefficients — `k` varies with elevation, and the bands are the glacier
     # rather than the reanalysis surface — accepts or rejects each fit against its diagnostics, and
     # labels the provenance of whatever it substitutes. Nothing downstream of it fills or clamps.
-    fit = (; time = acc.time, decoupling, lapse_rate)
+    fit = (; time = acc.time, decoupling, lapse_rate, bare_ice_albedo)
     applied = resolve_downscaling(fit, hypsometry_intervals(grid_cells), acc.time;
                                   basis = downscaling_basis, min_cells,
                                   spread_minimum = elevation_spread_minimum,
                                   stderr_maximum = lapse_rate_stderr_maximum,
                                   lapse_rate_window, lapse_rate_prior, decoupling_factor_prior)
+    # Donors are the region's own cells: a derivation is handed the neighbourhood it should draw on, so
+    # there is no wider set to reach into the way a tiled sweep has its buffer.
     interval_forcing = _ElevationIntervalForcing(grid_cells, load, applied,
-                                                 elevation_interval_batch)
+                                                 elevation_interval_batch, grid_cells,
+                                                 Float64(donor_max_distance_km))
 
     provenance = Dict{String,Any}(
         "climate_model" => string(climate_model),
@@ -382,7 +391,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     # mean, from which the spread that made the slope identifiable cannot be recovered.
     return (; grid_cells, time = acc.time, decoupling, lapse_rate, lapse_rate_uncertainty, applied,
             cell_elevations = acc.elevations, cell_areas = acc.areas,
-            elevation_interval_forcing = interval_forcing, provenance)
+            elevation_interval_forcing = interval_forcing, bare_ice_albedo, provenance)
 end
 
 # Per-timestep cross-cell sums for both fits, plus the per-cell metadata the interval pass needs.
@@ -476,13 +485,18 @@ end
 
 """
     elevation_interval_forcing(grid_cells, applied; climate_model, time_range, token, cache_path,
-                               elevation_interval_batch = 0, forcing_loader = climate_forcing)
+                               elevation_interval_batch = 0, forcing_loader = climate_forcing,
+                               donor_cells = nothing,
+                               donor_max_distance_km = $_DONOR_MAX_DISTANCE_KM_DEFAULT)
 
 Lazy iterator over the elevation bands of `applied`, yielding glacier-area weighted forcing for each.
 
-Each element is `(; lo, hi, center, area, n_cells, decoupling_factor, forcing)`. Bands ascend in
-elevation, and `area` sums over the iterator to the total glacier area of the cells whose forcing was
-usable, so nothing is dropped between the cells and the bands.
+Each element is
+`(; lo, hi, center, area, n_cells, n_cells_substituted, area_substituted, area_unrecovered,
+max_donor_distance_km, decoupling_factor, decoupling_factor_source, forcing)`. Bands ascend in
+elevation, and `area` sums over the iterator to the glacier area whose forcing was accounted for,
+whether from a cell's own forcing or a donor's. `area_unrecovered` is the remainder — ice this band
+holds that no cell could supply forcing for.
 
 `applied` is an [`AppliedDownscaling`](@ref): it supplies the time axis, the applied lapse rate, and
 one applied `k` series per band, each already resolved onto that axis and inside the domain its
@@ -495,6 +509,23 @@ were fitted from. A tile fits its parameters over a buffered neighbourhood so th
 regressions have enough elevation range to be identifiable, but it must aggregate area over its
 **core** cells only, or the ice in the buffer is counted once for this tile and again for its
 neighbour.
+
+ERA5-Land is defined on land only, so a cell the glacier table credits with ice can still return an
+all-`NaN` stack — `climate_forcing` succeeds and the geopotential elevation resolves, but no variable
+carries data. Such a cell borrows forcing from the nearest cell of `donor_cells` that has usable
+forcing, within `donor_max_distance_km`; `donor_cells` defaults to `grid_cells`, and a tiled caller
+should pass its buffered neighbourhood so a tile whose *every* core cell is masked still runs. The
+substitution takes the donor's reference elevation and the donor's `glm`, because both describe the
+borrowed series: `glm` is how much the reanalysis already damped *that* forcing, and the reference
+elevation is the surface the lapse to the band centre starts from. Only the ice area is the masked
+cell's own. `donor_max_distance_km = 0` disables the substitution, dropping a masked cell's area as
+`area_unrecovered` instead.
+
+The alternative to borrowing is to drop the masked cell, which silently removes real ice from the
+band area and from every total derived from it. Over the global 2° tiling that comes to 2.3% of the
+table's glacier area, concentrated on the Antarctic Peninsula, north Greenland and the Russian High
+Arctic — a regional bias rather than noise, which is why the substitution is the default and why
+whatever it cannot reach is counted rather than skipped.
 
 Per grid cell, per band, forcing is adjusted in the order `climate_adjust_for_glacier` requires:
 **lapse to the band center first, then decouple.** `k` multiplies an ambient temperature already at the
@@ -519,13 +550,17 @@ function elevation_interval_forcing(grid_cells, applied::AppliedDownscaling;
                                     token = nothing,
                                     cache_path = nothing,
                                     elevation_interval_batch::Int = 0,
-                                    forcing_loader = climate_forcing)
+                                    forcing_loader = climate_forcing,
+                                    donor_cells = nothing,
+                                    donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT)
     load(row) = forcing_loader(climate_model, row.latitude, row.longitude;
                                time_range, token, cache_path)
-    return _ElevationIntervalForcing(grid_cells, load, applied, elevation_interval_batch)
+    return _ElevationIntervalForcing(grid_cells, load, applied, elevation_interval_batch,
+                                     donor_cells === nothing ? grid_cells : donor_cells,
+                                     Float64(donor_max_distance_km))
 end
 
-struct _ElevationIntervalForcing{C,L,B}
+struct _ElevationIntervalForcing{C,L,B,D}
     grid_cells::C
     load::L
     time::Vector{DateTime}
@@ -533,15 +568,77 @@ struct _ElevationIntervalForcing{C,L,B}
     lapse_rate_source::Vector{Int8}
     elevation_interval_batch::Int
     intervals::B
+    donor_cells::D
+    donor_max_distance_km::Float64
+    # Forcing for donors that have been used, and the coordinates already found unusable. Masked cells
+    # cluster, so the second one in a tile usually resolves to a donor already here and costs no I/O;
+    # the unusable set stops a rejected candidate from being loaded again by the next masked cell.
+    # Keyed by coordinate rather than by row, so the two batching passes over the cells share it.
+    donor_forcing::Dict{Tuple{Float64,Float64},Any}
+    donor_unusable::Set{Tuple{Float64,Float64}}
 end
 
 function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling,
-                                   elevation_interval_batch::Int)
+                                   elevation_interval_batch::Int, donor_cells,
+                                   donor_max_distance_km::Float64)
     elevation_interval_batch >= 0 || throw(ArgumentError(
         "elevation_interval_batch must be >= 0, got $elevation_interval_batch"))
+    donor_max_distance_km >= 0 || throw(ArgumentError(
+        "donor_max_distance_km must be >= 0 (0 disables donor substitution), got " *
+        string(donor_max_distance_km)))
     return _ElevationIntervalForcing(grid_cells, load, applied.time, applied.lapse_rate,
                                      applied.lapse_rate_source, elevation_interval_batch,
-                                     applied.bands)
+                                     applied.bands, donor_cells, donor_max_distance_km,
+                                     Dict{Tuple{Float64,Float64},Any}(),
+                                     Set{Tuple{Float64,Float64}}())
+end
+
+# Forcing to use for `row`, which has ice but no usable forcing of its own: the nearest cell of
+# `ivf.donor_cells` inside the distance cap whose forcing is complete. Returns
+# `(; forcing, elevation, glm, distance_km)`, or `nothing` when the cap holds no usable cell.
+#
+# Candidates are probed in ascending distance so the first usable one is the nearest, and the scan
+# stops there — the cost is one load per rejected candidate, which the memo pays only once per
+# coordinate for the whole tile.
+function _nearest_usable_donor(ivf::_ElevationIntervalForcing, row)
+    ivf.donor_max_distance_km > 0 || return nothing
+    lat, lon = Float64(row.latitude), Float64(row.longitude)
+
+    rows = eachrow(ivf.donor_cells)
+    candidates = Tuple{Float64,Int}[]
+    for i in eachindex(rows)
+        donor = rows[i]
+        d = _haversine_km(lat, lon, donor.latitude, donor.longitude)
+        d <= ivf.donor_max_distance_km && push!(candidates, (d, i))
+    end
+    sort!(candidates; by = first)
+
+    for (d, i) in candidates
+        donor = rows[i]
+        key = (Float64(donor.latitude), Float64(donor.longitude))
+        key in ivf.donor_unusable && continue
+        fd = get(ivf.donor_forcing, key, nothing)
+        if fd === nothing
+            fd = try
+                ivf.load(donor)
+            catch e
+                e isa InterruptException && rethrow()
+                is_caller_error(e) && rethrow()
+                push!(ivf.donor_unusable, key)
+                continue
+            end
+            if !forcing_is_complete(fd)
+                push!(ivf.donor_unusable, key)
+                continue
+            end
+            ivf.donor_forcing[key] = fd
+        end
+        return (; forcing = fd,
+                elevation = Float64(DimensionalData.metadata(fd)["elevation"]),
+                glm = _row_glm(donor),
+                distance_km = d)
+    end
+    return nothing
 end
 
 Base.eltype(::Type{<:_ElevationIntervalForcing}) = NamedTuple
@@ -596,6 +693,12 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
     # Highest reanalysis surface contributing to each interval. Per interval, not per batch, so the
     # extrapolation this reports does not depend on how the batching happens to group them.
     z_max = fill(-Inf, length(intervals))
+    # What the donor substitution did, per interval: how many of its cells borrowed forcing, how much
+    # ice that covered, the worst distance borrowed over, and the ice left with no donor at all.
+    n_substituted = zeros(Int, length(intervals))
+    substituted = zeros(length(intervals))
+    donor_distance = zeros(length(intervals))
+    unrecovered = zeros(length(intervals))
 
     for row in eachrow(ivf.grid_cells)
         # Which of this batch's intervals does this cell hold ice in, and how much?
@@ -612,58 +715,52 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             @warn "Forcing load failed during elevation interval aggregation; skipping cell" exception=e
             continue
         end
-        forcing_is_complete(fd) || continue
-        template === nothing && (template = fd)
-
-        z_cell = Float64(DimensionalData.metadata(fd)["elevation"])
 
         # How much of the correction this cell still needs, after the reanalysis has already applied
         # its own `glm`-worth of it — the same weighting `cell_decoupling_factor` applies, and the
         # same one `derive_lapse_rate` undoes to fit the slope.
         glm = _row_glm(row)
+        distance = 0.0
+        substituting = false
 
-        # Threaded over intervals, not over cells. This inner loop is the whole cost of the pass —
-        # `n_cells * n_intervals` lapse-and-decouple passes over the record, which for a 335-cell tile
-        # of 60 bands is 20,000 of them — and each iteration writes only its own interval's slot, so
-        # the accumulation order within an interval stays the cell order and the result is bit-for-bit
-        # what the serial loop gives. Threading over cells instead would have several threads adding
-        # into the same interval, where floating-point addition is not associative.
-        Threads.@threads for i in eachindex(intervals)
-            areas[i] > 0 && !unreachable[i] || continue
-            interval = intervals[i]
-            # `k` at *this interval's* elevation, weighted down by the cell's `glm`. Per interval
-            # rather than per cell, because `k` varies with elevation and the interval center is
-            # where the forcing is being delivered — only `glm` differs between cells.
-            cell_factor = [_effective_decoupling_factor(k, glm) for k in interval.decoupling_factor]
-            adjusted = try
-                _cell_forcing_at_interval(fd, interval.center - z_cell, cell_factor,
-                                          ivf.lapse_rate)
-            catch e
-                e isa InterruptException && rethrow()
-                is_caller_error(e) && rethrow()
-                # Caught inside the loop body: an exception escaping a `Threads.@threads` region
-                # becomes a `TaskFailedException` that names the thread rather than the interval, and
-                # would take down a whole tile over its highest few bands.
-                unreachable[i] = true
-                reasons[i] = sprint(showerror, e)
+        if !forcing_is_complete(fd)
+            # This cell is outside ERA5-Land's mask: it carries ice but no forcing of its own. Its own
+            # coordinate is a candidate donor whenever `donor_cells` includes `grid_cells`, so record
+            # it as unusable first — otherwise the scan reloads the stack just read.
+            push!(ivf.donor_unusable, (Float64(row.latitude), Float64(row.longitude)))
+            donor = _nearest_usable_donor(ivf, row)
+            if donor === nothing
+                for i in eachindex(intervals)
+                    unrecovered[i] += areas[i]
+                end
                 continue
             end
-            w = areas[i]
-            for v in _FORCING_VARIABLES
-                s = sums[i][v]
-                a = adjusted[v]
-                @inbounds for t in 1:n
-                    s[t] += w * a[t]
-                end
-            end
-            weights[i] += w
-            counts[i] += 1
-            z_max[i] = max(z_max[i], z_cell)
+            # The donor supplies the series, its own reference elevation and its own `glm`; the masked
+            # cell supplies only `areas`.
+            fd = donor.forcing
+            glm = donor.glm
+            distance = donor.distance_km
+            substituting = true
         end
+
+        template === nothing && (template = fd)
+        # Whether substituted or not, this is the reference surface of the series in `fd`, which is what
+        # the lapse to the interval centre must start from.
+        z_cell = Float64(DimensionalData.metadata(fd)["elevation"])
+
+        # A function barrier: with substitution, `fd` may come from the donor memo, whose element type
+        # is not concrete. Resolving it at this one call keeps the record-length inner loops specialized
+        # on the stack's real type rather than dispatching per timestep.
+        _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, reasons, n_substituted,
+                                    substituted, donor_distance, intervals, areas, fd, z_cell, glm,
+                                    ivf, n, substituting, distance)
     end
 
     template === nothing && throw(ArgumentError(
-        "no grid cell in the region yielded usable forcing during elevation interval aggregation"))
+        "no grid cell in the region yielded usable forcing during elevation interval aggregation" *
+        (ivf.donor_max_distance_km > 0 ?
+         ", and no donor within $(ivf.donor_max_distance_km) km had any either" :
+         " (donor substitution is disabled)")))
 
     # How far each interval is being lapse-extrapolated past the reanalysis surface it came from.
     # Glaciers systematically occupy the high ground *within* a 0.1° cell, so an interval well above
@@ -680,15 +777,37 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
                           highest_interval = maximum(first, far),
                           max_extrapolation = round(maximum(last, far), digits = 1))
 
-    # An interval the hypsometry populates but whose donor cells all turned out to have no usable
-    # forcing accumulates no area, and there is nothing to average. It is dropped rather than emitted,
-    # and named rather than dropped silently: the area it carried is real ice that this tile's totals
-    # will not account for, which is the same gap a skipped cell leaves and has to be visible the same
-    # way. Common on the Antarctic and Aleutian coasts, where ERA5-Land is land-only and a whole
-    # elevation band's cells can fall on water.
+    # What the substitution covered. Borrowed forcing is a spatial approximation on top of the lapse
+    # extrapolation, so how much of a band rests on it belongs in the log next to how far the band was
+    # extrapolated, and the worst distance is the number that says whether the donor is a neighbour or
+    # a different climate.
+    subs = findall(>(0), n_substituted)
+    isempty(subs) || @info("Elevation intervals partly forced by a donor cell: these cells carry ice " *
+                           "but fall outside the reanalysis land mask, so forcing came from the " *
+                           "nearest cell that has it",
+                           n_elevation_intervals = length(subs),
+                           n_cells = sum(n_substituted),
+                           substituted_area = round(sum(substituted[subs]), digits = 2),
+                           max_donor_distance_km = round(maximum(donor_distance[subs]), digits = 1))
+
+    # Ice no cell could supply forcing for, either its own or a donor's within the cap. Reported with
+    # its area, because the area is the consequence: it is real ice that this tile's totals will not
+    # account for. Raising `donor_max_distance_km` is what recovers it, so the cap is named.
+    lost = findall(>(0), unrecovered)
+    isempty(lost) || @warn("Elevation intervals hold ice with no usable forcing and no donor within " *
+                           "the distance cap; that area is absent from this interval's average",
+                           n_elevation_intervals = length(lost),
+                           unrecovered_area = round(sum(unrecovered[lost]), digits = 2),
+                           centers = [intervals[i].center for i in lost],
+                           donor_max_distance_km = ivf.donor_max_distance_km)
+
+    # An interval the hypsometry populates but whose cells all turned out to have no usable forcing
+    # accumulates no area, and there is nothing to average. It is dropped rather than emitted, and
+    # named rather than dropped silently. Common on the Antarctic and Aleutian coasts, where ERA5-Land
+    # is land-only and a whole elevation band's cells can fall on water.
     dropped = [intervals[i].center for i in eachindex(intervals)
                if weights[i] <= 0 && !unreachable[i]]
-    isempty(dropped) || @warn("Elevation intervals dropped: their donor cells carried no usable " *
+    isempty(dropped) || @warn("Elevation intervals dropped: their cells carried no usable " *
                               "forcing, so the interval accumulated no glacier area",
                               n_dropped = length(dropped), centers = dropped)
 
@@ -704,9 +823,65 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
                           first_reason = reasons[first(far)])
 
     return [(weights[i] > 0 && !unreachable[i]) ?
-            _interval_stack(intervals[i], sums[i], weights[i], counts[i], template, ivf, z_max[i]) :
+            _interval_stack(intervals[i], sums[i], weights[i], counts[i], template, ivf, z_max[i],
+                            n_substituted[i], substituted[i], donor_distance[i], unrecovered[i]) :
             nothing
             for i in eachindex(intervals)]
+end
+
+# One cell's contribution to every interval of the current batch. Split out of `_accumulate_intervals`
+# as a function barrier: `forcing` may arrive from the donor memo, whose element type is not concrete,
+# and this is where the record-length loops live.
+#
+# Threaded over intervals, not over cells. This inner loop is the whole cost of the pass —
+# `n_cells * n_intervals` lapse-and-decouple passes over the record, which for a 335-cell tile of 60
+# bands is 20,000 of them — and each iteration writes only its own interval's slot, so the accumulation
+# order within an interval stays the cell order and the result is bit-for-bit what the serial loop
+# gives. Threading over cells instead would have several threads adding into the same interval, where
+# floating-point addition is not associative.
+function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, reasons,
+                                     n_substituted, substituted, donor_distance,
+                                     intervals, areas, forcing, z_cell, glm, ivf, n,
+                                     substituting::Bool, distance::Float64)
+    Threads.@threads for i in eachindex(intervals)
+        areas[i] > 0 && !unreachable[i] || continue
+        interval = intervals[i]
+        # `k` at *this interval's* elevation, weighted down by the cell's `glm`. Per interval rather
+        # than per cell, because `k` varies with elevation and the interval center is where the forcing
+        # is being delivered — only `glm` differs between cells.
+        cell_factor = [_effective_decoupling_factor(k, glm) for k in interval.decoupling_factor]
+        adjusted = try
+            _cell_forcing_at_interval(forcing, interval.center - z_cell, cell_factor, ivf.lapse_rate)
+        catch e
+            e isa InterruptException && rethrow()
+            is_caller_error(e) && rethrow()
+            # Caught inside the loop body: an exception escaping a `Threads.@threads` region becomes a
+            # `TaskFailedException` that names the thread rather than the interval, and would take down
+            # a whole tile over its highest few bands.
+            unreachable[i] = true
+            reasons[i] = sprint(showerror, e)
+            continue
+        end
+        w = areas[i]
+        for v in _FORCING_VARIABLES
+            s = sums[i][v]
+            a = adjusted[v]
+            @inbounds for t in 1:n
+                s[t] += w * a[t]
+            end
+        end
+        weights[i] += w
+        counts[i] += 1
+        z_max[i] = max(z_max[i], z_cell)
+        # Recorded here rather than after the call, so it counts exactly the intervals this cell
+        # actually contributed to — an interval refused above must not be credited with a substitution.
+        if substituting
+            n_substituted[i] += 1
+            substituted[i] += w
+            donor_distance[i] = max(donor_distance[i], distance)
+        end
+    end
+    return nothing
 end
 
 """
@@ -864,7 +1039,8 @@ end
 
 # Finish one elevation interval: divide the weighted sums by the total weight and rebuild a stack
 # shaped like `climate_forcing` output, so it drops straight into the existing sweep.
-function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max)
+function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
+                         n_substituted, substituted, donor_distance, unrecovered)
     weight > 0 || throw(ArgumentError(
         "elevation interval $(interval.lo)-$(interval.hi) m accumulated zero area"))
     time_dim = dims(template, Ti)
@@ -890,6 +1066,16 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max)
         "elevation" => interval.center,
         "glacier_area" => weight,
         "n_grid_cells" => n_cells,
+        # How much of this band rests on borrowed forcing, and from how far. A cell outside the
+        # reanalysis land mask keeps its ice here by taking the nearest usable cell's series, so these
+        # say how much of the average is a spatial approximation rather than the band's own cells.
+        "n_grid_cells_substituted" => n_substituted,
+        "substituted_area" => substituted,
+        "max_donor_distance_km" => donor_distance,
+        # Ice in this band that no cell could supply forcing for, its own or a donor's. Absent from
+        # `glacier_area` and from every total derived from it, so it is on record here rather than left
+        # as the difference between two numbers a reader has to think to compare.
+        "unrecovered_area" => unrecovered,
         "elevation_interval_lower" => Float64(interval.lo),
         "elevation_interval_upper" => Float64(interval.hi),
         # How far above the highest contributing reanalysis surface this interval sits. Positive means
@@ -928,7 +1114,14 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max)
     end
 
     return (; interval.lo, interval.hi, interval.center, area = weight, n_cells,
+            n_cells_substituted = n_substituted, area_substituted = substituted,
+            area_unrecovered = unrecovered, max_donor_distance_km = donor_distance,
             decoupling_factor = interval.decoupling_factor,
             decoupling_factor_source = interval.decoupling_factor_source,
+            # Carried on the band rather than looked up again downstream: `_runnable_bands` and
+            # `_bands_after` both reshape this list, so a band's index here is not its index in
+            # `applied.bands`, and re-matching by elevation edges is how the two fall out of step.
+            albedo_ice = interval.albedo_ice,
+            albedo_ice_source = interval.albedo_ice_source,
             forcing = DimStack(layers; metadata = meta))
 end

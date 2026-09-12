@@ -114,6 +114,10 @@ function write_downscaling_tile_netcdf(path::AbstractString, tile, p;
         if elevation_intervals !== nothing
             _write_elevation_intervals!(ds, elevation_intervals, precision, deflatelevel)
         end
+        # On its own dimension rather than `elevation_interval`, which exists only when the interval
+        # forcing was retained — the albedo profile is ~1.5 kB and must be there either way.
+        albedo = hasproperty(p, :bare_ice_albedo) ? p.bare_ice_albedo : nothing
+        albedo === nothing || _write_bare_ice_albedo!(ds, albedo, deflatelevel)
         _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size, buffer,
                              min_cells, area_minimum,
                              n_intervals = elevation_intervals === nothing ? nothing :
@@ -477,6 +481,83 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
     return nothing
 end
 
+# Codes for the per-bin provenance of the stored albedo profile. Written as small integers so the
+# variable is a fixed width; `_BARE_ICE_ALBEDO_BIN_SOURCES` is the decoder, and it is the profile's
+# own vocabulary (`BareIceAlbedoHyps.sources`), not the resolved one — `:clamped` and `:default` are
+# decided at the point of use, not here.
+const _BARE_ICE_ALBEDO_BIN_SOURCES = (:observed, :hold, :fit, :none)
+_bare_ice_albedo_source_code(s::Symbol) =
+    Int8(something(findfirst(==(s), _BARE_ICE_ALBEDO_BIN_SOURCES), 0))
+
+# The tile's pooled bare-ice albedo profile, on its own `bare_ice_albedo_bin` dimension.
+#
+# The *profile* is stored, not one value per elevation interval, for two reasons: the interval
+# dimension is written only when the interval forcing was retained, and storing the profile lets a
+# consumer re-resolve it onto a different binning without refetching MODIS. `resolve_albedo_ice` is
+# what turns a bin into the `albedo_ice` a run uses.
+function _write_bare_ice_albedo!(ds, f, deflatelevel)
+    n = length(f.albedo)
+    NCDatasets.defDim(ds, "bare_ice_albedo_bin", n)
+    deflate = deflatelevel > 0 ? deflatelevel : nothing
+    lo = f.edges[1:n]
+    hi = f.edges[2:n + 1]
+
+    for (name, values, units, long_name, comment) in (
+        ("bare_ice_albedo", f.albedo, "1",
+         "bare-ice albedo best estimate for this elevation bin",
+         "The observed mean where the bin held enough MODIS cells, otherwise the nearest observed " *
+         "bin or the linear fit — see bare_ice_albedo_source. NaN where nothing resolved. NOT " *
+         "clamped to the range GEMB accepts for albedo_ice; resolve_albedo_ice does that."),
+        ("bare_ice_albedo_observed", f.observed, "1",
+         "the bin's own mean over its MODIS cells",
+         "Reported whatever the cell count, so a filled bin can be checked against the few cells " *
+         "that were in it. NaN in an empty bin."),
+        ("bare_ice_albedo_lower", lo, "m", "elevation bin lower edge", ""),
+        ("bare_ice_albedo_upper", hi, "m", "elevation bin upper edge", ""))
+        v = NCDatasets.defVar(ds, name, Float64, ("bare_ice_albedo_bin",);
+                              deflatelevel = deflate)
+        v.attrib["units"] = units
+        v.attrib["long_name"] = long_name
+        isempty(comment) || (v.attrib["comment"] = comment)
+        v[:] = collect(Float64, values)
+    end
+
+    src = NCDatasets.defVar(ds, "bare_ice_albedo_source", Int8, ("bare_ice_albedo_bin",))
+    src.attrib["units"] = "1"
+    src.attrib["long_name"] = "where this bin's albedo came from"
+    src.attrib["flag_values"] = Int8[1:length(_BARE_ICE_ALBEDO_BIN_SOURCES);]
+    src.attrib["flag_meanings"] = join(_BARE_ICE_ALBEDO_BIN_SOURCES, " ")
+    src[:] = Int8[_bare_ice_albedo_source_code(s) for s in f.sources]
+
+    for (name, values, long_name) in (
+        ("bare_ice_albedo_n_cells", f.n_cells, "MODIS 463 m cells in this bin"),
+        ("bare_ice_albedo_n_valid", f.n_valid, "MCD43A3 retrievals behind those cells"))
+        v = NCDatasets.defVar(ds, name, Int32, ("bare_ice_albedo_bin",); deflatelevel = deflate)
+        v.attrib["units"] = "1"
+        v.attrib["long_name"] = long_name
+        v[:] = Int32.(collect(values))
+    end
+
+    ds.attrib["bare_ice_albedo_sky"] = String(f.sky)
+    ds.attrib["bare_ice_albedo_n_modis_cells_used"] = f.n_used
+    ds.attrib["bare_ice_albedo_n_modis_cells_supplied"] = f.n_input
+    ds.attrib["bare_ice_albedo_slope_per_km"] = f.fit.slope_per_km
+    ds.attrib["bare_ice_albedo_intercept"] = f.fit.intercept
+    ds.attrib["bare_ice_albedo_slope_stderr"] = f.fit.slope_stderr
+    ds.attrib["bare_ice_albedo_r2"] = f.fit.r2
+    ds.attrib["bare_ice_albedo_fit_n"] = f.fit.n
+    ds.attrib["bare_ice_albedo_elevation_min"] = f.fit.elevation_range[1]
+    ds.attrib["bare_ice_albedo_elevation_max"] = f.fit.elevation_range[2]
+    for s in _BARE_ICE_ALBEDO_BIN_SOURCES
+        ds.attrib["bare_ice_albedo_n_bins_$(s)"] = count(==(s), f.sources)
+    end
+    ds.attrib["bare_ice_albedo_source_comment"] =
+        "MODIS MCD43A3 v061, darkest-percentile mean pooled over 2000-2025, at RGI 7.0 cells. " *
+        "Pooled over this tile's buffered cell selection, so neighbouring tiles overlap and the " *
+        "albedo varies smoothly across a tile seam."
+    return nothing
+end
+
 # A variable on the shared time axis. `NaN` is the fill for the floating-point ones, which is what
 # the fits themselves use for "unmeasurable", so an absent fit reads back as an absent fit rather
 # than as a number.
@@ -751,8 +832,47 @@ function read_downscaling_tile(path::AbstractString)
 
         (; time, decoupling, lapse_rate, lapse_rate_uncertainty,
          fit_usable = (v = get1("fit_usable"); v === nothing ? nothing : Bool[x == 1 for x in v]),
-         cells, fit_cells, intervals, attributes = dmeta)
+         cells, fit_cells, intervals,
+         # `nothing` for a tile written before the albedo was derived, or one where it could not be:
+         # `resolve_albedo_ice` then falls every band back to the caller's default.
+         bare_ice_albedo = haskey(ds.dim, "bare_ice_albedo_bin") ?
+                           _read_bare_ice_albedo(ds) : nothing,
+         attributes = dmeta)
     end
+end
+
+# The stored albedo profile, rebuilt as the `BareIceAlbedoHyps` it was written from, so a consumer
+# reads back the same callable `derive_bare_ice_albedo` produced rather than a bag of vectors.
+#
+# The struct is reconstructed rather than a lookalike returned, because `resolve_albedo_ice` and
+# `bare_ice_albedo_table` both dispatch on it — a NamedTuple here would need every one of them to
+# grow a second method.
+function _read_bare_ice_albedo(ds)
+    f64(name) = Float64.(collect(ds[name][:]))
+    lo = f64("bare_ice_albedo_lower")
+    hi = f64("bare_ice_albedo_upper")
+    # Edges from the bin bounds: contiguous by construction, so the upper edges plus the first lower
+    # one reproduce the vector the profile was binned on.
+    edges = Float64[lo[1]; hi]
+    codes = Int8.(collect(ds["bare_ice_albedo_source"][:]))
+    sources = Symbol[1 <= c <= length(_BARE_ICE_ALBEDO_BIN_SOURCES) ?
+                     _BARE_ICE_ALBEDO_BIN_SOURCES[c] : :none for c in codes]
+    att(key, default) = haskey(ds.attrib, key) ? ds.attrib[key] : default
+    fit = AlbedoElevationFit((Float64(att("bare_ice_albedo_slope_per_km", NaN)),
+                              Float64(att("bare_ice_albedo_intercept", NaN)),
+                              Float64(att("bare_ice_albedo_slope_stderr", NaN)),
+                              Float64(att("bare_ice_albedo_r2", NaN)),
+                              Int(att("bare_ice_albedo_fit_n", 0)),
+                              (Float64(att("bare_ice_albedo_elevation_min", NaN)),
+                               Float64(att("bare_ice_albedo_elevation_max", NaN)))))
+    n_used = Int(att("bare_ice_albedo_n_modis_cells_used", 0))
+    n_input = Int(att("bare_ice_albedo_n_modis_cells_supplied", n_used))
+    return BareIceAlbedoHyps(edges, f64("bare_ice_albedo"), f64("bare_ice_albedo_observed"),
+                             Int.(collect(ds["bare_ice_albedo_n_cells"][:])),
+                             Int.(collect(ds["bare_ice_albedo_n_valid"][:])),
+                             sources, fit,
+                             Symbol(att("bare_ice_albedo_sky", "bsa")),
+                             n_input, n_used, n_input - n_used, 0)
 end
 
 # The stored interval forcing, rebuilt as one `DimStack` per interval so each element matches what

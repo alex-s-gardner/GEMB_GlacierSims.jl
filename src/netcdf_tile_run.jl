@@ -56,6 +56,7 @@ function write_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun;
 
         _write_tile_run_globals!(ds, run; institution, references)
         _write_tile_run_coordinates!(ds, run, n_layer)
+        _write_tile_run_provenance!(ds, run)
         _write_tile_band_series!(ds, run, precision, deflatelevel)
         _write_tile_totals!(ds, run, deflatelevel)
         _write_tile_restart_group!(ds, run, n_layer)
@@ -100,6 +101,11 @@ function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
             ds[_tile_total_variable(v)][idx, :, :] = run.totals[v]
         end
 
+        # The spinup provenance is left as written, both the per-run variables and the reduced
+        # `spinup_converged`. A continuation resumes from the saved columns and runs no spinup of its
+        # own, so the history already in the file is the history of these columns; rewriting it from
+        # the continuation would only copy it back.
+        #
         # The restart group is state, not a time series: overwrite it in place. Its `layer` dimension
         # is fixed at creation, so a continuation whose columns grew past it cannot be stored — that
         # means the grid changed and the tile needs a fresh file.
@@ -150,6 +156,10 @@ resume from. `nothing` when the file does not exist.
 Returns `(; time, band_centers, delta_temperatures, precipitation_scalings, profiles, parameters,
 provenance)`, where `profiles` maps `(i_band, i_dt, i_ps)` to a `DimStack` carrying
 [`PROFILE_VARIABLES`](@ref). A run slot that produced no output has no entry.
+
+Each profile's metadata is that column's own spinup provenance over the tile-level constants, since
+`gemb` copies it onto the output a continuation produces. `provenance` is the tile-level part alone,
+which is what a slot with no profile has to fall back on.
 """
 function read_glacier_tile_restart(path::AbstractString)
     isfile(path) || return nothing
@@ -179,6 +189,12 @@ function read_glacier_tile_restart(path::AbstractString)
         columns = Dict(v => g[string(v)][:, :, :, :] for v in PROFILE_VARIABLES)
         layer_metadata = cf_layer_index_attributes()
         provenance = _read_provenance(ds)
+        run_provenance = _read_run_provenance(ds)
+        isempty(run_provenance) &&
+            @warn("This tile file stores spinup provenance only as tile-wide attributes, which hold " *
+                  "one column's history — the lowest band at the first perturbation. Every restored " *
+                  "profile therefore carries that same history, and an appended record will repeat " *
+                  "it. Delete the file to rebuild it with per-run provenance.", path)
 
         profiles = Dict{Tuple{Int,Int,Int},DimStack}()
         for i_ps in eachindex(scalings), i_dt in eachindex(deltas), i_band in eachindex(band_centers)
@@ -189,15 +205,52 @@ function read_glacier_tile_restart(path::AbstractString)
             cols = NamedTuple(
                 v => DimArray(collect(Float64, @view columns[v][1:n, i_band, i_dt, i_ps]), (zdim,))
                 for v in PROFILE_VARIABLES)
+            # This column's own spinup history, over the file-level constants. `gemb` copies a profile's
+            # metadata onto the output it starts, so handing every column the same history would make an
+            # appended record claim one column's spinup for all of them.
             profiles[(i_band, i_dt, i_ps)] =
                 DimStack(cols; layermetadata = cf_layermetadata(cols; time_axis = false),
-                         metadata = provenance)
+                         metadata = _profile_metadata(provenance, run_provenance,
+                                                     i_band, i_dt, i_ps))
         end
 
         (; time = n_time == 0 ? nothing : _nc_decode_time(ds["time"][n_time]),
          band_centers, delta_temperatures = deltas, precipitation_scalings = scalings,
          profiles, parameters = _read_run_parameters(ds), provenance)
     end
+end
+
+# The per-run spinup provenance variables, or an empty dict for a file written before they existed.
+#
+# A provenance key is a variable here and an attribute in an older file, so the two are told apart by
+# where the value lives rather than by a version stamp. `spinup_converged` is both — the attribute being
+# the `all` reduction — so a name is only taken as per-run when a variable actually carries it.
+function _read_run_provenance(ds)
+    out = Dict{String,Array{Float64,3}}()
+    for name in keys(ds)
+        _is_provenance_key(name) || continue
+        var = ds[name]
+        ndims(var) == 3 || continue
+        out[name] = collect(Float64, coalesce.(var[:, :, :], NaN))
+    end
+    return out
+end
+
+# One column's provenance: its own per-run values over the file-level constants.
+#
+# Falls back to the file-level provenance alone when the file has no per-run variables. Such a file
+# records one column's spinup history for the whole tile, so every profile restored from it carries the
+# same values — wrong for all but one column, and the reason the variables exist. Warned about once per
+# read rather than per profile.
+function _profile_metadata(provenance, run_provenance, i_band, i_dt, i_ps)
+    isempty(run_provenance) && return provenance
+    meta = copy(provenance)
+    for (key, slots) in run_provenance
+        value = slots[i_band, i_dt, i_ps]
+        isnan(value) && continue
+        meta[key] = _run_provenance_is_flag(key) ? _encode_attribute(value == 1.0) : value
+    end
+    return meta
 end
 
 function _write_tile_run_globals!(ds, run::GlacierTileRun; institution, references)
@@ -250,6 +303,14 @@ function _write_tile_run_globals!(ds, run::GlacierTileRun; institution, referenc
 
     _write_tile_run_parameters!(ds, run)
 
+    # The tile-level aggregates and the climatology descriptors that are constant across runs. The
+    # per-run spinup outcome is not here — `_collect_run_provenance!` routed it to the variables
+    # `_write_tile_run_provenance!` writes, because one column's history is not the tile's.
+    #
+    # `spinup_converged` is deliberately both an attribute and a variable: the attribute is the `all`
+    # reduction over every run, the variable says which run. NetCDF keeps attributes and variables in
+    # separate namespaces, so this is legal and the shared name is the point.
+    #
     # NetCDF attributes hold no `nothing`, `Bool` or `DateTime`, so encode those.
     for (k, v) in run.provenance
         enc = _encode_attribute(v)
@@ -327,7 +388,9 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
     bn[:] = Int32[b.n_cells for b in run.bands]
 
     # The per-band parameter provenance, as variables rather than attributes: it varies with the band,
-    # and `k` in particular is resolved at each band's own centre.
+    # and `k` in particular is resolved at each band's own centre. Units come from the key name, so a
+    # new provenance key reaches the file correctly labelled without a change here — see
+    # `_band_provenance_units`.
     keys_seen = Set{String}()
     for p in run.band_provenance, k in keys(p)
         push!(keys_seen, k)
@@ -335,8 +398,7 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
     for key in sort!(collect(keys_seen))
         values = [Float64(get(p, key, NaN)) for p in run.band_provenance]
         v = NCDatasets.defVar(ds, "band_" * key, Float64, ("band",); fillvalue = NC_FILL)
-        v.attrib["units"] = occursin("lapse_rate", key) && !occursin("_n_", key) ? "K km-1" :
-                            (startswith(key, "extrapolation") ? "m" : "1")
+        v.attrib["units"] = _band_provenance_units(key)
         v.attrib["long_name"] = replace(key, "_" => " ")
         v[:] = values
     end
@@ -347,6 +409,13 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
             "contributing cell, which for glaciers is the norm rather than an error — they occupy " *
             "the high ground within a 0.1 degree cell — and is the dominant uncertainty in this " *
             "forcing, so a fit against altimetry should weight a band by it.")
+    haskey(ds, "band_max_donor_distance_km") &&
+        (ds["band_max_donor_distance_km"].attrib["comment"] =
+            "Furthest a cell of this band borrowed its forcing, for cells that carry ice but fall " *
+            "outside the reanalysis land mask and so have none of their own. Zero where every cell " *
+            "used its own forcing. How much ice rests on a loan is band_substituted_area, and ice " *
+            "no donor could reach at all is band_unrecovered_area, which is excluded from " *
+            "band_glacier_area.")
 
     # GEMB's own attributes for this dimension: an index, deliberately carrying no `standard_name`
     # and no `positive`, so it is not presented as a physical height.
@@ -365,6 +434,69 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
               sum(b.area for b in run.bands)
     end
     return nothing
+end
+
+# Units for a `band_*` provenance variable, from its name. Keyed on the name rather than a table so a
+# new provenance key in `_band_provenance` reaches the file labelled without a second edit here; the
+# fallback is "1", which is right for the counts that most of these keys are.
+function _band_provenance_units(key::AbstractString)
+    # `_n_` marks a count *of* lapse-rate values, not a lapse rate.
+    occursin("lapse_rate", key) && !occursin("_n_", key) && return "K km-1"
+    startswith(key, "extrapolation") && return "m"
+    endswith(key, "_area") && return "km2"
+    endswith(key, "_km") && return "km"
+    return "1"
+end
+
+# The spinup outcome of each run, as variables over the full run grid.
+#
+# Every column of a tile spins up on its own, and they do not agree: over one tile the final SMB of the
+# spinup cycle spans more than an order of magnitude and changes sign between the ablation and
+# accumulation bands. So this is per-run data, not a tile attribute. `spinup_converged` is additionally
+# reduced with `all` onto the globals, because "did every column settle" is a question worth being able
+# to answer without reading an array; nothing else is reduced.
+#
+# Booleans are stored as 0/1 with `flag_values`, so one fill convention (`NC_FILL`, NaN) covers a run
+# that produced no output for both the flags and the rates.
+function _write_tile_run_provenance!(ds, run::GlacierTileRun)
+    dimnames = ("band", "delta_temperature", "precipitation_scaling")
+    for key in sort!(collect(keys(run.run_provenance)))
+        values = run.run_provenance[key]
+        v = NCDatasets.defVar(ds, key, Float64, dimnames; fillvalue = NC_FILL)
+        v.attrib["units"] = _run_provenance_units(key)
+        v.attrib["long_name"] = replace(key, "_" => " ")
+        v.attrib["comment"] =
+            "Per-run spinup provenance: one value for each (band, temperature offset, precipitation " *
+            "scaling), because each is a separately spun-up column. NaN where the run produced no " *
+            "output. Do not read one element as a property of the tile."
+        if _run_provenance_is_flag(key)
+            v.attrib["flag_values"] = [0.0, 1.0]
+            v.attrib["flag_meanings"] = key == "spinup_converged" ? "not_converged converged" :
+                                        "not_performed performed"
+        end
+        v[:, :, :] = values
+    end
+    return nothing
+end
+
+_run_provenance_is_flag(key::AbstractString) = key in ("spinup_converged", "spinup_performed")
+
+# Units for a per-run provenance variable, from its name — same convention as
+# `_band_provenance_units`, so a new key `gemb` starts reporting reaches the file labelled without a
+# second edit here. The fallback is "1", right for the cycle and iteration counts and the flags.
+function _run_provenance_units(key::AbstractString)
+    endswith(key, "_smb_rate") && return "m yr-1"
+    # A drift is the trend across cycles and a delta the step between two, so they differ by a time
+    # unit. Both exist for density and for firn air content, which is why this comes before the plain
+    # density and fac cases.
+    endswith(key, "_drift_density") && return "kg m-3 yr-1"
+    endswith(key, "_drift_fac") && return "m yr-1"
+    endswith(key, "_delta_density") && return "kg m-3"
+    endswith(key, "_delta_fac") && return "m"
+    occursin("_density", key) && return "kg m-3"
+    # `years_per_cycle` and `years_simulated`, but not `steps_per_year`, which is a count.
+    occursin("_years", key) && return "yr"
+    return "1"
 end
 
 function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, deflatelevel::Int)

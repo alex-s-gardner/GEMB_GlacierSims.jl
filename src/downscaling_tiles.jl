@@ -330,6 +330,21 @@ unconditionally.
   `decoupling_factor_prior`: how the fits are turned into applied parameters, forwarded to
   [`resolve_downscaling`](@ref). These affect **only** the interval forcing, since that is the only
   thing here that applies a fit; the stored fits themselves are always raw.
+- `derive_albedo = true`: also derive each tile's observed bare-ice albedo profile
+  ([`derive_bare_ice_albedo`](@ref)) over its **buffered** cells, and store it in the tile file, so
+  every elevation class can be run at a measured `albedo_ice` instead of a tuned constant. Pooling
+  over the buffered selection is what makes neighbouring tiles overlap by half their window, so the
+  albedo does not step at a tile seam.
+
+  Unlike the two forcing fits this needs no CDS token — the albedo is read from tables vendored in
+  GEMB_ClimateForcing — but it does need the Copernicus DEM, and so network. A tile whose albedo
+  cannot be derived is still written with its fits, and every band falls back to the default
+  `albedo_ice`; only a broken caller propagates.
+- `dem_cache_path = nothing`: where the Copernicus DEM's 1° tiles are cached. Tiles are fetched whole
+  and reused, so a sweep pays for each 1° tile once however many 2° tiles overlap it — but the path
+  must be durable or `climate_model_invariant` throws rather than write tiles the OS will reap.
+  `nothing` falls back to `ENV["GEMB_CACHE_PATH"]`, else GEMB_ClimateForcing's own `data/`, which is
+  not where a global sweep's DEM should land. GLO-30 tiles are 19–40 MB each.
 - `precision = Float32`, `deflatelevel = 4`: storage for the written series. The `k` coefficients are
   always Float64 — see [`write_downscaling_tile_netcdf`](@ref).
 - `order = :chunk`: tile visit order; `:chunk` keeps the forcing cache warm across neighbouring
@@ -337,9 +352,17 @@ unconditionally.
 - `tile_limit = Inf`: stop after this many tiles. Useful for a first pass over a global table.
 - `forcing_loader = climate_forcing`: injectable loader, so a sweep can be exercised with no CDS
   token.
+- `tile_gate = nothing`: called as `tile_gate(tile, path)` before each tile; a `false` return skips it
+  without recording an outcome. This is the hook a parallel launcher uses to run the sweep as N
+  independent processes, each claiming tiles with [`claim_tile!`](@ref) — the gate owns the
+  coordination, so this function needs no notion of workers.
 
-The sweep is serial: it is I/O bound on the forcing store, and running tiles concurrently would work
-against the cache locality `order = :chunk` is there to exploit.
+One call is serial, and within a process that is right: it is I/O bound on the forcing store, and running
+tiles concurrently inside one process would work against the cache locality `order = :chunk` exists to
+exploit. Scale out across *processes* instead, via `tile_gate`: each drains its own contiguous block of
+the chunk-ordered list, so locality is preserved per worker, and steals afterwards so no worker idles
+through the tail. Over the full record the fit is long enough that serial is not an option
+(`scripts/run_derive_parameters.sh`).
 """
 function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             glacier_elevation_classes, output_dir::AbstractString;
@@ -359,6 +382,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                                             lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                                             decoupling_factor_prior = nothing,
+                                            derive_albedo::Bool = true,
+                                            dem_cache_path::Union{Nothing,AbstractString} = nothing,
                                             precision::Type = Float32,
                                             deflatelevel::Int = 4,
                                             order::Symbol = :chunk,
@@ -366,7 +391,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             tile_limit = Inf,
                                             institution = nothing,
                                             references = nothing,
-                                            forcing_loader = climate_forcing)
+                                            forcing_loader = climate_forcing,
+                                            tile_gate = nothing)
     tiles = downscaling_tiles(glacier_elevation_classes; tile_size, buffer, area_minimum, order)
     isempty(tiles) && throw(ArgumentError(
         "no grid cells with at least $area_minimum km² of glacier area, so there are no tiles"))
@@ -387,6 +413,10 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
     rows = NamedTuple[]
     for (i, tile) in enumerate(selected)
         path = joinpath(output_dir, tile.name)
+        # `tile_gate` lets a caller run this sweep as N independent processes: it is asked, per tile,
+        # whether this process should take it, and a `false` skips without recording an outcome. The
+        # gate — not this loop — owns the coordination, so the sweep needs no notion of workers.
+        tile_gate === nothing || tile_gate(tile, path) || continue
         t0 = time()
         try
             # --- pre-flight, before any forcing I/O ------------------------------------------
@@ -417,6 +447,23 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                 continue
             end
 
+            # Pooled over the *buffered* cells, the same selection the two forcing fits are taken
+            # over, so neighbouring tiles share half their window and the albedo does not step at a
+            # tile seam. Derived before the forcing because it is the cheap half — one albedo query
+            # and a few DEM windows — and a tile whose albedo cannot be derived should still get its
+            # fits, with every band falling back to the default.
+            albedo = if derive_albedo
+                try
+                    derive_bare_ice_albedo(tile.buffered; bins = hypsometry_bin_edges(tile.buffered),
+                                           dem_cache_path, label = tile.name, verbose = false)
+                catch err
+                    is_caller_error(err) && rethrow()
+                    @warn "Could not derive bare-ice albedo for this tile; every band will fall back to the default albedo_ice" tile =
+                        tile.name exception = err
+                    nothing
+                end
+            end
+
             p = derive_downscaling_parameters(climate_model, time_range, tile.buffered;
                                              token, cache_path,
                                              region_extent = tile.buffered_bounds,
@@ -425,7 +472,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                              downscaling_basis, elevation_spread_minimum,
                                              lapse_rate_stderr_maximum,
                                              lapse_rate_window, lapse_rate_prior,
-                                             decoupling_factor_prior, forcing_loader)
+                                             decoupling_factor_prior,
+                                             bare_ice_albedo = albedo, forcing_loader)
 
             # `elevation_interval_forcing` is a lazy iterator: leaving it alone reads no forcing at
             # all, which is why the fits-only sweep costs one pass over the tile's cells. Collecting
