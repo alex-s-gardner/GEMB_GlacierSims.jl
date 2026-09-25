@@ -402,6 +402,12 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
         v.attrib["long_name"] = replace(key, "_" => " ")
         v[:] = values
     end
+    haskey(ds, "band_bare_ice_albedo_source") &&
+        (ds["band_bare_ice_albedo_source"].attrib["comment"] =
+            "Index into applied_bare_ice_albedo_source_meanings: how this band's albedo_ice was " *
+            "resolved from the observed profile. band_bare_ice_albedo is the value itself, and it " *
+            "is the one aligned with this file's bands — applied_bare_ice_albedo spans every band " *
+            "the downscaling resolved, including any this run could not force.")
     haskey(ds, "band_extrapolation_above_reanalysis") &&
         (ds["band_extrapolation_above_reanalysis"].attrib["comment"] =
             "Signed distance from this band's center to the highest reanalysis surface that fed " *

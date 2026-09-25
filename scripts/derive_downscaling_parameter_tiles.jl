@@ -25,6 +25,8 @@ using DataFrames
 using Dates
 import GeoDataFrames
 
+include(joinpath(@__DIR__, "run_settings.jl"))
+
 const BASE_CLIMATE_DIR = "/mnt/bylot-r3/data";
 const CLIMATE_MODEL = :era5land
 
@@ -43,6 +45,12 @@ const MIN_CELLS = 8
 # Skip cells holding less than this total glacier area (km²). 0 keeps every cell, which is what makes
 # the tile files a complete partition of the table.
 const AREA_MINIMUM = 0.0
+
+# Derive each tile's observed bare-ice albedo profile from MODIS and store it in the tile file, so every
+# elevation class runs at a measured `albedo_ice`? Off, every band falls back to the tuned constant
+# `albedo_ice` — a tile file written that way carries no profile, and nothing downstream can recover one.
+# Needs the Copernicus DEM and so network, but no CDS token.
+const DERIVE_ALBEDO = get(ENV, "DERIVE_ALBEDO", "1") == "1"
 
 # Also store each tile's glacier-area weighted per-elevation-interval forcing? This is the expensive
 # half — most of the output volume, plus at least one extra pass over every cell's forcing — and the
@@ -67,7 +75,9 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
                           joinpath(BASE_CLIMATE_DIR, string(CLIMATE_MODEL)))
 
 const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
-const OUTPUT_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
+# Overridable so a timing probe can share the forcing cache without writing files the production sweep
+# would then treat as current and skip.
+const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "downscaling_parameters"))
 
 # In-memory budget for the cross-tile forcing cache, in GiB.
 #
@@ -83,7 +93,55 @@ const OUTPUT_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 # disable, e.g. on a machine where the memory is needed elsewhere.
 const CACHE_BUDGET_GIB = parse(Float64, get(ENV, "FORCING_CACHE_GIB", "8"))
 
+# Which slice of the tile list this process owns, 1-based. Over the full record the fit is far too long
+# to run serially, so the sweep scales out across processes: each drains its own contiguous block of the
+# chunk-ordered list — preserving the forcing-cache locality that ordering buys — and then steals the
+# heaviest tile still unclaimed, so none idles through the tail. Tiles are claimed by an atomic mkdir
+# under `OUTPUT_DIR/claims`, which is the whole coordination mechanism.
+const TILE_BLOCKS = haskey(ENV, "TILE_BLOCKS") ? parse(Int, ENV["TILE_BLOCKS"]) : 1
+const TILE_BLOCK = haskey(ENV, "TILE_BLOCK") ? parse(Int, ENV["TILE_BLOCK"]) : 1
+# Must exceed the longest a single tile's fit can take: reclaiming a running tile would put two writers
+# on one file. `0` disables reclaiming.
+const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
+
+# Stop after this many tiles. For a timing probe before committing to a global pass, which the sizing note
+# above asks for; the sweep is resumable, so a bounded run is a prefix of the full one and not a detour.
+const TILE_LIMIT = haskey(ENV, "TILE_LIMIT") ? parse(Int, ENV["TILE_LIMIT"]) : typemax(Int)
+
+# Restrict the sweep to named tiles, as `gemb_tile_sweep.jl` does. A region can then be derived and run
+# end to end before the globe is committed to — which is the only way to size the global pass on real
+# tiles, since the sparse ones cost nothing and measure nothing.
+const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? Set(split(ENV["TILE_NAMES"], ",")) : Set{String}()
+
+# What this run is configured to do, for the log and for the terminal that launched it. Built before any
+# precondition is checked, so a run that stops on a missing table or a missing key still says what it was
+# going to do.
+function settings_rows()
+    return [
+        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
+        setting("minimum cells to fit", MIN_CELLS),
+        setting("minimum cell glacier area", "$(AREA_MINIMUM) km²"),
+        env_setting("observed bare-ice albedo", DERIVE_ALBEDO, "DERIVE_ALBEDO"),
+        setting("elevation-interval forcing", RETAIN_ELEVATION_INTERVAL_FORCING),
+        env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
+        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
+        env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
+        env_setting("tiles", isempty(TILE_NAMES) ? "all" : join(sort!(collect(TILE_NAMES)), ", "),
+                    "TILE_NAMES"),
+        env_setting("forcing cache budget", "$(CACHE_BUDGET_GIB) GiB", "FORCING_CACHE_GIB"),
+        env_setting("climate cache", CLIMATE_CACHE, "CLIMATE_CACHE"),
+        env_setting("DEM tile cache", get(ENV, "GEMB_CACHE_PATH",
+                                          "GEMB_ClimateForcing data/ (package default)"),
+                    "GEMB_CACHE_PATH"),
+        env_setting("output", OUTPUT_DIR, "OUTPUT_DIR"),
+    ]
+end
+
 function main()
+    print_settings("Downscaling-parameter derivation — settings in force", settings_rows())
+    SHOW_SETTINGS && return nothing
+
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
     cache = joinpath(CLIMATE_CACHE, "cache")
@@ -108,7 +166,23 @@ function main()
         @info "Cross-tile forcing cache" budget_GiB=CACHE_BUDGET_GIB capacity_cells=capacity MiB_per_cell=round(CACHE_BUDGET_GIB * 1024 / capacity, digits = 1)
     end
 
-    @info "Global downscaling-parameter sweep" cells=nrow(table) tile_size=TILE_SIZE buffer=BUFFER time_range=TIME_RANGE output=OUTPUT_DIR
+    @info "Global downscaling-parameter sweep" cells=nrow(table) tile_size=TILE_SIZE buffer=BUFFER time_range=TIME_RANGE output=OUTPUT_DIR block="$TILE_BLOCK/$TILE_BLOCKS"
+
+    # Claim-based work stealing across processes. The gate is asked per tile, in the visit order the
+    # sweep itself chooses, so this process takes whatever it wins and skips the rest.
+    #
+    # Affinity is expressed by *declining* tiles outside this worker's block until it has drained them:
+    # `derive_downscaling_parameter_tiles` owns the visit order, so a worker cannot reorder it — but it
+    # can pass on a tile now and take it on a second pass. One pass with stealing enabled from the start
+    # is simpler and costs only that a worker may take a neighbour's tile early, which the claim makes
+    # safe either way.
+    claim_dir = joinpath(OUTPUT_DIR, "claims")
+    mkpath(claim_dir)
+    function gate(tile, path)
+        isempty(TILE_NAMES) || replace(tile.name, ".nc" => "") in TILE_NAMES || return false
+        TILE_BLOCKS == 1 && return true          # sole worker: nothing to claim against
+        return claim_tile!(claim_dir, tile.name, path; stale_after = CLAIM_STALE_AFTER)
+    end
 
     t0 = time()
     summary = derive_downscaling_parameter_tiles(CLIMATE_MODEL, TIME_RANGE, table, OUTPUT_DIR;
@@ -118,9 +192,13 @@ function main()
                                                 buffer = BUFFER,
                                                 min_cells = MIN_CELLS,
                                                 area_minimum = AREA_MINIMUM,
+                                                derive_albedo = DERIVE_ALBEDO,
                                                 retain_elevation_interval_forcing =
                                                     RETAIN_ELEVATION_INTERVAL_FORCING,
-                                                institution = "NASA Jet Propulsion Laboratory")
+                                                institution = "NASA Jet Propulsion Laboratory",
+                                                tile_limit = TILE_LIMIT,
+                                                tile_gate = (TILE_BLOCKS == 1 && isempty(TILE_NAMES)) ?
+                                                            nothing : gate)
     @info "Sweep finished" minutes=round((time() - t0) / 60, digits = 1)
 
     # The hit rate against the 3.62 requests per cell the tiling implies: the ceiling is ~0.72, and a

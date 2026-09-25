@@ -376,6 +376,11 @@ function _record_bare_ice_albedo!(params::AbstractDict, resolved)
     params["applied_bare_ice_albedo_source"] =
         [bare_ice_albedo_source_code(last(r)) for r in resolved]
     params["applied_bare_ice_albedo_source_meanings"] = join(BARE_ICE_ALBEDO_SOURCES, " ")
+    params["applied_bare_ice_albedo_comment"] =
+        "One entry per band the downscaling resolved, in ascending elevation. This is the whole " *
+        "resolution and not the set of bands a run produced, so it is what a continuation is " *
+        "compared against; it is NOT indexed by the band dimension, which omits any band the " *
+        "forcing could not drive. Read band_bare_ice_albedo for the per-band values of this file."
     return params
 end
 

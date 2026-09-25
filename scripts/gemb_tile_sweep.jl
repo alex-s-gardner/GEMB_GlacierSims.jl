@@ -38,6 +38,8 @@ using Statistics
 import GEMB
 import GeoDataFrames
 
+include(joinpath(@__DIR__, "run_settings.jl"))
+
 const GI = GeoDataFrames.GeoInterface
 const CLIMATE_MODEL = :era5land
 const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
@@ -163,7 +165,77 @@ const FORCE = get(ENV, "FORCE", "0") == "1"
 const TILE_BLOCKS = haskey(ENV, "TILE_BLOCKS") ? parse(Int, ENV["TILE_BLOCKS"]) : 1
 const TILE_BLOCK = haskey(ENV, "TILE_BLOCK") ? parse(Int, ENV["TILE_BLOCK"]) : 1
 
+# Whether the parameter tiles this sweep reads carry an observed bare-ice albedo profile. Without one
+# every band runs at the tuned constant `albedo_ice`, which the run records but does not warn about — so
+# it belongs in the settings table, where a sweep about to reproduce the constant-albedo experiment is
+# visible before it starts rather than afterwards.
+#
+# Sampled, not counted: storing a profile is a property of the derivation, which either did it for every
+# tile it could or was run with it off, and a full census would be 819 header reads in each of 96 workers.
+function albedo_profile_sample(n = 12)
+    isdir(PARAMETER_DIR) || return "unknown — no parameter tiles yet"
+    files = sort!(filter(endswith(".nc"), readdir(PARAMETER_DIR)))
+    isempty(files) && return "unknown — no parameter tiles yet"
+    # Sparse tiles are skipped, not counted against the total: they carry no fits at all and return
+    # before the albedo is derived, so a profile is not something they can be missing. Counting them
+    # would report a complete derivation as "mixed" purely by where the alphabet puts them.
+    fitted = 0
+    with = 0
+    for f in files
+        GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(PARAMETER_DIR, f), "r") do ds
+            get(ds.attrib, "sparse", "false") == "true" && return
+            fitted += 1
+            haskey(ds.dim, "bare_ice_albedo_bin") && (with += 1)
+        end
+        fitted >= n && break
+    end
+    fitted == 0 && return "unknown — the tiles sampled are all sparse, which carry no albedo"
+    with == fitted && return "observed, MODIS ($(with)/$(fitted) fitted tiles sampled)"
+    with == 0 && return "none stored — every band falls back to the default"
+    return "mixed — $(with) of $(fitted) fitted tiles sampled carry a profile"
+end
+
+# What this run is configured to do, for the log and for the terminal that launched it.
+function settings_rows()
+    return [
+        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
+        env_setting("output frequency", OUTPUT_FREQUENCY, "OUTPUT_FREQUENCY"),
+        env_setting("temperature offsets (K)", DELTA_TEMPERATURES, "DELTA_TEMPERATURES"),
+        env_setting("precipitation scalings", PRECIPITATION_SCALINGS, "PRECIPITATION_SCALINGS"),
+        setting("perturbations per band",
+                "$(length(DELTA_TEMPERATURES)) × $(length(PRECIPITATION_SCALINGS)) = " *
+                "$(length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS))"),
+        setting("bare-ice albedo", albedo_profile_sample(), "parameter tiles"),
+        setting("spinup climatology", SPINUP_CLIMATOLOGY_WINDOW,
+                haskey(ENV, "SPINUP_CLIMATOLOGY_START") || haskey(ENV, "SPINUP_CLIMATOLOGY_STOP") ?
+                "ENV[SPINUP_CLIMATOLOGY_START/STOP]" : "default"),
+        env_setting("spinup ceiling", "$(SPINUP_SIMULATION_YEARS_MAXIMUM) simulated years",
+                    "SPINUP_SIMULATION_YEARS_MAXIMUM"),
+        setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
+        env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
+        env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
+        # From JLOptions, not ENV: this is the value the collector acts on, so a hint lost on its way to
+        # the worker shows up here as "none" instead of being reported as if it had taken effect.
+        let hint = Base.JLOptions().heap_size_hint
+            hint == 0 ?
+                setting("GC heap hint", "none (target sized from physical memory)") :
+                setting("GC heap hint", "$(round(hint / 2^30; digits = 1)) GiB", "--heap-size-hint")
+        end,
+        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
+        env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
+        env_setting("tiles", isempty(TILE_NAMES) ? "all" : join(TILE_NAMES, ", "), "TILE_NAMES"),
+        env_setting("force rebuild of current tiles", FORCE, "FORCE"),
+        env_setting("climate cache", CLIMATE_CACHE, "CLIMATE_CACHE"),
+        setting("parameters", PARAMETER_DIR),
+        env_setting("output", OUTPUT_DIR, "OUTPUT_DIR"),
+    ]
+end
+
 function main()
+    print_settings("GEMB tile sweep — settings in force", settings_rows())
+    SHOW_SETTINGS && return nothing
+
     token = GEMB_ClimateForcing.get_cds_api_key()
     token === nothing && error("no CDS API key; set ENV[\"CDS_API_KEY\"] or write ~/.cdsapirc")
     cache = joinpath(CLIMATE_CACHE, "cache")

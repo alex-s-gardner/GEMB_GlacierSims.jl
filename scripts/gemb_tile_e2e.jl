@@ -147,7 +147,7 @@ function main()
     run = gemb_glacier_tile(tile, applied, bands, mp;
                             delta_temperatures = DELTA_TEMPERATURES,
                             precipitation_scalings = PRECIPITATION_SCALINGS,
-                            max_iterations = SPINUP_MAX_ITERATIONS,
+                            simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                             convergence_drift_fac = SPINUP_DRIFT_FAC)
     simulations = length(run.bands) * length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS)
     @info "GEMB finished" minutes=round((time() - t0) / 60; digits = 2) simulations seconds_per_simulation=round((time() - t0) / simulations; digits = 2)
