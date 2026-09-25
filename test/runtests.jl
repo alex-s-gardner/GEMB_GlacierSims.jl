@@ -170,7 +170,13 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
         "n_timesteps_above_freezing" => 4,
         "glacier_decoupling_factor_n_fitted" => 3,
         "glacier_decoupling_factor_n_fitted_above_freezing" => 2,
-        "temperature_lapse_rate_n_fitted" => n_t) for i in 1:n_band]
+        "temperature_lapse_rate_n_fitted" => n_t,
+        # The albedo each band ran at, and how it was resolved. Distinct per band, so a round-trip that
+        # broadcast one band's value over the rest would show up.
+        "bare_ice_albedo" => 0.30 + 0.02i,
+        "bare_ice_albedo_source" =>
+            Float64(bare_ice_albedo_source_code(i == 1 ? :default : :observed))
+        ) for i in 1:n_band]
     # One band missing a key the others carry. The writer defines a variable per key seen anywhere, so
     # this band's entry has to read back as absent rather than as a number — the fill is the only thing
     # that distinguishes "not recorded" from "recorded as zero".
@@ -2742,6 +2748,17 @@ end
                 @test ismissing(held[end])
                 @test held[1] == run.band_provenance[1]["glacier_decoupling_factor_n_fit_held"]
 
+                # The bare-ice albedo is on the band, like the lapse rate and `k`: indexed by the band
+                # dimension, so a reader needs no separate alignment step to say what a band ran at.
+                @test collect(ds["band_bare_ice_albedo"][:]) ==
+                      [p["bare_ice_albedo"] for p in run.band_provenance]
+                @test collect(ds["band_bare_ice_albedo_source"][:]) ==
+                      [p["bare_ice_albedo_source"] for p in run.band_provenance]
+                @test bare_ice_albedo_source_name(ds["band_bare_ice_albedo_source"][1]) === :default
+                # The codes are meaningless without the vocabulary, so the variable says where to find it.
+                @test occursin("applied_bare_ice_albedo_source_meanings",
+                               ds["band_bare_ice_albedo_source"].attrib["comment"])
+
                 # The spinup outcome is per run, over the whole grid, because every column spins up on
                 # its own. A single scalar would be one column's history standing for the tile.
                 for key in ("spinup_smb_rate", "spinup_cycles", "spinup_converged")
@@ -3035,6 +3052,87 @@ end
             empty_tile = (; name = "N00_E000.nc", bounds = tile_bounds((0, 0)),
                           core = DataFrame(longitude = Float64[], latitude = Float64[]))
             @test_throws "owns no cells" bare_ice_albedo_tile(empty_tile, nothing)
+        end
+
+        @testset "a resolution attributes its albedo without invalidating a restart" begin
+            n = 4
+            rt = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, n - 1))
+            ti = Ti(rt)
+            dec = DimStack((decoupling_factor = DimArray(fill(0.7, n), (ti,)),
+                            n_cells = DimArray(fill(20, n), (ti,)),
+                            r2 = DimArray(fill(0.99, n), (ti,)),
+                            ambient_excess = DimArray(fill(5.0, n), (ti,)),
+                            coef_alpha = DimArray(fill(8.0, n), (ti,)),
+                            coef_beta = DimArray(fill(-0.001, n), (ti,)),
+                            coef_gamma = DimArray(fill(-3.0, n), (ti,)),
+                            coef_delta = DimArray(fill(0.0004, n), (ti,))))
+            lr = DimStack((lapse_rate = DimArray(fill(6.0, n), (ti,)),
+                           n_cells = DimArray(fill(20, n), (ti,)),
+                           elevation_spread = DimArray(fill(900.0, n), (ti,))))
+            bands = [(; lo = 1000, hi = 1100, center = 1050.0),
+                     (; lo = 2000, hi = 2100, center = 2050.0)]
+            z = collect(1000.0:50.0:2100.0)
+            profile = bare_ice_albedo_hyps(fill(0.42, length(z)), z, 0:100:3000;
+                                           min_cells = 1, extrapolate = :hold)
+
+            base = (; time = rt, decoupling = dec, lapse_rate = lr)
+            with = resolve_downscaling(merge(base, (; bare_ice_albedo = profile,
+                                                   source_path = "/params/N60_W142.nc")),
+                                       bands, rt; basis = :fitted)
+
+            @test with.provenance["downscaling_bare_ice_albedo_product"] ==
+                  GEMB_GlacierSims.BARE_ICE_ALBEDO_PRODUCT
+            @test with.provenance["downscaling_bare_ice_albedo_sky"] == "bsa"
+            @test with.provenance["downscaling_bare_ice_albedo_n_bins"] == length(profile.albedo)
+            @test with.provenance["downscaling_bare_ice_albedo_n_modis_cells_used"] ==
+                  profile.n_used
+            @test with.provenance["downscaling_bare_ice_albedo_r2"] === profile.fit.r2
+            @test with.provenance["downscaling_bare_ice_albedo_n_bins_observed"] ==
+                  count(==(:observed), profile.sources)
+            # The file the numbers came from: without it a run states an albedo nothing can be traced to.
+            @test with.provenance["downscaling_parameter_file"] == "/params/N60_W142.nc"
+
+            # Provenance is recorded, never compared. A run whose product description or parameter path
+            # changed simulated the same thing, so it must not read as a different experiment.
+            for key in keys(with.provenance)
+                @test !haskey(with.settings, key)
+            end
+            params = tile_run_parameters(initialize_parameters(), with;
+                                         spinup_window = (DateTime(1990), DateTime(2019)))
+            @test !haskey(params, "downscaling_parameter_file")
+            @test !haskey(params, "downscaling_bare_ice_albedo_product")
+            # What *is* compared is the albedo each band ran at, and the vector's span is stated:
+            # `applied.bands` is the whole resolution, which the band dimension of a run need not be.
+            @test params["applied_bare_ice_albedo"] == [b.albedo_ice for b in with.bands]
+            @test occursin("NOT indexed by the band dimension",
+                           params["applied_bare_ice_albedo_comment"])
+
+            # No profile, nothing to attribute: every band fell back to the caller's default, which the
+            # settings already record.
+            without = resolve_downscaling(base, bands, rt; basis = :fitted)
+            @test isempty(without.provenance)
+            @test without.settings["downscaling_bare_ice_albedo_available"] === false
+        end
+
+        @testset "each band carries the albedo it ran at" begin
+            ti = Ti(collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 2)))
+            forcing = DimStack((temperature = DimArray(fill(270.0, 3), (ti,)),);
+                               metadata = Dict{String,Any}("temperature_lapse_rate" => 6.2))
+            band = (; lo = 1000, hi = 1100, center = 1050.0, area = 10.0,
+                    albedo_ice = 0.37, albedo_ice_source = :observed, forcing)
+            prov = GEMB_GlacierSims._band_provenance(band)
+            @test prov["bare_ice_albedo"] === 0.37
+            # The code, not the symbol: these become numeric per-band variables, decoded through
+            # `applied_bare_ice_albedo_source_meanings`.
+            @test prov["bare_ice_albedo_source"] ==
+                  Float64(bare_ice_albedo_source_code(:observed))
+            @test bare_ice_albedo_source_name(prov["bare_ice_albedo_source"]) === :observed
+            # A band that fell back is recorded as such rather than left out, so the variable covers
+            # every band of the file.
+            fell_back = GEMB_GlacierSims._band_provenance(
+                merge(band, (; albedo_ice = 0.48, albedo_ice_source = :default)))
+            @test fell_back["bare_ice_albedo"] === 0.48
+            @test bare_ice_albedo_source_name(fell_back["bare_ice_albedo_source"]) === :default
         end
     end
 

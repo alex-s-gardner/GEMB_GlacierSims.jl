@@ -375,6 +375,10 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
 
     band_provenance = [_band_provenance(band) for band in bands]
     merge!(provenance, applied.settings)
+    # Where the resolved parameters came from, as against what they were: `applied.provenance` names the
+    # albedo product, the fit behind it and the parameter file, none of which a continuation has to
+    # match. Merged here and not into `parameters` for exactly that reason.
+    merge!(provenance, applied.provenance)
     provenance["n_bands"] = n_band
     provenance["glacier_area_km2"] = sum(band_areas)
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
@@ -560,6 +564,12 @@ function _band_provenance(band)
             "n_grid_cells_substituted", "substituted_area", "max_donor_distance_km",
             "unrecovered_area")
     prov = Dict{String,Any}(k => meta[k] for k in keep if haskey(meta, k))
+    # The bare-ice albedo this band ran at, on the band itself — as the lapse rate and the decoupling
+    # factor already are. The band dimension of the output is this list, reshaped by `_runnable_bands`
+    # and `_bands_after`, so a value carried here cannot fall out of step with the band it describes.
+    # The source is its `BARE_ICE_ALBEDO_SOURCES` index, because these become numeric variables.
+    prov["bare_ice_albedo"] = Float64(band.albedo_ice)
+    prov["bare_ice_albedo_source"] = Float64(bare_ice_albedo_source_code(band.albedo_ice_source))
     for source in DOWNSCALING_SOURCES
         for key in ("glacier_decoupling_factor_n_$source",
                     "glacier_decoupling_factor_n_$(source)_above_freezing",

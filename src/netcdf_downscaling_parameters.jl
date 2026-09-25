@@ -551,10 +551,10 @@ function _write_bare_ice_albedo!(ds, f, deflatelevel)
     for s in _BARE_ICE_ALBEDO_BIN_SOURCES
         ds.attrib["bare_ice_albedo_n_bins_$(s)"] = count(==(s), f.sources)
     end
+    ds.attrib["bare_ice_albedo_product"] = BARE_ICE_ALBEDO_PRODUCT
     ds.attrib["bare_ice_albedo_source_comment"] =
-        "MODIS MCD43A3 v061, darkest-percentile mean pooled over 2000-2025, at RGI 7.0 cells. " *
-        "Pooled over this tile's buffered cell selection, so neighbouring tiles overlap and the " *
-        "albedo varies smoothly across a tile seam."
+        BARE_ICE_ALBEDO_PRODUCT * " Pooled over this tile's buffered cell selection, so " *
+        "neighbouring tiles overlap and the albedo varies smoothly across a tile seam."
     return nothing
 end
 
@@ -837,6 +837,10 @@ function read_downscaling_tile(path::AbstractString)
          # `resolve_albedo_ice` then falls every band back to the caller's default.
          bare_ice_albedo = haskey(ds.dim, "bare_ice_albedo_bin") ?
                            _read_bare_ice_albedo(ds) : nothing,
+         # Which file these parameters came from. Carried so a run that applies them can record it:
+         # the fits and the albedo profile are otherwise anonymous once resolved, and a consumer
+         # holding only the run cannot say which derivation produced them.
+         source_path = abspath(path),
          attributes = dmeta)
     end
 end

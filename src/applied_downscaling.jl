@@ -137,7 +137,11 @@ value.
   the other two it does not vary with time — and `albedo_ice_source` is its
   [`BARE_ICE_ALBEDO_SOURCES`](@ref) provenance.
 - `basis`: `:climatology` or `:fitted`, as requested.
-- `settings`: the thresholds and priors this resolution used, for the record.
+- `settings`: the thresholds and priors this resolution used. A run records these as the values a
+  continuation must match, so anything that makes two runs *different experiments* belongs here.
+- `provenance`: where the resolved values came from — the albedo product, the parameter file, the fit
+  behind the albedo profile. Recorded but **not** compared: re-wording a product description or
+  moving a parameter file does not change what was simulated, and must not invalidate a restart.
 
 Use [`downscaling_source_counts`](@ref) to summarize a source vector, and pass it the band's
 above-freezing mask to get the count that matters — `k` is arbitrary at a timestep with no warm excess
@@ -150,7 +154,15 @@ struct AppliedDownscaling{B}
     bands::B
     basis::Symbol
     settings::Dict{String,Any}
+    provenance::Dict{String,Any}
 end
+
+# Provenance defaults to empty: a caller assembling an `AppliedDownscaling` by hand — a test, or a
+# resolution not read from a parameter file — has nothing to record, and an absent provenance is not
+# an absent setting.
+AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings) =
+    AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings,
+                       Dict{String,Any}())
 
 Base.show(io::IO, a::AppliedDownscaling) = print(io,
     "AppliedDownscaling(", length(a.time), " timesteps, ", length(a.bands), " bands, basis=",
@@ -440,7 +452,43 @@ function resolve_downscaling(fit, intervals, run_time;
         settings["downscaling_n_albedo_ice_$(s)"] = count(b -> b.albedo_ice_source === s, bands)
     end
 
-    return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings)
+    return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings,
+                              _albedo_provenance(fit, albedo_profile))
+end
+
+# Where a resolution's bare-ice albedo came from, for the record rather than for comparison.
+#
+# Keyed to match the parameter file's own `bare_ice_albedo_*` attributes, so the run and the derivation
+# describe one profile in one vocabulary. Without this a run states the albedo every band used and
+# nothing about the observations behind it: the product, the pooling and the fit all live in the
+# parameter file, which the run would otherwise not even name.
+#
+# Empty when no profile was stored. There is then nothing to attribute — every band ran at the
+# caller's default, which `settings` already records.
+function _albedo_provenance(fit, profile)
+    profile === nothing && return Dict{String,Any}()
+    prov = Dict{String,Any}(
+        "downscaling_bare_ice_albedo_product" => BARE_ICE_ALBEDO_PRODUCT,
+        "downscaling_bare_ice_albedo_sky" => String(profile.sky),
+        "downscaling_bare_ice_albedo_n_bins" => length(profile.albedo),
+        "downscaling_bare_ice_albedo_n_modis_cells_used" => profile.n_used,
+        "downscaling_bare_ice_albedo_n_modis_cells_supplied" => profile.n_input,
+        "downscaling_bare_ice_albedo_slope_per_km" => profile.fit.slope_per_km,
+        "downscaling_bare_ice_albedo_intercept" => profile.fit.intercept,
+        "downscaling_bare_ice_albedo_slope_stderr" => profile.fit.slope_stderr,
+        "downscaling_bare_ice_albedo_r2" => profile.fit.r2,
+        "downscaling_bare_ice_albedo_fit_n" => profile.fit.n,
+        "downscaling_bare_ice_albedo_elevation_min" => profile.fit.elevation_range[1],
+        "downscaling_bare_ice_albedo_elevation_max" => profile.fit.elevation_range[2],
+    )
+    for s in _BARE_ICE_ALBEDO_BIN_SOURCES
+        prov["downscaling_bare_ice_albedo_n_bins_$(s)"] = count(==(s), profile.sources)
+    end
+    # Absent when the resolution did not come from a file — `resolve_downscaling` takes a fit, not
+    # necessarily one `read_downscaling_tile` produced.
+    hasproperty(fit, :source_path) &&
+        (prov["downscaling_parameter_file"] = fit.source_path)
+    return prov
 end
 
 # Whether a timestep's `k` leaves that timestep's lapse-rate fit uncorrupted. `NaN` does: the fit

@@ -25,6 +25,15 @@ const AlbedoElevationFit = @NamedTuple{slope_per_km::Float64, intercept::Float64
 const _NO_ALBEDO_FIT = AlbedoElevationFit((NaN, NaN, NaN, NaN, 0, (NaN, NaN)))
 
 """
+The satellite product a [`BareIceAlbedoHyps`](@ref) reduces, as a sentence for a file attribute.
+
+Named once and shared by everything that records where a bare-ice albedo came from, so a parameter
+file and a run that consumed it cannot describe the same numbers differently.
+"""
+const BARE_ICE_ALBEDO_PRODUCT =
+    "MODIS MCD43A3 v061, darkest-percentile mean pooled over 2000-2025, at RGI 7.0 cells."
+
+"""
     BareIceAlbedoHyps
 
 Bare-ice albedo binned by elevation, callable as `f(z)`.
