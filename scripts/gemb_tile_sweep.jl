@@ -21,7 +21,11 @@
 #
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
-# PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, FORCING_CACHE_GIB, DONOR_MAX_DISTANCE_KM
+# PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1
+#
+# To widen the perturbation grid, run the extra points as a supplementary sweep into their own
+# OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
 # Sizing: a 60-band tile over the 7x7 grid is 2,940 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
@@ -63,8 +67,8 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 # at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
 # far points exist to bracket it and to show the response is monotonic.
 #
-# `1.0` and `0.0` must be present. They are the baseline the reports and the reference discharge locate
-# with `findfirst`, and a grid without them silently loses both.
+# `1.0` and `0.0` must be present, except under `SUPPLEMENTARY`. They are the baseline the reports and
+# the reference discharge locate with `findfirst`, and a grid without them silently loses both.
 #
 # Overridable so a timing probe or a re-fit does not need the file edited, but the defaults are the run:
 # they are what a re-run reproduces, and they are in git.
@@ -106,9 +110,6 @@ const SPINUP_CLIMATOLOGY_WINDOW = (
 # archipelagos — still runs instead of failing. `0` drops those cells' ice instead.
 const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "50.0"))
 
-# Slack on the forcing an append fetches, before the saved output time. The run trims to strictly after
-# that time, so this only guards against the forcing grid not landing on it; one step would do, and a day
-# costs nothing against a fetch measured in months.
 # How often the transient is sampled. Weekly resolves the melt season, which monthly averages across:
 # ablation is concentrated in a few weeks and a monthly mean spreads it over the whole month, so a
 # comparison against altimetry binned finer than a month cannot see it. `output_period_bound` must know
@@ -118,6 +119,9 @@ const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "
 # changes how much of it is written — about 4.4x more steps than monthly over the full record.
 const OUTPUT_FREQUENCY = Symbol(get(ENV, "OUTPUT_FREQUENCY", "weekly"))
 
+# Slack on the forcing an append fetches, before the saved output time. The run trims to strictly after
+# that time, so this only guards against the forcing grid not landing on it; one step would do, and a day
+# costs nothing against a fetch measured in months.
 const RESTART_FETCH_OVERLAP = Day(1)
 
 # Where tile claims live, and how long before one is treated as abandoned. Under `OUTPUT_DIR` so a claim
@@ -133,6 +137,9 @@ const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
 const TILE_LIMIT = haskey(ENV, "TILE_LIMIT") ? parse(Int, ENV["TILE_LIMIT"]) : typemax(Int)
 const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? split(ENV["TILE_NAMES"], ",") : String[]
 const FORCE = get(ENV, "FORCE", "0") == "1"
+# Run only extra perturbation points, to be joined onto an existing grid by `merge_tile_perturbations`.
+# Waives the baseline-corner requirement; see the pre-flight for why that is safe only when merged.
+const SUPPLEMENTARY = get(ENV, "SUPPLEMENTARY", "0") == "1"
 
 # Which slice of the tile list this process owns, as `TILE_BLOCK` of `TILE_BLOCKS`, 1-based.
 #
@@ -243,12 +250,23 @@ function main()
     # The baseline corner has to exist: it is what the summary's `dv_rate_baseline` and every downstream
     # anomaly are measured against, and `findfirst` returning `nothing` would drop them silently rather
     # than fail.
-    1.0 in PRECIPITATION_SCALINGS || error(
-        "PRECIPITATION_SCALINGS must include 1.0, the unperturbed baseline; got " *
-        string(PRECIPITATION_SCALINGS))
-    0.0 in DELTA_TEMPERATURES || error(
-        "DELTA_TEMPERATURES must include 0.0, the unperturbed baseline; got " *
-        string(DELTA_TEMPERATURES))
+    #
+    # `SUPPLEMENTARY=1` lifts that, for a run whose only job is to add perturbation points to a grid
+    # that already has the baseline — `merge_tile_perturbations` joins the two and the merged file
+    # carries the corner. Such a run must write to its own `OUTPUT_DIR`: its files have a different
+    # `delta_temperature` axis, so the sweep would otherwise read the existing tiles as a different
+    # experiment and rebuild all of them.
+    if SUPPLEMENTARY
+        @warn "Supplementary run: the baseline corner is not required here, and this output is only " *
+              "meaningful once merged into a grid that has it" DELTA_TEMPERATURES PRECIPITATION_SCALINGS OUTPUT_DIR
+    else
+        1.0 in PRECIPITATION_SCALINGS || error(
+            "PRECIPITATION_SCALINGS must include 1.0, the unperturbed baseline; got " *
+            string(PRECIPITATION_SCALINGS))
+        0.0 in DELTA_TEMPERATURES || error(
+            "DELTA_TEMPERATURES must include 0.0, the unperturbed baseline; got " *
+            string(DELTA_TEMPERATURES))
+    end
     all(>=(0), PRECIPITATION_SCALINGS) || error(
         "a negative precipitation scaling is not a scenario; got " * string(PRECIPITATION_SCALINGS))
 
