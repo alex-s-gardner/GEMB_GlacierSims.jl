@@ -112,6 +112,8 @@ export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id
 export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
 
 include("netcdf_tile_run.jl")
+include("netcdf_tile_merge.jl")
+export merge_tile_perturbations
 export write_glacier_tile_netcdf, append_glacier_tile_netcdf
 export read_glacier_tile_status, read_glacier_tile_restart
 
