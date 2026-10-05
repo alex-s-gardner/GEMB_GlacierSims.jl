@@ -27,7 +27,7 @@
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
-# Sizing: a 60-band tile over the 7x7 grid is 2,940 simulations, and one simulation is the spinup plus
+# Sizing: a 60-band tile over the 10x7 grid is 4,200 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
 # full ERA5-Land record is eleven times longer with a `:representative` spinup costing about 2.2x the
 # model-years of an averaged one. Measure with a TILE_LIMIT or TILE_NAMES subset before committing to a
@@ -77,7 +77,7 @@ const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
     [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 4.0]
 const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
-    [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0]
+    [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
 
 # Ceiling on the spinup, not the convergence test: bands exit on the drift criterion well inside this on
 # glacier firn, so the ceiling only binds on an outlier.
@@ -129,7 +129,7 @@ const RESTART_FETCH_OVERLAP = Day(1)
 # sweep can no longer see.
 #
 # The bound has to exceed the longest a single tile can legitimately take: reclaiming a running tile would
-# put two processes on one netCDF. A 63-band tile over the 7x7 grid and the full record is the worst case,
+# put two processes on one netCDF. A 63-band tile over the 10x7 grid and the full record is the worst case,
 # so this is deliberately generous. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
 const CLAIM_SUBDIR = "claims"
 const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
