@@ -29,13 +29,24 @@ waiting on the CDS queue for hours. `$CLIMATE_CACHE/downscaling_parameters` hold
 from `derive_downscaling_parameter_tiles.jl` for the same reason.
 
 One cache is *not* covered by this: `climate_forcing` does not thread a path through to the
-invariant geopotential file, so `GEMB_ClimateForcing` always puts it at
-`tempdir()/GEMB_ClimateForcing/invariant/era5_land/`. A copy is preserved at
-`$CLIMATE_CACHE/invariant/era5_land/`; restore it after a reboot with
+invariant geopotential file, so `GEMB_ClimateForcing` caches it under its own package install
+directory — `_default_invariant_cache` resolves to
+`<pkgdir(GEMB_ClimateForcing)>/data/invariant/era5_land/`. That path is keyed to the package's
+content-hash slug (`~/.julia/packages/GEMB_ClimateForcing/<slug>/`), so **any `Pkg.update` or
+`Pkg.resolve` that changes the resolved commit orphans the cached file**: the new slug's
+`data/invariant/era5_land/` starts empty, and every worker that starts after the bump tries to
+redownload it. Starting several workers at once at that moment hits a known race
+(`rename(...): no such file or directory`) — one wins, the rest fail that tile and exit. A copy
+is preserved at `$CLIMATE_CACHE/invariant/era5_land/`; after a dependency bump (or a reboot, which
+has the same effect on other `tempdir()`-cached state in this repo), restore it into the *current*
+slug's path before launching workers:
 
 ```sh
-mkdir -p /tmp/GEMB_ClimateForcing/invariant
-cp -a /mnt/bylot-r3/data/era5land/invariant/era5_land /tmp/GEMB_ClimateForcing/invariant/
+PKGDIR=$(~/.juliaup/bin/julia +release --project=. -e \
+  'using GEMB_ClimateForcing; print(pkgdir(GEMB_ClimateForcing))')
+mkdir -p "$PKGDIR/data/invariant/era5_land"
+cp -a /mnt/bylot-r3/data/era5land/invariant/era5_land/geo_1279l4_0.1x0.1.grib2_v4_unpack.nc \
+      "$PKGDIR/data/invariant/era5_land/"
 ```
 
 Low stakes either way — it is one 50 MB file from a plain HTTP URL, not a CDS-queued request.
