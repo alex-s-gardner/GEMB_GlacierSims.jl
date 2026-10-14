@@ -1051,9 +1051,7 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
     weight > 0 || throw(ArgumentError(
         "elevation interval $(interval.lo)-$(interval.hi) m accumulated zero area"))
     time_dim = dims(template, Ti)
-    layers = NamedTuple(v => DimArray(v === :solar_zenith_angle ?
-                                          _band_zenith_angle(sums[v], sums[:shortwave_downward]) :
-                                          sums[v] ./ weight, (time_dim,);
+    layers = NamedTuple(v => DimArray(_band_layer(v, sums, weight), (time_dim,);
                                       metadata = DimensionalData.metadata(template[v]))
                         for v in _FORCING_VARIABLES)
 
@@ -1133,6 +1131,26 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
             albedo_ice = interval.albedo_ice,
             albedo_ice_source = interval.albedo_ice_source,
             forcing = DimStack(layers; metadata = meta))
+end
+
+# One layer of a band's forcing from its accumulated sums.
+#
+# Cloud optical thickness is capped at `CLOUD_OPTICAL_THICKNESS_MAX` per cell, and an area mean of
+# values at the cap can round a few ulps above it, which the forcing validator rejects. A mean within
+# that rounding of the cap is set to the cap; one further above is an error in the inputs.
+function _band_layer(v::Symbol, sums, weight)
+    v === :solar_zenith_angle && return _band_zenith_angle(sums[v], sums[:shortwave_downward])
+    mean = sums[v] ./ weight
+    if v === :cloud_optical_thickness
+        cap = CLOUD_OPTICAL_THICKNESS_MAX
+        for t in eachindex(mean)
+            mean[t] <= cap && continue
+            mean[t] <= cap * (1 + 1e-12) || throw(ErrorException(
+                "band mean cloud_optical_thickness is $(mean[t]) at step $t, above the per-cell cap $cap"))
+            mean[t] = cap
+        end
+    end
+    return mean
 end
 
 # A band's solar zenith angle (degrees) from the accumulated `Σ w·SW·cos θ` and `Σ w·SW`: the angle

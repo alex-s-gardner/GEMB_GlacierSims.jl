@@ -72,3 +72,16 @@ end
     E0 = (T_obs .- 273.15) .- Γ * 1.5
     @test cf0.temperature_air ≈ @.(273.15 + ifelse(E0 > 0, k * E0, E0)) atol = 1e-10
 end
+
+@testset "pipeline audit: band optical thickness at the cap" begin
+    # Three cells at the per-cell cap whose area-weighted mean rounds one ulp above it, as the
+    # accumulation forms it: the band mean is the cap itself, which the forcing validator accepts.
+    cap = GEMB_GlacierSims.CLOUD_OPTICAL_THICKNESS_MAX
+    w = [0.1, 0.1, 0.7]
+    total = foldl((acc, x) -> acc + x * cap, w; init = 0.0)
+    @test total / foldl(+, w) > cap
+    sums = Dict(:cloud_optical_thickness => [total], :shortwave_downward => [1.0])
+    @test GEMB_GlacierSims._band_layer(:cloud_optical_thickness, sums, foldl(+, w)) == [cap]
+    @test_throws "above the per-cell cap" GEMB_GlacierSims._band_layer(
+        :cloud_optical_thickness, Dict(:cloud_optical_thickness => [1.01 * cap]), 1.0)
+end

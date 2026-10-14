@@ -19,6 +19,7 @@ using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
                            _cell_forcing_at_interval, _FORCING_VARIABLES,
                            _MIN_CELLS_DEFAULT, _DECOUPLING_FACTOR_LIMITS,
                            _LAPSE_RATE_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE,
+                           CLOUD_OPTICAL_THICKNESS_MAX,
                            _MIN_AMBIENT_EXCESS, _haversine_km
 using DimensionalData
 using Rasters
