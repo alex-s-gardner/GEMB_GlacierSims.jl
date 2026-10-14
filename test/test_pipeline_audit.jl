@@ -246,3 +246,48 @@ end
         :synthetic, (_CP_TIME[1], _CP_TIME[end]), _cp_table(cells); token = nothing,
         cache_path = nothing, min_cells = 2, forcing_loader = flaky)
 end
+
+@testset "pipeline audit: merge keeps per-source attributes" begin
+    dir = mktempdir()
+    a = _fake_tile_run(; deltas = [0.0, 1.0])
+    b = _fake_tile_run(; deltas = [-1.0])
+    a.provenance["max_dh_residual"] = 1.0e-14
+    b.provenance["max_dh_residual"] = 4.0e-13
+    a.provenance["n_bands_dropped"] = 0
+    b.provenance["n_bands_dropped"] = 2
+    b.provenance["spinup_converged"] = true          # `a` carries false
+    pa = write_glacier_tile_netcdf(joinpath(dir, "a.nc"), a)
+    pb = write_glacier_tile_netcdf(joinpath(dir, "b.nc"), b)
+    out = merge_tile_perturbations(joinpath(dir, "m.nc"), [pa, pb])
+    NCDatasets.NCDataset(out, "r") do ds
+        @test ds["delta_temperature"][:] == [-1.0, 0.0, 1.0]
+        @test ds["source_max_dh_residual"][:] == [4.0e-13, 1.0e-14, 1.0e-14]
+        @test ds["source_n_bands_dropped"][:] == [2.0, 0.0, 0.0]
+        @test ds["source_spinup_converged"][:] == ["true", "false", "false"]
+        @test ds.attrib["max_dh_residual"] == 4.0e-13
+        @test ds.attrib["spinup_converged"] == "false"
+        @test !haskey(ds.attrib, "n_bands_dropped")
+        @test issubset(["max_dh_residual", "n_bands_dropped", "spinup_converged"],
+                       split(ds.attrib["source_attributes"]))
+        # Shared attributes are carried as they are.
+        @test ds.attrib["geotile_id"] == a.geotile_id
+    end
+end
+
+@testset "pipeline audit: elevation datum and annual precipitation" begin
+    path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), _fake_tile_run())
+    NCDatasets.NCDataset(path, "r") do ds
+        for name in ("band_center", "band_lower", "band_upper")
+            @test ds[name].attrib["standard_name"] == "height_above_mean_sea_level"
+            @test ds[name].attrib["vertical_datum"] == "EGM2008"
+        end
+    end
+    # Hourly forcing at 0.1 kg m-2 per step is 876 kg m-2 per 365-day year.
+    cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 1.0)])]
+    applied = _flat_applied(_CP_TIME, [(1000, 1100)])
+    band = only(collect(elevation_interval_forcing(
+        _cp_table(cells), applied; climate_model = :synthetic,
+        time_range = (_CP_TIME[1], _CP_TIME[end]),
+        forcing_loader = _cp_loader(cells, c -> fill(270.0, length(_CP_TIME))))))
+    @test DimensionalData.metadata(band.forcing)["precipitation_mean"] ≈ 0.1 * 8760
+end

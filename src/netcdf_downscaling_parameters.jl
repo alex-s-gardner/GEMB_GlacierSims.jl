@@ -357,17 +357,21 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
 
     for (name, values, units, long_name, standard_name) in (
         ("interval_center", [Float64(iv.center) for iv in intervals], "m",
-         "elevation interval center", "height_above_reference_ellipsoid"),
+         "elevation interval center", ELEVATION_STANDARD_NAME),
         ("interval_lower", [Float64(iv.lo) for iv in intervals], "m",
-         "elevation interval lower edge", "height_above_reference_ellipsoid"),
+         "elevation interval lower edge", ELEVATION_STANDARD_NAME),
         ("interval_upper", [Float64(iv.hi) for iv in intervals], "m",
-         "elevation interval upper edge", "height_above_reference_ellipsoid"),
+         "elevation interval upper edge", ELEVATION_STANDARD_NAME),
         ("interval_area", [Float64(iv.area) for iv in intervals], "km2",
          "glacier area in the elevation interval", ""))
         v = NCDatasets.defVar(ds, name, Float64, ("elevation_interval",))
         v.attrib["units"] = units
         v.attrib["long_name"] = long_name
-        isempty(standard_name) || (v.attrib["standard_name"] = standard_name)
+        if standard_name == ELEVATION_STANDARD_NAME
+            _set_elevation_datum!(v)
+        elseif !isempty(standard_name)
+            v.attrib["standard_name"] = standard_name
+        end
         v[:] = values
     end
     ds["interval_area"].attrib["comment"] =
