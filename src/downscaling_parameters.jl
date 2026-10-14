@@ -1087,7 +1087,9 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
         "n_timesteps_above_freezing" => count(warm),
         "adjustment_order" => "ambient_lapse_decouple",
         "temperature_air_mean" => Statistics.mean(layers.temperature_air),
-        "precipitation_mean" => Statistics.mean(layers.precipitation),
+        # kg m-2 yr-1, as GEMB reads it: the mean per step times the steps in a 365-day year, the
+        # convention `climate_forcing` and `precipitation_adjust` use.
+        "precipitation_mean" => Statistics.mean(layers.precipitation) * _steps_per_year(time_dim),
         "wind_speed_mean" => Statistics.mean(layers.wind_speed)))
 
     # The provenance of every applied value, by source, for `k` at this band and for the tile's lapse
@@ -1114,6 +1116,13 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
             albedo_ice = interval.albedo_ice,
             albedo_ice_source = interval.albedo_ice_source,
             forcing = DimStack(layers; metadata = meta))
+end
+
+# Forcing steps in a 365-day year, from the step of a `Ti` axis.
+function _steps_per_year(ti)
+    t = lookup(ti)
+    length(t) >= 2 || throw(ArgumentError("a forcing axis of $(length(t)) step(s) has no step length"))
+    return Dates.value(Millisecond(Day(365))) / Dates.value(Millisecond(t[2] - t[1]))
 end
 
 # One layer of a band's forcing from its accumulated sums.

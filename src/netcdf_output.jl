@@ -30,6 +30,21 @@ _nc_decode_time(t::DateTime) = t
 
 const NC_FILL = NaN
 
+# Band and bin elevations are orthometric heights above the EGM2008 geoid: the glacier hypsometry is
+# binned from the Copernicus DEM, and ERA5-Land surface elevations are referenced to the same geoid.
+# CF's name for a height above the geoid is `height_above_mean_sea_level`; the geoid model has no
+# standard attribute, so it is named in `vertical_datum` and the comment.
+const ELEVATION_STANDARD_NAME = "height_above_mean_sea_level"
+const ELEVATION_DATUM = "EGM2008"
+const ELEVATION_DATUM_COMMENT = "Orthometric height above the EGM2008 geoid."
+
+function _set_elevation_datum!(v)
+    v.attrib["standard_name"] = ELEVATION_STANDARD_NAME
+    v.attrib["vertical_datum"] = ELEVATION_DATUM
+    v.attrib["comment"] = ELEVATION_DATUM_COMMENT
+    return v
+end
+
 """
     write_glacier_cell_netcdf(path, run::GlacierCellRun; kwargs...)
 
@@ -367,7 +382,7 @@ function _write_coordinates!(ds, run::GlacierCellRun, n_layer::Int)
     )
         v = NCDatasets.defVar(ds, name, Float64, ("bin",))
         v.attrib["units"] = "m"
-        v.attrib["standard_name"] = "height_above_reference_ellipsoid"
+        _set_elevation_datum!(v)
         v.attrib["long_name"] = long_name
         v.attrib["positive"] = "up"
         v[:] = values

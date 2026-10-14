@@ -431,7 +431,7 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
     )
         v = NCDatasets.defVar(ds, name, Float64, ("band",))
         v.attrib["units"] = "m"
-        v.attrib["standard_name"] = "height_above_reference_ellipsoid"
+        _set_elevation_datum!(v)
         v.attrib["long_name"] = long_name
         v.attrib["positive"] = "up"
         v[:] = values
