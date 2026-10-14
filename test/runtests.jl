@@ -34,17 +34,21 @@ end
 
 const _CP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
-# Synthetic climate forcing shaped exactly like `climate_forcing` output: the seven layers on a `Ti`
-# axis, with the metadata keys `forcing_is_complete` and the elevation interval pass reads.
-function _cp_forcing(lat, lon, elevation, temperature)
+# Synthetic climate forcing shaped exactly like `climate_forcing` output: the ten layers on a `Ti`
+# axis, with the metadata keys `forcing_is_complete` and the elevation interval pass reads. Keywords
+# replace a constant layer by name, with a scalar or a series.
+function _cp_forcing(lat, lon, elevation, temperature; overrides...)
     n = length(temperature)
     ti = Ti(_CP_TIME[1:n])
-    const_layers = (pressure_air = 8e4, vapor_pressure = 300.0, wind_speed = 3.0,
-                    precipitation = 0.1, shortwave_downward = 100.0, longwave_downward = 250.0)
+    const_layers = merge((pressure_air = 8e4, vapor_pressure = 300.0, wind_speed = 3.0,
+                          precipitation = 0.1, shortwave_downward = 100.0, longwave_downward = 250.0,
+                          solar_zenith_angle = 60.0, shortwave_downward_diffuse = 30.0,
+                          cloud_optical_thickness = 2.0), NamedTuple(overrides))
     layers = merge(
         (temperature_air = DimArray(collect(Float64, temperature), (ti,);
                                     metadata = Dict("units" => "K")),),
-        NamedTuple(v => DimArray(fill(Float64(x), n), (ti,)) for (v, x) in pairs(const_layers)))
+        NamedTuple(v => DimArray(x isa AbstractVector ? collect(Float64, x) : fill(Float64(x), n),
+                                 (ti,)) for (v, x) in pairs(const_layers)))
     return DimStack(layers; metadata = Dict{String,Any}(
         "latitude" => Float64(lat), "longitude" => Float64(lon),
         "elevation" => Float64(elevation), "dataset" => "synthetic",
@@ -1071,10 +1075,9 @@ end
         end
 
         @testset "lapse rate" begin
-            # The ON-GLACIER lapse rate, which is not the ambient one. Above melting the decoupling
-            # maps T -> 273.15 + k(T - 273.15), so it compresses the profile and the on-glacier
-            # slope is k*Γ.
-            @test all(g -> isapprox(g, k_true * gamma_true, atol = 1e-8), p.lapse_rate.lapse_rate)
+            # The AMBIENT lapse rate: the fit brings every cell to the ice-free state before taking
+            # the slope, which is the slope the band forcing is lapsed with before it is decoupled.
+            @test all(g -> isapprox(g, gamma_true, atol = 1e-8), p.lapse_rate.lapse_rate)
             @test p.lapse_rate isa DimStack
             @test collect(dims(p.lapse_rate, Ti)) == p.time
             @test DimensionalData.metadata(p.lapse_rate)["n_fitted"] == length(_CP_TIME)
@@ -1090,7 +1093,7 @@ end
             by_month = groupby(p.lapse_rate, Ti => month)
             @test length(by_month) == 1
             @test Statistics.median(filter(isfinite, only(by_month).lapse_rate)) ≈
-                  k_true * gamma_true atol = 1e-8
+                  gamma_true atol = 1e-8
             by_hour = groupby(p.decoupling, Ti => hour)
             @test length(by_hour) == length(_CP_TIME)
             @test all(g -> isapprox(Statistics.median(filter(isfinite, g.decoupling_factor)),
@@ -1110,11 +1113,13 @@ end
             zs = [c.z for c in cells]
             gs = [c.glm for c in cells]
             kk = collect(p.decoupling.decoupling_factor)[1]
-            a, b = collect(p.decoupling.coef_alpha)[1], collect(p.decoupling.coef_beta)[1]
+            γc, δc = collect(p.decoupling.coef_gamma)[1], collect(p.decoupling.coef_delta)[1]
             usable = isfinite(kk) && 0 < kk <= 1
             raw = [observed(c)[1] for c in cells]
+            # The ice-free temperature of a cell above melting, `T - glm·(γ + δz)`.
             corrected = usable ?
-                [raw[i] + (kk - 1) * (1 - gs[i]) * (a + b * zs[i]) for i in eachindex(raw)] : copy(raw)
+                [raw[i] - (raw[i] > 273.15 ? gs[i] * (γc + δc * zs[i]) : 0.0) for i in eachindex(raw)] :
+                copy(raw)
             Szz = sum((zs .- mean(zs)) .^ 2)
             SzT = sum((zs .- mean(zs)) .* (corrected .- mean(corrected)))
             STT = sum((corrected .- mean(corrected)) .^ 2)
@@ -1140,31 +1145,39 @@ end
 
             # The realistic case: cells that do *not* fall exactly on a line, which is what the
             # diagnostic exists to measure. Here the sums must reproduce a from-scratch regression
-            # tightly, not just to a floor.
-            scatter = [0.0, 0.4, -0.3, 0.25, -0.15, 0.05][1:length(cells)]
-            noisy(c) = (i = findfirst(x -> x.lat == c.lat && x.lon == c.lon, cells);
+            # tightly, not just to a floor. Six cells, because the four-term decoupling fit
+            # interpolates four cells exactly and its ice-free correction would then remove any
+            # scatter they carry.
+            cells6 = [cells; [(lon = 10.4, lat = 46.0, z = 1200.0, glm = 0.7, bins = [(1250, 5.0)]),
+                              (lon = 10.45, lat = 46.0, z = 2200.0, glm = 0.1, bins = [(2250, 5.0)])]]
+            zs6 = [c.z for c in cells6]
+            gs6 = [c.glm for c in cells6]
+            Szz6 = sum((zs6 .- mean(zs6)) .^ 2)
+            scatter = [0.0, 0.4, -0.3, 0.25, -0.15, 0.05]
+            noisy(c) = (i = findfirst(x -> x.lat == c.lat && x.lon == c.lon, cells6);
                         observed(c) .+ scatter[i])
-            pn = derive_downscaling_parameters(:synthetic, time_range, table, region;
+            pn = derive_downscaling_parameters(:synthetic, time_range, _cp_table(cells6), region;
                                                token = nothing, cache_path = nothing, min_cells = 4,
-                                               forcing_loader = _cp_loader(cells, noisy))
+                                               forcing_loader = _cp_loader(cells6, noisy))
             kn = collect(pn.decoupling.decoupling_factor)[1]
-            an, bn = collect(pn.decoupling.coef_alpha)[1], collect(pn.decoupling.coef_beta)[1]
-            rawn = [noisy(c)[1] for c in cells]
+            γn, δn = collect(pn.decoupling.coef_gamma)[1], collect(pn.decoupling.coef_delta)[1]
+            rawn = [noisy(c)[1] for c in cells6]
             corrn = (isfinite(kn) && 0 < kn <= 1) ?
-                [rawn[i] + (kn - 1) * (1 - gs[i]) * (an + bn * zs[i]) for i in eachindex(rawn)] :
+                [rawn[i] - (rawn[i] > 273.15 ? gs6[i] * (γn + δn * zs6[i]) : 0.0)
+                 for i in eachindex(rawn)] :
                 copy(rawn)
-            SzTn = sum((zs .- mean(zs)) .* (corrn .- mean(corrn)))
+            SzTn = sum((zs6 .- mean(zs6)) .* (corrn .- mean(corrn)))
             STTn = sum((corrn .- mean(corrn)) .^ 2)
-            rssn = STTn - SzTn^2 / Szz
+            rssn = STTn - SzTn^2 / Szz6
             @test rssn > 1e-6                       # genuinely scattered, so the check has teeth
             @test collect(pn.lapse_rate_uncertainty.residual_sd)[1] ≈
-                  sqrt(rssn / (length(zs) - 2)) rtol = 1e-6
+                  sqrt(rssn / (length(zs6) - 2)) rtol = 1e-6
             @test collect(pn.lapse_rate_uncertainty.lapse_rate_stderr)[1] ≈
-                  1000 * sqrt(rssn / (length(zs) - 2)) / sqrt(Szz) rtol = 1e-6
+                  1000 * sqrt(rssn / (length(zs6) - 2)) / sqrt(Szz6) rtol = 1e-6
             @test collect(pn.lapse_rate_uncertainty.lapse_rate_r2)[1] ≈
                   1 - rssn / STTn rtol = 1e-6
             # And the slope the error belongs to is still upstream's, unchanged by any of this.
-            @test collect(pn.lapse_rate.lapse_rate)[1] ≈ -1000 * SzTn / Szz rtol = 1e-8
+            @test collect(pn.lapse_rate.lapse_rate)[1] ≈ -1000 * SzTn / Szz6 rtol = 1e-8
         end
 
         @testset "elevation interval forcing" begin
@@ -1223,17 +1236,42 @@ end
             # Interval temperature decreases with elevation.
             @test issorted([mean(iv.forcing[:temperature_air]) for iv in intervals], rev = true)
 
-            # Each interval here draws on exactly one cell whose own elevation is 50 m below the
-            # center, so its temperature is that cell's forcing lapsed 50 m and then given the
-            # decoupling it still needs — a value that can be written out by hand.
-            for (iv, c) in zip(intervals, cells)
-                lapsed = observed(c)[1] - k_true * gamma_true * (iv.center - c.z) / 1000.0
-                still_needed = 1 - (1 - k_true) * (1 - c.glm)
-                expected = lapsed + (still_needed - 1) * max(lapsed - 273.15, 0.0)
+            # The analytic on-glacier temperature `T_ref + k(z)·E_ambient(z)` at each band's center. The
+            # fixture follows the mixing model with one `k` at every elevation, so the band
+            # temperature depends on neither the contributing cell's `glm` nor its elevation.
+            for iv in intervals
+                expected = 273.15 + k_true * (t0 - gamma_true * iv.center / 1000 - 273.15)
                 @test mean(iv.forcing[:temperature_air]) ≈ expected atol = 1e-8
                 # Precipitation is area-averaged unadjusted: the downstream sweep solves for its
                 # correction factor, which is the whole point of producing this forcing.
                 @test all(≈(0.1), iv.forcing[:precipitation])
+            end
+
+            @testset "far above donors of different glm" begin
+                # Bands 1050 to 2550 m above the cells that force them, with glacier fractions from
+                # 0 to 0.9 and one band drawn from three of them. Each cell's forcing is the mixing
+                # model's observed temperature, so the only value every cell can agree on at a band is
+                # `T_ref + k·E_ambient(z_band)`.
+                far = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(2050, 3.0), (3550, 5.0)]),
+                       (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.9, bins = [(3550, 7.0)]),
+                       (lon = 10.2, lat = 46.0, z = 2000.0, glm = 0.3, bins = [(3050, 2.0)]),
+                       (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.6, bins = [(3550, 4.0)])]
+                t_far = 300.0
+                ambient_far(z) = t_far - gamma_true * z / 1000
+                observed_far(c) = fill(273.15 + (1 - c.glm * (1 - k_true)) * (ambient_far(c.z) - 273.15),
+                                       length(_CP_TIME))
+                pf = derive_downscaling_parameters(:synthetic, time_range, _cp_table(far), region;
+                                                   token = nothing, cache_path = nothing,
+                                                   min_cells = 4,
+                                                   forcing_loader = _cp_loader(far, observed_far))
+                bands_far = collect(pf.elevation_interval_forcing)
+                @test [b.center for b in bands_far] == [2050.0, 3050.0, 3550.0]
+                @test only(filter(b -> b.center == 3550.0, bands_far)).n_cells == 3
+                for b in bands_far
+                    @test DimensionalData.metadata(b.forcing)["extrapolation_above_reanalysis"] >= 1000
+                    expected = 273.15 + k_true * (ambient_far(b.center) - 273.15)
+                    @test all(T -> isapprox(T, expected, atol = 1e-8), b.forcing[:temperature_air])
+                end
             end
         end
 
@@ -1281,7 +1319,7 @@ end
             @test p.provenance["n_grid_cells_in_region"] == 4
             @test p.provenance["n_grid_cells_used"] == 4
             @test p.provenance["n_elevation_intervals"] == 4
-            @test p.provenance["adjustment_order"] == "lapse_then_decouple"
+            @test p.provenance["adjustment_order"] == "ambient_lapse_decouple"
             # How much of each fit is measurement rather than absence — the count, not a verdict.
             @test p.provenance["n_timesteps"] == length(_CP_TIME)
             @test p.provenance["n_decoupling_factor_fitted"] == length(_CP_TIME)
@@ -2572,14 +2610,15 @@ end
             # untouched between these two tables, so a dependence on it could not show up here.
             #
             # Two conditions have to hold for `glm` to be observable at all, and both are asserted
-            # below rather than assumed: `k` must not be the identity, since
-            # `_effective_decoupling_factor(1, glm)` is 1 whatever `glm` is, and the band must be above
-            # freezing, since the correction scales `max(T - 273.15, 0)`.
+            # below rather than assumed: `k` must not be the identity, since the ice-free correction
+            # scales with `1 - k`, and the band must be above freezing, since the correction scales
+            # `max(T - 273.15, 0)`.
             half = [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
                     for b in applied.bands]
             applied_k = GEMB_GlacierSims.AppliedDownscaling(
                 applied.time, applied.lapse_rate, applied.lapse_rate_source, half,
-                applied.basis, applied.settings)
+                applied.basis, applied.settings, Dict{String,Any}(),
+                z -> fill(0.5, length(applied.time)))
             hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
             hot_hole(c) = c.lon == 10.1 ? masked(c) : hot(c)
 
@@ -3142,3 +3181,5 @@ end
     # `scripts/derive_downscaling_parameters_e2e.jl`, `scripts/gemb_tile_e2e.jl` and
     # `scripts/derive_bare_ice_albedo_tile.jl` rather than here.
 end
+
+include("test_pipeline_audit.jl")

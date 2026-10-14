@@ -268,7 +268,7 @@ function _write_lapse_rate!(ds, p, precision, deflatelevel)
 
     # The joint screen, as a variable rather than a comment.
     #
-    # `derive_lapse_rate` consumes `k` to bring the cells to a common on-glacier state, so a `k`
+    # `derive_lapse_rate` consumes the decoupling fit to bring the cells to the ice-free state, so a `k`
     # outside (0, 1] corrupts that timestep's *slope* as well — and the corruption is a smooth false
     # gradient rather than scatter, so it is invisible in the slope series alone and no robust
     # estimator removes it. A reader who screens the two series separately therefore gets a
@@ -475,9 +475,9 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
         end
     end
     ds["temperature_air"].attrib["comment"] =
-        "Glacier-area weighted mean over the cells holding ice in this interval, each lapsed to " *
-        "the interval center and then decoupled — in that order, which is the order " *
-        "climate_adjust_for_glacier requires."
+        "Glacier-area weighted mean over the cells holding ice in this interval, each brought to " *
+        "the ice-free state with k at its own elevation, lapsed to the interval center with the " *
+        "ambient lapse rate, and then decoupled with k at the interval center."
     return nothing
 end
 
