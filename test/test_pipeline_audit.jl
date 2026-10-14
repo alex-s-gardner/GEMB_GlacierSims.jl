@@ -291,3 +291,18 @@ end
         forcing_loader = _cp_loader(cells, c -> fill(270.0, length(_CP_TIME))))))
     @test DimensionalData.metadata(band.forcing)["precipitation_mean"] ≈ 0.1 * 8760
 end
+
+@testset "pipeline audit: band validation grid" begin
+    # A band at 200 K survives ΔT = 0 but not ΔT = -30 (170 K is below the validator's 180 K floor).
+    # Run at ΔT = 0 alone it is kept; validated against a grid reaching -30 K it is dropped, as it is
+    # from a run over that grid.
+    cold = _tiny_band_forcing(; years = 1, temperature = 200.0)
+    band = (; lo = 1000, hi = 1100, center = 1050.0, area = 1.0, forcing = cold)
+    kept, _ = GEMB_GlacierSims._runnable_bands([band], [0.0], [1.0])
+    @test length(kept) == 1
+    kept, dropped = GEMB_GlacierSims._runnable_bands([band], [-30.0, 0.0], [1.0])
+    @test isempty(kept) && only(dropped).delta == -30.0
+    @test_throws ForcingUnavailable _tiny_tile_run([0.4]; forcing = cold,
+                                                   validation_grid = ([-30.0], [1.0]))
+end
+

@@ -159,6 +159,11 @@ published 2° products exclude rain from their aggregates.
   parameters. It changes nothing here — the substitution happens in
   [`elevation_interval_forcing`](@ref), and these bands no longer know which cells borrowed — but two
   runs under different caps rest on different forcing and must not compare as the same experiment.
+- `validation_grid = nothing`: `(delta_temperatures, precipitation_scalings)` a band's forcing must
+  also be perturbable to, beyond this run's own grid. A band is run only if every perturbation of
+  both grids passes the forcing validator, so a run at a few points of a wider grid — a
+  native-resolution run at its calibrated correction — keeps exactly the bands a run over the wider
+  grid keeps.
 - `restart = nothing`: the value [`read_glacier_tile_restart`](@ref) returns, or `nothing`. Each run
   inherits its saved column and the spinup is skipped; the forcing is trimmed to the steps after the
   saved time, so pass only the new forcing rather than refetching the record. Throws
@@ -182,6 +187,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            drift_window::Int = SPINUP_DRIFT_WINDOW,
                            threaded::Bool = true,
                            donor_max_distance_km = nothing,
+                           validation_grid = nothing,
                            restart = nothing,
                            force_restart::Bool = false,
                            on_output = nothing)
@@ -204,7 +210,11 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             "elevation); a NaN in an applied downscaling parameter is the usual cause"))
     end
 
-    bands, dropped = _runnable_bands(bands, delta_temperatures, precipitation_scalings)
+    validation_deltas, validation_scalings = validation_grid === nothing ?
+        (delta_temperatures, precipitation_scalings) :
+        (sort!(unique!(vcat(delta_temperatures, collect(Float64, validation_grid[1])))),
+         sort!(unique!(vcat(precipitation_scalings, collect(Float64, validation_grid[2])))))
+    bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings)
     isempty(bands) && throw(ForcingUnavailable(
         "no band of this tile could be perturbed into forcing GEMB accepts; the highest bands are " *
         "lapse extrapolations far above every contributing reanalysis surface, and a cold " *
@@ -264,8 +274,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # No elevation or glacier adjustment: the band forcing is already at the band center and
         # already decoupled. Rebuilt per task rather than shared across perturbations, so concurrent
         # tasks never hand each other the same object.
-        adjusted = precipitation_adjust(temperature_adjust(band.forcing, delta), pscale)
-        cf = initialize_forcing(adjusted)
+        cf = initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
 
         # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
         # task, so concurrent tasks never share it, and used for the spinup as well as the run: a
@@ -405,6 +414,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # a recorded number rather than something a reader has to notice. Zero on a tile whose every band
     # was runnable, which is the common case.
     provenance["n_bands_dropped"] = length(dropped)
+    provenance["band_validation_delta_temperatures"] = validation_deltas
+    provenance["band_validation_precipitation_scalings"] = validation_scalings
     provenance["dropped_area_km2"] = isempty(dropped) ? 0.0 : sum(d.area for d in dropped)
     # One tile-level convergence verdict, and the only spinup outcome reduced to a scalar: a tile is
     # settled when every one of its columns is, so this is `all` and not a sample. The per-run detail is
@@ -474,6 +485,11 @@ function _collect_run_provenance!(run_provenance, provenance, res, parameters, d
     return nothing
 end
 
+# A band's forcing at one perturbation point: the temperature offset, then the precipitation scaling.
+# The one definition the band validation and the run share, so a band validated is the band run.
+_perturbed_forcing(forcing, delta, pscale) =
+    precipitation_adjust(temperature_adjust(forcing, delta), pscale)
+
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
 #
 # The high bands of a tile are lapse extrapolations well above every contributing reanalysis surface —
@@ -498,8 +514,7 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
         failure = nothing
         for pscale in precipitation_scalings, delta in delta_temperatures
             try
-                initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta),
-                                                        pscale))
+                initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
             catch e
                 e isa InterruptException && rethrow()
                 is_caller_error(e) && rethrow()
