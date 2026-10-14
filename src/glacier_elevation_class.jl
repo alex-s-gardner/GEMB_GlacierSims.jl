@@ -315,9 +315,12 @@ function tile_hypsometry!(H, gp, rows, dem, geoms, gtree, glaciers, grid_size, b
 
         D = parent(subdem); M = parent(submask)   # both nx × ny; iterate raw matrices
         hyps = zeros(Float64, n_bins)
+        # Every glacier pixel is counted. One below the lowest edge (a tidewater front a few metres
+        # below the geoid) goes to the lowest bin and one above the highest edge to the highest, so
+        # the bins sum to the cell's glacier area.
         @inbounds for j in axes(D, 2), i in axes(D, 1)
             (M[i, j] && isfinite(D[i, j])) || continue
-            b = _bin_index(D[i, j], bin_edges, n_bins); b == 0 && continue
+            b = clamp(searchsortedlast(bin_edges, D[i, j]), 1, n_bins)
             hyps[b] += area_by_row[j]
         end
         H[r, :] = hyps

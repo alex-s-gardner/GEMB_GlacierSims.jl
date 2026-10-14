@@ -315,3 +315,117 @@ end
     @test p["spinup_unconverged_area_km2"] ≈ sum(b.area for b in TINY_RUN.bands)
     @test all(==(0.0), TINY_RUN.run_provenance["spinup_converged"])
 end
+
+@testset "pipeline audit: hypsometry areas" begin
+    # Spec 66: two fully glaciated 0.1° cells at 46-46.1°N on a flat 1050 m DEM. Each cell's area in
+    # the 1000-1100 m bin is the spherical box R²·Δλ·(sin φ₂ - sin φ₁); the two sum to the 0.2° box;
+    # a pixel 10 m below the geoid is counted (in the lowest bin), not dropped.
+    GI = GeoDataFrames.GeoInterface
+    Rs = GEMB_GlacierSims.Rasters
+    dem_values = fill(1050.0f0, 120, 120)
+    dem = Rs.Raster(dem_values, (X(9.905:0.01:11.095), Y(45.905:0.01:47.095)); crs = Rs.EPSG(4326))
+    lake = (findfirst(≈(10.055), collect(9.905:0.01:11.095)), findfirst(≈(46.055), collect(45.905:0.01:47.095)))
+    dem[lake...] = -10.0f0
+    glaciers = Rs.Raster(zeros(Float32, 10, 10), (X(10.05:0.1:10.95), Y(46.05:0.1:46.95)))
+    geoms = [GI.Polygon([GI.LinearRing([(9.5, 45.5), (11.5, 45.5), (11.5, 47.5), (9.5, 47.5),
+                                        (9.5, 45.5)])])]
+    gtree = GEMB_GlacierSims.SortTileRecursiveTree.STRtree(geoms)
+    gp = (; geometry = [GI.Point(10.05, 46.05), GI.Point(10.15, 46.05)],
+          index = [CartesianIndex(1, 1), CartesianIndex(2, 1)])
+    edges = 0:100:10000
+    H = zeros(2, length(edges) - 1)
+    GEMB_GlacierSims.tile_hypsometry!(H, gp, 1:2, dem, geoms, gtree, glaciers, (0.1, 0.1), edges,
+                                      length(edges) - 1, Base.Semaphore(1))
+    R = 6371.0088                                   # km, mean Earth radius
+    box(Δλ) = R^2 * deg2rad(Δλ) * (sind(46.1) - sind(46.0))
+    @test sum(H[1, :]) ≈ box(0.1) rtol = 1e-3
+    @test sum(H[2, :]) ≈ box(0.1) rtol = 1e-3
+    @test sum(H) ≈ box(0.2) rtol = 1e-3
+    @test H[1, 1] > 0                               # the -10 m pixel, in the lowest bin
+    @test H[2, 1] == 0
+    @test sum(H[:, 11]) ≈ box(0.2) - H[1, 1] rtol = 1e-12
+end
+
+@testset "pipeline audit: perturbation chain" begin
+    # Spec 61: T = 263.15 K at 80 % relative humidity, LW = 0.8σT⁴, P = 1 kg m-2 per step. At
+    # ΔT = +2 and pscale 1.5 the chain gives T' = T + 2, e' = 0.8·eₛ(T'), LW' = (ε_cs(e', T') + Δε)σT'⁴
+    # with Δε = 0.8 - ε_cs(e, T), and P' = 1.5; every other layer is untouched.
+    CF = GEMB_GlacierSims.GEMB_ClimateForcing
+    σ = 5.67e-8                     # the Stefan–Boltzmann value `temperature_adjust` documents
+    T, n = 263.15, 4
+    e = 0.8 * CF.saturation_vapor_pressure(T)
+    f = _cp_forcing(46.0, 10.0, 1000.0, fill(T, n); vapor_pressure = e, longwave_downward = 0.8σ * T^4,
+                    precipitation = 1.0)
+    g = GEMB_GlacierSims._perturbed_forcing(f, 2.0, 1.5)
+    T′ = T + 2
+    e′ = 0.8 * CF.saturation_vapor_pressure(T′)
+    Δε = 0.8 - CF.konzelmann_clear_sky_emissivity(e, T)
+    @test all(≈(T′), g[:temperature_air])
+    @test all(x -> isapprox(x, e′; rtol = 1e-12), g[:vapor_pressure])
+    @test all(x -> isapprox(x, (CF.konzelmann_clear_sky_emissivity(e′, T′) + Δε) * σ * T′^4;
+                            rtol = 1e-12), g[:longwave_downward])
+    @test all(==(1.5), g[:precipitation])
+    for v in (:pressure_air, :wind_speed, :shortwave_downward, :solar_zenith_angle,
+              :shortwave_downward_diffuse, :cloud_optical_thickness)
+        @test g[v] == f[v]
+    end
+    # At the identity point a supersaturated input (relative humidity 1.2) comes back bit for bit.
+    wet = _cp_forcing(46.0, 10.0, 1000.0, fill(T, n);
+                      vapor_pressure = 1.2 * CF.saturation_vapor_pressure(T),
+                      longwave_downward = 0.8σ * T^4)
+    same = GEMB_GlacierSims._perturbed_forcing(wet, 0.0, 1.0)
+    @test all(v -> same[v] == wet[v], GEMB_GlacierSims._FORCING_VARIABLES)
+end
+
+@testset "pipeline audit: tile totals by hand" begin
+    # Spec 62: bands of 10 and 30 km², runoff [1,2,3] and [4,5,6] kg m-2 per interval, dh
+    # [-0.1,-0.2,-0.3] and [0,-0.1,-0.2] m.
+    series = Dict{Symbol,Array{Float64,4}}()
+    for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...)
+        series[v] = zeros(3, 2, 1, 1)
+    end
+    series[:runoff][:, :, 1, 1] = [1 4; 2 5; 3 6]
+    series[:dh][:, :, 1, 1] = [-0.1 0.0; -0.2 -0.1; -0.3 -0.2]
+    totals = GEMB_GlacierSims._tile_totals(series, [10.0, 30.0])
+    @test totals[:runoff][:, 1, 1] ≈ [1.3, 3.0, 5.1] .* 1e-4
+    @test totals[:dv][:, 1, 1] ≈ [-0.001, -0.005, -0.009]
+    @test totals[:dm][:, 1, 1] ≈ -totals[:runoff][:, 1, 1]
+end
+
+@testset "pipeline audit: bare-ice albedo reaches GEMB" begin
+    # Spec 65: on bare ice under a shortwave-dominated melting forcing, melt is proportional to the
+    # absorbed shortwave, so the bands at albedo_ice 0.3 and 0.5 melt in the ratio 0.7/0.5.
+    m = TINY_RUN.bands_series[:melt]
+    @test sum(m[:, 1, 1, 1]) / sum(m[:, 2, 1, 1]) ≈ 0.7 / 0.5 rtol = 0.1
+end
+
+@testset "pipeline audit: time integration" begin
+    # Spec 67: 1 kg m-2 of precipitation every hour for three weeks, weekly output: 168 kg m-2 per
+    # interval, stamped at the last hour of days 7, 14 and 21, and the tile total over bands of 10 and
+    # 30 km² accumulates 168·k·40·1e6 kg = 168·k·40·1e-6 Gt by interval k. GEMB's weeks are calendar
+    # weeks ending on Sunday, so the record starts on a Monday to make the three intervals whole.
+    start = DateTime(2000, 1, 3)
+    time = collect(start:Hour(1):(start + Day(21) - Hour(1)))
+    n = length(time)
+    ti = Ti(time)
+    f = DimStack(NamedTuple(k => DimArray(fill(v, n), (ti,)) for (k, v) in pairs((
+            temperature_air = 260.0, pressure_air = 8e4, vapor_pressure = 150.0, wind_speed = 3.0,
+            precipitation = 1.0, shortwave_downward = 100.0, longwave_downward = 220.0,
+            solar_zenith_angle = 60.0, shortwave_downward_diffuse = 30.0,
+            cloud_optical_thickness = 2.0)));
+        metadata = Dict{String,Any}("temperature_air_mean" => 260.0, "wind_speed_mean" => 3.0,
+                                    "precipitation_mean" => 8760.0,
+                                    "temperature_observation_height" => 2.0,
+                                    "wind_observation_height" => 10.0))
+    mp = initialize_parameters(output_frequency = :weekly)
+    cf = GEMB.initialize_forcing(f)
+    out = GEMB.gemb(GEMB.initialize_profile(mp, cf), cf, mp)
+    @test collect(lookup(out, Ti)) == [start + Day(d - 1) + Hour(23) for d in (7, 14, 21)]
+    @test collect(out[:precipitation]) ≈ fill(168.0, 3)
+    series = Dict{Symbol,Array{Float64,4}}(v => zeros(3, 2, 1, 1)
+                                           for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...))
+    series[:precipitation][:, 1, 1, 1] = out[:precipitation]
+    series[:precipitation][:, 2, 1, 1] = out[:precipitation]
+    totals = GEMB_GlacierSims._tile_totals(series, [10.0, 30.0])
+    @test totals[:precipitation][:, 1, 1] ≈ [168.0 * k * 40 * 1e-6 for k in 1:3]
+end
