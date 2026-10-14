@@ -171,6 +171,12 @@ published 2° products exclude rain from their aggregates.
   `RestartParameterMismatch` when the saved run parameters disagree with this call's.
 - `force_restart = false`: append even across a run-parameter disagreement, warning instead of throwing.
   The record before the seam then does not reflect the new parameters.
+- `spinup_seed = nothing`: `i_band -> profile` (or `nothing` to decline), a starting column for the
+  cold-spinup branch only -- a band with a `restart` profile uses that and never calls this. Unlike
+  `restart`, the seed's own parameters need not match this run's: `gemb_spinup` still runs its full
+  convergence loop against the same criteria, so a seed from a different `(ΔT, pscale)` only shortens
+  or lengthens the number of cycles to convergence, never changes what it converges to. A band the
+  function returns `nothing` for falls back to `initialize_profile`.
 - `on_output = nothing`: called as `on_output(output; band, delta, pscale)` with each simulation's full
   output stack, for inspection. Called from inside the task, so with `threaded = true` it runs
   concurrently and in an unspecified order.
@@ -190,6 +196,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            validation_grid = nothing,
                            restart = nothing,
                            force_restart::Bool = false,
+                           spinup_seed = nothing,
                            on_output = nothing)
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
@@ -294,7 +301,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             cf_spinup = _spinup_climatology(cf, window, mp_band)
             # The depth is fixed by the initial profile, so the firn-air tolerance can only be converted
             # into the density one `gemb_spinup` tests once that profile exists.
-            initial = initialize_profile(mp_band, cf_spinup)
+            initial = spinup_seed === nothing ? nothing : spinup_seed(i_band)
+            initial === nothing && (initial = initialize_profile(mp_band, cf_spinup))
             # The FAC trend is the *only* convergence criterion. `convergence_delta_density` is passed
             # explicitly as `nothing` rather than left out, so that the single-criterion design is visible
             # here and not mistaken for an omission: a step between consecutive cycles both passes a column
