@@ -251,24 +251,22 @@ end
         full = cell_decoupling_factor(cell(7.53, 45.97, 0.0))
         @test full.rgi_id == "RGI60-11.02810"
         @test full.distance < 1.0
-        # A cell ERA5-Land treats as ice-free gets the published k unweighted.
+        # `k` is the published on-glacier factor whatever the cell's glacier fraction; the fraction
+        # is returned beside it and applied where the forcing is brought to the ice-free state.
         @test full.decoupling_factor == full.decoupling_factor_published
         @test 0 < full.decoupling_factor < 1
 
         k_pub = full.decoupling_factor_published
-
-        # The weighting is linear in the non-glacier fraction and exact at both ends: no glacier
-        # in the cell is the full correction, an all-glacier cell is the identity.
-        @test cell_decoupling_factor(cell(7.53, 45.97, 1.0)).decoupling_factor == 1.0
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.5)).decoupling_factor ≈
-              1 - (1 - k_pub) * 0.5
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.25)).decoupling_factor ≈
-              1 - (1 - k_pub) * 0.75
+        for g in (1.0, 0.5, 0.25)
+            found = cell_decoupling_factor(cell(7.53, 45.97, g))
+            @test found.decoupling_factor == k_pub
+            @test found.glm == g
+        end
 
         # A `missing` or `NaN` glm is a real data gap, so it falls back to the uncorrected
-        # reanalysis assumption (glm = 0) and gets the full correction.
-        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).decoupling_factor == k_pub
-        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).decoupling_factor == k_pub
+        # reanalysis assumption (glm = 0).
+        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).glm == 0.0
+        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).glm == 0.0
 
         # A table with no `:glm` column at all is schema drift, not a data gap: it cannot weight
         # the correction, and silently applying the unweighted factor to every cell in a sweep is
@@ -298,15 +296,12 @@ end
             geometry = [GeoDataFrames.GeoInterface.Point(7.53, 45.97)], glm = [glm])))
         resolve = resolve_decoupling_factor
 
-        # `false` skips the lookup entirely; `true` looks k up and weights it by 1 - glm.
+        # `false` skips the lookup entirely; `true` looks the published k up, whatever the glm.
         @test resolve(cell(0.0), false) === nothing
         @test resolve(cell(0.0), true) == cell_decoupling_factor(cell(0.0)).decoupling_factor
+        @test resolve(cell(1.0), true) == resolve(cell(0.0), true)
 
-        # An entirely glaciated cell weights to exactly 1.0 — the identity — so the adjustment
-        # is skipped rather than run as a no-op pass over the whole forcing record.
-        @test resolve(cell(1.0), true) === nothing
-
-        # A prescribed `k` bypasses both the table and the glm weighting.
+        # A prescribed `k` bypasses the table.
         @test resolve(cell(1.0), 0.6) === 0.6
 
         # A cell with no published k is run on ambient forcing.
