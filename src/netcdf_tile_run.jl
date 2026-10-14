@@ -105,19 +105,14 @@ function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
         for v in keys(run.bands_series)
             name = string(v)
             series = run.bands_series[v]
-            if v in TILE_CUMULATIVE_HEIGHT_VARIABLES
-                seam = coalesce.(ds[name][n_existing, :, :, :], NaN)
-                series = series .+ reshape(seam, 1, size(seam)...)
-            end
+            v in TILE_CUMULATIVE_HEIGHT_VARIABLES &&
+                (series = _continue_from_seam(series, ds[name][n_existing, :, :, :]))
             ds[name][idx, :, :, :] = series
         end
         for v in keys(run.totals)
             name = _tile_total_variable(v)
             total = run.totals[v]
-            if v !== :fac
-                seam = coalesce.(ds[name][n_existing, :, :], NaN)
-                total = total .+ reshape(seam, 1, size(seam)...)
-            end
+            v === :fac || (total = _continue_from_seam(total, ds[name][n_existing, :, :]))
             ds[name][idx, :, :] = total
         end
         _append_band_forcing_summaries!(ds, run)
@@ -150,38 +145,41 @@ end
 # output interval; neither is offset.
 const TILE_CUMULATIVE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual)
 
+# A continuation's cumulative series, offset by the stored value at the seam (fill where there is none)
+# so it continues the record. `seam` has the series' shape without its leading time axis.
+_continue_from_seam(series, seam) =
+    series .+ reshape(coalesce.(seam, NaN), 1, size(seam)...)
+
+# Per-band forcing summaries that are time means over the forcing steps, and those that count steps.
+const BAND_STEP_MEAN_KEYS = ("temperature_lapse_rate", "glacier_decoupling_factor_mean")
+const BAND_LAPSE_SOURCE_KEYS = Tuple("temperature_lapse_rate_n_$s" for s in DOWNSCALING_SOURCES)
+const BAND_STEP_COUNT_KEYS = ("n_timesteps_above_freezing", BAND_LAPSE_SOURCE_KEYS...,
+    ("glacier_decoupling_factor_n_$s" for s in DOWNSCALING_SOURCES)...,
+    ("glacier_decoupling_factor_n_$(s)_above_freezing" for s in DOWNSCALING_SOURCES)...)
+
 # Per-band forcing summaries over the whole record: time means weighted by each segment's forcing steps
 # and per-step counts summed. A band's forcing steps are the sum of its lapse-rate source counts, since
 # every step has exactly one source. Anything else in the band provenance describes the band or the fit
 # and is the same for every segment.
 function _append_band_forcing_summaries!(ds, run::GlacierTileRun)
     isempty(run.band_provenance) && return nothing
-    steps_key(src) = "temperature_lapse_rate_n_$src"
-    sources = [src for src in DOWNSCALING_SOURCES if haskey(first(run.band_provenance), steps_key(src))]
+    present = filter(in(keys(first(run.band_provenance))), (BAND_STEP_MEAN_KEYS..., BAND_STEP_COUNT_KEYS...))
+    stored = Dict(key => begin
+                      haskey(ds, "band_" * key) || throw(ArgumentError(
+                          "the tile file has no band_$key, which the continuation reports; the file " *
+                          "predates that summary and its record-long value cannot be formed"))
+                      collect(Float64, coalesce.(ds["band_" * key][:], NaN))
+                  end for key in present)
+    new = Dict(key => [Float64(p[key]) for p in run.band_provenance] for key in present)
+    sources = filter(in(present), BAND_LAPSE_SOURCE_KEYS)
     isempty(sources) && throw(ArgumentError(
         "the continuation's band provenance carries no temperature_lapse_rate_n_* counts, so its " *
         "forcing steps per band are unknown and the record-long band means cannot be formed"))
-    steps(get_count) = sum(src -> get_count(steps_key(src)), sources)
-    stored(key) = begin
-        haskey(ds, "band_" * key) || throw(ArgumentError(
-            "the tile file has no band_$key, which the continuation reports; the file predates that " *
-            "summary and its record-long value cannot be formed"))
-        collect(Float64, coalesce.(ds["band_" * key][:], NaN))
-    end
-    new(key) = [Float64(p[key]) for p in run.band_provenance]
-
-    n_old = steps(stored)
-    n_new = steps(new)
-    for key in keys(first(run.band_provenance))
-        is_mean = key in ("temperature_lapse_rate", "glacier_decoupling_factor_mean")
-        is_count = key == "n_timesteps_above_freezing" ||
-                   any(src -> key in ("glacier_decoupling_factor_n_$src",
-                                      "glacier_decoupling_factor_n_$(src)_above_freezing",
-                                      steps_key(src)), DOWNSCALING_SOURCES)
-        (is_mean || is_count) || continue
-        old = stored(key)
-        combined = is_mean ? (old .* n_old .+ new(key) .* n_new) ./ (n_old .+ n_new) : old .+ new(key)
-        ds["band_" * key][:] = combined
+    n_old = sum(stored[k] for k in sources)
+    n_new = sum(new[k] for k in sources)
+    for key in present
+        ds["band_" * key][:] = key in BAND_STEP_MEAN_KEYS ?
+            (stored[key] .* n_old .+ new[key] .* n_new) ./ (n_old .+ n_new) : stored[key] .+ new[key]
     end
     return nothing
 end

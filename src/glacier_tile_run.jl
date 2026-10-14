@@ -210,10 +210,11 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             "elevation); a NaN in an applied downscaling parameter is the usual cause"))
     end
 
+    union_grid(axis, extra) = sort!(unique!(vcat(axis, collect(Float64, extra))))
     validation_deltas, validation_scalings = validation_grid === nothing ?
         (delta_temperatures, precipitation_scalings) :
-        (sort!(unique!(vcat(delta_temperatures, collect(Float64, validation_grid[1])))),
-         sort!(unique!(vcat(precipitation_scalings, collect(Float64, validation_grid[2])))))
+        (union_grid(delta_temperatures, validation_grid[1]),
+         union_grid(precipitation_scalings, validation_grid[2]))
     bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings)
     isempty(bands) && throw(ForcingUnavailable(
         "no band of this tile could be perturbed into forcing GEMB accepts; the highest bands are " *
