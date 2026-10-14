@@ -612,7 +612,8 @@ The settings that define *how* a tile was run, as netCDF global attributes.
 These are exactly the values that must be identical for a continuation to be a continuation rather than
 a different experiment spliced onto an old record, so they are what a restart is checked against. Every
 `ModelParameters` field is included, prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` —
-the fields `gemb` computes from the forcing and overwrites whatever it is handed.
+the fields `gemb` computes from the forcing and overwrites whatever it is handed. The package versions
+and source trees ([`software_provenance`](@ref)) are included too.
 
 The downscaling settings from `applied` are included for the same reason: two runs of one tile that
 resolved their lapse rate differently are different experiments, and a file that recorded only the
@@ -645,6 +646,7 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     donor_max_distance_km === nothing ||
         (params["forcing_donor_max_distance_km"] = Float64(donor_max_distance_km))
     merge!(params, applied.settings)
+    merge!(params, software_provenance())
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)

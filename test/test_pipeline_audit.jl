@@ -200,3 +200,17 @@ end
         @test ds.attrib["max_dh_residual"] == 3.0e-13
     end
 end
+
+@testset "pipeline audit: software provenance in every file" begin
+    sw = software_provenance()
+    @test issetequal(keys(sw), ["software_$(p)_$(f)" for p in ("gemb", "gemb_climateforcing",
+                                                            "gemb_glaciersims")
+                                for f in ("version", "tree")])
+    @test all(v -> v isa AbstractString && !isempty(v), values(sw))
+    path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), TINY_RUN)
+    stored = read_glacier_tile_status(path).parameters
+    @test all(stored[k] == v for (k, v) in sw)
+    # A file from different code is a different experiment.
+    other = merge(stored, Dict{String,Any}("software_gemb_tree" => "0"^40))
+    @test haskey(run_parameter_differences(stored, other), "software_gemb_tree")
+end

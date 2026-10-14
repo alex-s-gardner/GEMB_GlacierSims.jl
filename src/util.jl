@@ -364,3 +364,63 @@ function claim_order(weights, block::Int, n_blocks::Int)
     sort!(rest; by = i -> weights[i], rev = true)
     return vcat(collect(mine), rest)
 end
+
+"""
+    software_provenance() -> Dict{String,Any}
+
+The versions and source trees of GEMB, GEMB_ClimateForcing and GEMB_GlacierSims this process runs,
+as `software_<package>_version` and `software_<package>_tree`. Both [`run_parameters`](@ref) and
+[`tile_run_parameters`](@ref) include them, so a run under different code compares as a different
+experiment.
+
+The tree is the git tree hash of the package's `src` directory at `HEAD` when the package is a git
+checkout — with `+dirty:` and a CRC-32C of the uncommitted changes to `src` and `Project.toml`
+(including untracked files under `src`) when there are any — and otherwise the `git-tree-sha1` the
+active manifest records for it. A package whose tree cannot be identified either way throws.
+Computed once per process.
+"""
+function software_provenance()
+    cached = _SOFTWARE_PROVENANCE[]
+    cached === nothing || return copy(cached)
+    p = Dict{String,Any}()
+    for (label, mod) in (("gemb", GEMB), ("gemb_climateforcing", GEMB_ClimateForcing),
+                         ("gemb_glaciersims", @__MODULE__))
+        p["software_$(label)_version"] = string(pkgversion(mod))
+        p["software_$(label)_tree"] = _package_tree(mod)
+    end
+    _SOFTWARE_PROVENANCE[] = p
+    return copy(p)
+end
+
+const _SOFTWARE_PROVENANCE = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
+
+function _package_tree(mod::Module)
+    dir = pkgdir(mod)
+    dir === nothing && throw(ArgumentError("$(mod) has no package directory to identify"))
+    git(args...) = Cmd(`git -C $dir $args`; ignorestatus = true)
+    if isdir(joinpath(dir, ".git")) || isfile(joinpath(dir, ".git"))
+        tree = readchomp(Cmd(`git -C $dir rev-parse HEAD:./src`))
+        dirty = readchomp(git("status", "--porcelain", "--untracked-files=all", "--", "src",
+                              "Project.toml"))
+        isempty(dirty) && return tree
+        crc = Base._crc32c(read(git("diff", "HEAD", "--", "src", "Project.toml")))
+        for f in split(readchomp(git("ls-files", "--others", "--exclude-standard", "--", "src")), '\n')
+            isempty(f) && continue
+            crc = Base._crc32c(f, crc)
+            crc = Base._crc32c(read(joinpath(dir, f)), crc)
+        end
+        return tree * "+dirty:" * string(crc; base = 16, pad = 8)
+    end
+    uuid = string(Base.PkgId(mod).uuid)
+    for env in Base.load_path()
+        manifest = Base.project_file_manifest_path(env)
+        (manifest === nothing || !isfile(manifest)) && continue
+        deps = get(Base.TOML.parsefile(manifest), "deps", Dict{String,Any}())
+        for entry in get(deps, string(nameof(mod)), [])
+            get(entry, "uuid", "") == uuid || continue
+            haskey(entry, "git-tree-sha1") && return entry["git-tree-sha1"]
+        end
+    end
+    throw(ArgumentError("cannot identify the source tree of $(mod) at $dir: it is not a git " *
+                        "checkout and no active manifest records a git-tree-sha1 for it"))
+end

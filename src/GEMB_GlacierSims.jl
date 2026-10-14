@@ -45,7 +45,7 @@ import GeoParquet.Parquet2
 
 include("util.jl")
 export claim_tile!, claim_order, weight_balanced_blocks
-export era5_land_invariant, wrap_lon, forcing_at_elevation
+export era5_land_invariant, wrap_lon, forcing_at_elevation, software_provenance
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
 include("volume_change.jl")
