@@ -27,7 +27,7 @@
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
-# Sizing: a 60-band tile over the 10x7 grid is 4,200 simulations, and one simulation is the spinup plus
+# Sizing: a 60-band tile over the 10x10 grid is 6,000 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
 # full ERA5-Land record is eleven times longer with a `:representative` spinup costing about 2.2x the
 # model-years of an averaged one. Measure with a TILE_LIMIT or TILE_NAMES subset before committing to a
@@ -65,7 +65,9 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 
 # The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
 # at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
-# far points exist to bracket it and to show the response is monotonic.
+# far points exist to bracket it and to show the response is monotonic. The fit interpolates linearly
+# between nodes across a concave response, and most fitted scalings land between 1.5 and 4, so that
+# span carries nodes at every 0.5.
 #
 # `1.0` and `0.0` must be present, except under `SUPPLEMENTARY`. They are the baseline the reports and
 # the reference discharge locate with `findfirst`, and a grid without them silently loses both.
@@ -74,7 +76,7 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 # they are what a re-run reproduces, and they are in git.
 const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
     parse.(Float64, split(ENV["PRECIPITATION_SCALINGS"], ",")) :
-    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 4.0]
+    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
 const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
     [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
@@ -129,7 +131,7 @@ const RESTART_FETCH_OVERLAP = Day(1)
 # sweep can no longer see.
 #
 # The bound has to exceed the longest a single tile can legitimately take: reclaiming a running tile would
-# put two processes on one netCDF. A 63-band tile over the 10x7 grid and the full record is the worst case,
+# put two processes on one netCDF. A 63-band tile over the 10x10 grid and the full record is the worst case,
 # so this is deliberately generous. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
 const CLAIM_SUBDIR = "claims"
 const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
@@ -387,6 +389,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                    convergence_drift_fac = SPINUP_DRIFT_FAC,
+                                   drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
