@@ -425,8 +425,7 @@ function resolve_downscaling(fit, intervals, run_time;
 
     # `k` at a donor cell's reanalysis elevation, by the same tiers. No elevation range: a reanalysis
     # surface can sit below the hypsometry, and it is among the elevations the fit was taken over.
-    decoupling_at = z -> _resolve_decoupling_at(fit.decoupling, z, fit_time, run_time, basis,
-                                                k_prior).factor
+    decoupling_at = _DecouplingResolver(fit.decoupling, fit_time, run_time, basis, k_prior)
 
     settings = Dict{String,Any}(
         "downscaling_basis" => string(basis),
@@ -453,6 +452,19 @@ function resolve_downscaling(fit, intervals, run_time;
     return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings,
                               _albedo_provenance(fit, albedo_profile), decoupling_at)
 end
+
+# `k` at a reanalysis elevation, as `AppliedDownscaling.decoupling_at`: holds only what
+# `_resolve_decoupling_at` reads, so a resolution does not keep the rest of the fit alive.
+struct _DecouplingResolver{D,K}
+    decoupling::D
+    fit_time::Vector{DateTime}
+    run_time::Vector{DateTime}
+    basis::Symbol
+    k_prior::K
+end
+
+(r::_DecouplingResolver)(z::Real) =
+    _resolve_decoupling_at(r.decoupling, z, r.fit_time, r.run_time, r.basis, r.k_prior).factor
 
 # `k` at elevation `z` resolved onto `run_time`: the fit re-evaluated there
 # ([`decoupling_factor_at_elevation`](@ref)), accepted where finite and inside `(0, 1]` and labelled

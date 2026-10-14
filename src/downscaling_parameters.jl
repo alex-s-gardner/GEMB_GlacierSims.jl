@@ -852,6 +852,9 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
                                      intervals, areas, ambient, z_cell, ivf, n,
                                      substituting::Bool, distance::Float64)
     unit_factor = ones(n)
+    # The zenith angle is the cell's own at every interval (lapsing and decoupling leave it unchanged),
+    # so its cosine is taken once per cell.
+    cos_zenith = cosd.(parent(ambient[:solar_zenith_angle]))
     Threads.@threads for i in eachindex(intervals)
         areas[i] > 0 && !unreachable[i] || continue
         interval = intervals[i]
@@ -874,7 +877,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
             # `adjusted[v]` is looked up by a runtime name, so its type is not known here; the
             # record-length loops run behind a function barrier, where it is.
             if v === :solar_zenith_angle
-                _add_weighted_cosd!(sums[i][v], w, sw, adjusted[v])
+                _add_weighted_product!(sums[i][v], w, sw, cos_zenith)
             else
                 _add_weighted!(sums[i][v], w, adjusted[v])
             end
@@ -893,7 +896,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
     return nothing
 end
 
-# `s .+= w .* a`, and `s .+= w .* sw .* cosd.(θ)`, written as loops so the accumulation order is the
+# `s .+= w .* a`, and `s .+= w .* sw .* c`, written as loops so the accumulation order is the
 # same as a scalar sum's.
 function _add_weighted!(s, w, a)
     for t in eachindex(s, a)
@@ -902,9 +905,9 @@ function _add_weighted!(s, w, a)
     return s
 end
 
-function _add_weighted_cosd!(s, w, sw, θ)
-    for t in eachindex(s, sw, θ)
-        s[t] += w * sw[t] * cosd(θ[t])
+function _add_weighted_product!(s, w, sw, c)
+    for t in eachindex(s, sw, c)
+        s[t] += w * sw[t] * c[t]
     end
     return s
 end

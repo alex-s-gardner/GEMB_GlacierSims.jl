@@ -380,19 +380,23 @@ active manifest records for it, and failing both `crc32c:` and a CRC-32C of ever
 and of `Project.toml`. Computed once per process.
 """
 function software_provenance()
-    cached = _SOFTWARE_PROVENANCE[]
-    cached === nothing || return copy(cached)
-    p = Dict{String,Any}()
-    for (label, mod) in (("gemb", GEMB), ("gemb_climateforcing", GEMB_ClimateForcing),
-                         ("gemb_glaciersims", @__MODULE__))
-        p["software_$(label)_version"] = string(pkgversion(mod))
-        p["software_$(label)_tree"] = _package_tree(mod)
+    p = lock(_SOFTWARE_PROVENANCE_LOCK) do
+        cached = _SOFTWARE_PROVENANCE[]
+        cached === nothing || return cached
+        p = Dict{String,Any}()
+        for (label, mod) in (("gemb", GEMB), ("gemb_climateforcing", GEMB_ClimateForcing),
+                             ("gemb_glaciersims", @__MODULE__))
+            p["software_$(label)_version"] = string(pkgversion(mod))
+            p["software_$(label)_tree"] = _package_tree(mod)
+        end
+        _SOFTWARE_PROVENANCE[] = p
     end
-    _SOFTWARE_PROVENANCE[] = p
     return copy(p)
 end
 
+# Filled by the first call; the lock keeps concurrent first calls from each running the git queries.
 const _SOFTWARE_PROVENANCE = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
+const _SOFTWARE_PROVENANCE_LOCK = ReentrantLock()
 
 function _package_tree(mod::Module)
     dir = pkgdir(mod)
@@ -403,12 +407,9 @@ function _package_tree(mod::Module)
         dirty = readchomp(git("status", "--porcelain", "--untracked-files=all", "--", "src",
                               "Project.toml"))
         isempty(dirty) && return tree
-        crc = Base._crc32c(read(git("diff", "HEAD", "--", "src", "Project.toml")))
-        for f in split(readchomp(git("ls-files", "--others", "--exclude-standard", "--", "src")), '\n')
-            isempty(f) && continue
-            crc = Base._crc32c(f, crc)
-            crc = Base._crc32c(read(joinpath(dir, f)), crc)
-        end
+        untracked = filter(!isempty, split(readchomp(git("ls-files", "--others", "--exclude-standard",
+                                                         "--", "src")), '\n'))
+        crc = _crc_files(dir, untracked, Base._crc32c(read(git("diff", "HEAD", "--", "src", "Project.toml"))))
         return tree * "+dirty:" * string(crc; base = 16, pad = 8)
     end
     uuid = string(Base.PkgId(mod).uuid)
@@ -422,11 +423,16 @@ function _package_tree(mod::Module)
         end
     end
     # A plain directory, such as a `dev`ed copy outside git: identify it by its contents.
-    crc = UInt32(0)
-    files = [joinpath(root, f) for (root, _, fs) in walkdir(joinpath(dir, "src")) for f in fs]
-    for f in sort!(push!(files, joinpath(dir, "Project.toml")))
-        crc = Base._crc32c(relpath(f, dir), crc)
-        crc = Base._crc32c(read(f), crc)
-    end
+    files = [relpath(joinpath(root, f), dir) for (root, _, fs) in walkdir(joinpath(dir, "src")) for f in fs]
+    crc = _crc_files(dir, sort!(push!(files, "Project.toml")), UInt32(0))
     return "crc32c:" * string(crc; base = 16, pad = 8)
+end
+
+# CRC-32C over each file's path (relative to `dir`) and contents, continuing from `crc`.
+function _crc_files(dir, files, crc::UInt32)
+    for f in files
+        crc = Base._crc32c(f, crc)
+        crc = Base._crc32c(read(joinpath(dir, f)), crc)
+    end
+    return crc
 end
