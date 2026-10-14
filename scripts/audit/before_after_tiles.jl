@@ -10,10 +10,14 @@
 #
 # Run (one environment per configuration, each `Pkg.develop`ing the three packages at its commits):
 #   julia -t 2 --project=<env> scripts/audit/before_after_tiles.jl run <config> <tile> <pscale> <ΔT> <ceiling_years> [out_dir]
+#   julia --project=<env> scripts/audit/before_after_tiles.jl derive <tile,tile,...> <parameter_dir>
 #   julia --project=<env> scripts/audit/before_after_tiles.jl summarize <out_dir> <markdown_path>
 # e.g. `run D N60_W140 1.9 3.5 500`. `ceiling_years` is the spinup ceiling the configuration's sweep
 # uses: 100 on feat/native-resolution-run, 500 on fix/pipeline-audit. `out_dir` defaults to
 # $BEFORE_AFTER_OUT, else ./before_after_tiles.
+#
+# Configurations whose GEMB_ClimateForcing differs from production run from parameter tiles derived
+# with their own code: `derive` writes them, and BEFORE_AFTER_PARAMETERS points `run` at them.
 #
 # Reads (never writes) the ERA5-Land Zarr cache, the downscaling parameter tiles and, for context,
 # existing native-resolution runs, all under CLIMATE_CACHE (default /mnt/bylot-r3/data/era5land).
@@ -25,6 +29,10 @@ const GS = GEMB_GlacierSims
 const NCDatasets = GS.NCDatasets
 
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land")
+const PRODUCTION_PARAMETERS = joinpath(CLIMATE_CACHE, "downscaling_parameters")
+# The downscaling parameter tiles to run from. A configuration whose GEMB_ClimateForcing fits
+# differently needs tiles derived with its own code (`derive` mode) over the same record.
+const PARAMETER_DIR = get(ENV, "BEFORE_AFTER_PARAMETERS", PRODUCTION_PARAMETERS)
 # The cached ERA5-Land record: its first step and the end of the cache.
 # `BEFORE_AFTER_END_YEAR` shortens both, for a quick check of the script itself.
 const END_YEAR = parse(Int, get(ENV, "BEFORE_AFTER_END_YEAR", "0"))
@@ -52,6 +60,45 @@ function interval_means(x, forcing_time, out_time)
     stops = [searchsortedlast(forcing_time, t) for t in out_time]
     starts = [1; stops[1:end-1] .+ 1]
     return [mean(view(x, a:b)) for (a, b) in zip(starts, stops)]
+end
+
+# The tile's applied downscaling and band forcing over TIME_RANGE, as the production sweep builds
+# them: basis `:fitted` when the fit covers exactly the run's time axis, `:climatology` otherwise. A
+# parameter tile derived without the MODIS bare-ice albedo profile takes the production tile's.
+function tile_forcing(tile)
+    token = GEMB_ClimateForcing.get_cds_api_key()
+    cache = joinpath(CLIMATE_CACHE, "cache")
+    fit = read_downscaling_tile(joinpath(PARAMETER_DIR, tile.name))
+    if get(fit, :bare_ice_albedo, nothing) === nothing
+        production = read_downscaling_tile(joinpath(PRODUCTION_PARAMETERS, tile.name))
+        fit = merge(fit, (; bare_ice_albedo = production.bare_ice_albedo))
+    end
+    intervals = hypsometry_intervals(tile.core)
+    row = first(tile.core)
+    probe_time = collect(dims(climate_forcing(:era5land, row.latitude, row.longitude;
+                                              time_range = TIME_RANGE, token, cache_path = cache), Ti))
+    basis = collect(fit.time) == probe_time ? :fitted : :climatology
+    applied = resolve_downscaling(fit, intervals, probe_time; basis,
+                                  decoupling_factor_prior = decoupling_factor_prior(tile.core))
+    bands = collect(elevation_interval_forcing(tile.core, applied; climate_model = :era5land,
+                                               time_range = TIME_RANGE, token, cache_path = cache,
+                                               elevation_interval_batch = 0, donor_cells = tile.buffered,
+                                               donor_max_distance_km = DONOR_MAX_DISTANCE_KM))
+    return applied, bands, basis
+end
+
+# Downscaling parameter tiles for `tile_names`, derived over TIME_RANGE with this environment's code
+# into `out_dir`, with the production derivation's settings except the MODIS albedo profile, which
+# `tile_forcing` takes from the production tile.
+function derive_tiles(tile_names, out_dir)
+    table = GeoDataFrames.read(joinpath(pkgdir(GS), "data", "era5land_glacier_elevation_classes.parquet"))
+    table[!, :longitude] = GeoDataFrames.GeoInterface.x.(table.geometry)
+    table[!, :latitude] = GeoDataFrames.GeoInterface.y.(table.geometry)
+    mkpath(out_dir)
+    return derive_downscaling_parameter_tiles(:era5land, TIME_RANGE, table, out_dir;
+        token = GEMB_ClimateForcing.get_cds_api_key(), cache_path = joinpath(CLIMATE_CACHE, "cache"),
+        tile_size = 2, buffer = 1, min_cells = 8, derive_albedo = false,
+        tile_gate = (tile, path) -> replace(tile.name, ".nc" => "") in tile_names)
 end
 
 # Per-column diagnostics an `on_output` hook can take from the full output stack before it is
@@ -89,24 +136,13 @@ function run_config(config, tile_name, pscale, ΔT, ceiling, out_dir)
     t_start = time()
     tile = load_tile(tile_name)
     lat = mean(tile.core.latitude)
-    token = GEMB_ClimateForcing.get_cds_api_key()
-    cache = joinpath(CLIMATE_CACHE, "cache")
-    fit = read_downscaling_tile(joinpath(CLIMATE_CACHE, "downscaling_parameters", tile.name))
-    intervals = hypsometry_intervals(tile.core)
-    row = first(tile.core)
-    probe_time = collect(dims(climate_forcing(:era5land, row.latitude, row.longitude;
-                                              time_range = TIME_RANGE, token, cache_path = cache), Ti))
-    applied = resolve_downscaling(fit, intervals, probe_time; basis = :climatology,
-                                  decoupling_factor_prior = decoupling_factor_prior(tile.core))
-    bands = collect(elevation_interval_forcing(tile.core, applied; climate_model = :era5land,
-                                               time_range = TIME_RANGE, token, cache_path = cache,
-                                               elevation_interval_batch = 0, donor_cells = tile.buffered,
-                                               donor_max_distance_km = DONOR_MAX_DISTANCE_KM))
+    applied, bands, basis = tile_forcing(tile)
     t_forcing = time() - t_start
     mp = GEMB.initialize_parameters(output_frequency = OUTPUT_FREQUENCY)
 
     results = Dict{String,Any}("config" => config, "tile" => tile_name, "forcing_seconds" => t_forcing,
-                               "time_start" => first(probe_time), "time_end" => last(probe_time),
+                               "basis" => string(basis), "parameter_dir" => PARAMETER_DIR,
+                               "time_start" => first(applied.time), "time_end" => last(applied.time),
                                "ceiling_years" => ceiling, "software" => string.([pkgversion(GEMB), pkgdir(GEMB),
                                                                                   pkgdir(GEMB_ClimateForcing), pkgdir(GS)]))
     for (label, dT, ps) in (("baseline", 0.0, 1.0), ("calibrated", ΔT, pscale))
@@ -163,19 +199,7 @@ end
 function closure_check(tile_name, pscale, ΔT, out_dir)
     tile = load_tile(tile_name)
     lat = mean(tile.core.latitude)
-    token = GEMB_ClimateForcing.get_cds_api_key()
-    cache = joinpath(CLIMATE_CACHE, "cache")
-    fit = read_downscaling_tile(joinpath(CLIMATE_CACHE, "downscaling_parameters", tile.name))
-    intervals = hypsometry_intervals(tile.core)
-    row = first(tile.core)
-    probe_time = collect(dims(climate_forcing(:era5land, row.latitude, row.longitude;
-                                              time_range = TIME_RANGE, token, cache_path = cache), Ti))
-    applied = resolve_downscaling(fit, intervals, probe_time; basis = :climatology,
-                                  decoupling_factor_prior = decoupling_factor_prior(tile.core))
-    bands = collect(elevation_interval_forcing(tile.core, applied; climate_model = :era5land,
-                                               time_range = TIME_RANGE, token, cache_path = cache,
-                                               elevation_interval_batch = 0, donor_cells = tile.buffered,
-                                               donor_max_distance_km = DONOR_MAX_DISTANCE_KM))
+    applied, bands, basis = tile_forcing(tile)
     band = bands[argmax([b.area for b in bands])]
     season = lat >= 0 ? (DateTime(2020, 5, 1), DateTime(2020, 9, 30, 23)) :
                         (DateTime(2019, 11, 1), DateTime(2020, 3, 31, 23))
@@ -267,7 +291,7 @@ function summarize(out_dir, markdown)
             println(io, "| band (m) | area (km²) | A | D |\n|---|---|---|---|")
             for z in sort!(union(a["band_center"], d["band_center"]))
                 ia, id = findfirst(==(z), a["band_center"]), findfirst(==(z), d["band_center"])
-                area = something(ia === nothing ? nothing : a["band_area"][ia], d["band_area"][id])
+                area = ia === nothing ? d["band_area"][id] : a["band_area"][ia]
                 println(io, "| $(round(Int, z)) | $(fmt(area; d = 1)) | ",
                         ia === nothing ? "n/a" : fmt(a["band_smb_mwe"][ia]), " | ",
                         id === nothing ? "n/a" : fmt(d["band_smb_mwe"][id]), " |")
@@ -275,7 +299,7 @@ function summarize(out_dir, markdown)
             println(io)
         end
     end
-    for f in filter(f -> startswith(f, "closure_"), readdir(out_dir))
+    for f in filter(f -> startswith(f, "closure_") && endswith(f, ".jls"), readdir(out_dir))
         c = deserialize(joinpath(out_dir, f))
         println(io, "Closure, configuration D, $(c["tile"]) band $(c["band_center"]) m, $(Date(c["season"][1])) ",
                 "to $(Date(c["season"][2])) ($(c["steps"]) steps): GEMB's per-step verbose mass and energy ",
@@ -296,9 +320,11 @@ if abspath(PROGRAM_FILE) == @__FILE__
     elseif mode == "closure"
         closure_check(ARGS[2], parse(Float64, ARGS[3]), parse(Float64, ARGS[4]),
                       length(ARGS) >= 5 ? ARGS[5] : out_default)
+    elseif mode == "derive"
+        derive_tiles(split(ARGS[2], ","), ARGS[3])
     elseif mode == "summarize"
         summarize(ARGS[2], ARGS[3])
     else
-        error("mode must be run, closure or summarize; got $mode")
+        error("mode must be run, closure, derive or summarize; got $mode")
     end
 end
