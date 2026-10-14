@@ -14,6 +14,7 @@ the header of each script states the finding and the output expected on each.
 | `parameter_differences.jl` | no package versions recorded, and keys on one side only are ignored (reads output files) |
 | `spinup_unconverged_outputs.jl` | unconverged area at the 100-year spinup ceiling in a merged sweep (reads output files) |
 | `spinup_convergence.jl` | simulated years the current physics needs to converge, per tile (reads the ERA5-Land cache) |
+| `before_after_tiles.jl` | one tile run under configurations A–D (production, GEMB fixes, ClimateForcing and GlacierSims fixes, all), with window rates, bare-ice albedo, ablation fluxes and band mass balance (reads the ERA5-Land cache and native runs) |
 
 `common.jl` holds the synthetic inputs, built only from API present on both branches.
 
