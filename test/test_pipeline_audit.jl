@@ -160,3 +160,43 @@ end
     @test GEMB_GlacierSims.record_years(run) ≈ 7N / 365.25
     @test run.totals[:dv][end, 1, 1] / GEMB_GlacierSims.record_years(run) ≈ r * 365.25 / 7
 end
+
+@testset "pipeline audit: append continuity" begin
+    # Spec 63: a continuation's cumulative series start from its seam; appended, they continue the
+    # stored record. dh [-1, -2] then a continuation [-1, -2] reads [-1, -2, -3, -4], and the totals
+    # likewise; the state total_fac and the per-interval fluxes are written as they are.
+    dir = mktempdir()
+    first_run = _fake_tile_run(; time = [DateTime(2000, 1, 31), DateTime(2000, 2, 29)])
+    later = _fake_tile_run(; time = [DateTime(2000, 3, 31), DateTime(2000, 4, 30)])
+    for r in (first_run, later)
+        r.bands_series[:dh] .= reshape([-1.0, -2.0], 2, 1, 1, 1)
+        r.totals[:dv] .= reshape([-1.0, -2.0], 2, 1, 1)
+        r.totals[:runoff] .= reshape([3.0, 7.0], 2, 1, 1)
+        r.totals[:fac] .= reshape([5.0, 4.0], 2, 1, 1)
+        for p in r.band_provenance
+            p["temperature_lapse_rate_n_fitted"] = 10
+            p["n_timesteps_above_freezing"] = 4
+        end
+    end
+    for p in later.band_provenance
+        p["temperature_lapse_rate"] = 7.2
+        p["temperature_lapse_rate_n_fitted"] = 30
+    end
+    later.provenance["max_dh_residual"] = 3.0e-13
+    path = write_glacier_tile_netcdf(joinpath(dir, "t.nc"), first_run; precision = Float64)
+    append_glacier_tile_netcdf(path, later)
+    NCDatasets.NCDataset(path, "r") do ds
+        @test ds["dh"][:, 1, 1, 1] == [-1.0, -2.0, -3.0, -4.0]
+        @test ds["dh"][:, 3, 2, 2] == [-1.0, -2.0, -3.0, -4.0]
+        @test ds["total_dv"][:, 1, 1] == [-1.0, -2.0, -3.0, -4.0]
+        @test ds["total_runoff"][:, 1, 1] == [3.0, 7.0, 10.0, 14.0]
+        @test ds["total_fac"][:, 1, 1] == [5.0, 4.0, 5.0, 4.0]
+        @test ds["melt"][3:4, :, :, :] == later.bands_series[:melt]
+        # Record-long band summaries: a step-weighted mean of 6.2 over 10 steps and 7.2 over 30, and
+        # counts summed across the seam.
+        @test ds["band_temperature_lapse_rate"][1] ≈ (6.2 * 10 + 7.2 * 30) / 40
+        @test ds["band_temperature_lapse_rate_n_fitted"][1] == 40
+        @test ds["band_n_timesteps_above_freezing"][1] == 8
+        @test ds.attrib["max_dh_residual"] == 3.0e-13
+    end
+end

@@ -404,6 +404,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
 
     # An extendable file is only extendable if it actually carries a firn state; one written before the
     # restart group existed has to be rebuilt.
+    # A `:fitted` resolution applies each timestep's own fit, which covers the whole record and cannot
+    # be resolved onto an appended segment alone; such a tile is rebuilt.
+    if disposition === :extendable && basis === :fitted
+        @info "Tile was run on per-timestep fits; rebuilding instead of appending" tile=i name
+        disposition = :rebuild
+    end
     restart = disposition === :extendable ? read_glacier_tile_restart(path) : nothing
     appending = restart !== nothing && restart.time !== nothing
     if disposition === :extendable && !appending
@@ -417,6 +423,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
     fetch_range = appending ?
                   (max(first(TIME_RANGE), restart.time - RESTART_FETCH_OVERLAP), last(TIME_RANGE)) :
                   TIME_RANGE
+    # The band forcing is built on the fetched steps, so the applied parameters must be resolved onto
+    # the same axis. Under `:climatology` this changes no setting the run records.
+    if appending
+        applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
+                                      basis, decoupling_factor_prior = prior)
+    end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps
     # its ice by borrowing a neighbour's forcing, and the neighbour contributes no area of its own, so
@@ -461,10 +473,10 @@ end
 
 # The authoritative run time axis, from one cell's forcing rather than assumed to be hourly. Also the
 # earliest point a wrong token or a cold cache surfaces, which is worth paying before a tile-wide pass.
-function probe_run_time(tile, token, cache)
+function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     row = first(tile.core)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
-                         time_range = TIME_RANGE, token, cache_path = cache)
+                         time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
 end
 
