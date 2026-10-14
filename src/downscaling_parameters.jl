@@ -182,10 +182,10 @@ Returns `(; grid_cells, time, decoupling, lapse_rate, elevation_interval_forcing
   identity.
 - `provenance`: what was derived from what — cell counts, time range, the region's extent.
 
-Per grid cell, per interval, forcing is adjusted in the order [`forcing_at_elevation`](@ref) uses
-and `climate_adjust_for_glacier` requires: **lapse to the interval center first, then decouple**.
-`k` multiplies an ambient temperature already at the glacier's elevation, so the reverse order is
-wrong. Cells sharing an interval are then averaged weighted by each cell's glacier area in it.
+Per grid cell, per interval, forcing is brought to the ice-free state, lapsed to the interval center
+with the ambient lapse rate, and only then decoupled with the interval's `k` — see
+[`elevation_interval_forcing`](@ref). Cells sharing an interval are then averaged weighted by each
+cell's glacier area in it.
 
 **The fits report; they do not decide.** Both are `NaN` wherever the region's forcing carried no
 information, and neither is clamped — a lapse rate of 200 K/km is real evidence that the region does
@@ -204,8 +204,8 @@ Lapse rates vary strongly on diurnal and seasonal timescales — nocturnal valle
 steep midday cooling — so a wide spread across timesteps is usually physics rather than fit error.
 That distinction cannot be made here, which is exactly why this function does not try to.
 
-**Screen the two series together, not separately.** `derive_lapse_rate` consumes `k` to bring the
-cells to a common on-glacier state, so a `k` outside `(0, 1]` corrupts that timestep's slope as well:
+**Screen the two series together, not separately.** `derive_lapse_rate` consumes the decoupling fit to
+bring the cells to the ice-free state, so a `k` outside `(0, 1]` corrupts that timestep's slope as well:
 at Wrangell every fitted slope above $(_LAPSE_RATE_LIMITS[2]) K/km came from an out-of-domain `k`, and
 none from a valid one. The corruption is a smooth false gradient rather than scattered noise, so it is
 invisible in the slope series alone and a robust estimator does not remove it. The minimum screen is
@@ -339,8 +339,8 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     grid_cells = @view selected[acc.used, :]
 
     decoupling = derive_decoupling_factor(acc; min_cells)
-    # The lapse fit needs a `k` per timestep to bring every cell to a common on-glacier state before
-    # taking the slope. It reads the raw series and treats a `NaN` timestep as `k = 1` locally — the
+    # The lapse fit needs the decoupling fit per timestep to bring every cell to the ice-free state
+    # before taking the slope. It reads the raw series and treats a `NaN` timestep as `k = 1` locally — the
     # bit-exact no-op — rather than being handed a pre-filled one, so no substituted value is ever
     # written into what either fit reports.
     lapse_rate = derive_lapse_rate(acc, decoupling; min_cells)
@@ -372,7 +372,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
         "n_elevation_intervals" => length(interval_forcing.intervals),
         "area_minimum" => Float64(area_minimum),
         "mean_elevation" => acc.mean_elevation,
-        "adjustment_order" => "lapse_then_decouple",
+        "adjustment_order" => "ambient_lapse_decouple",
         # How much of each fit is measurement rather than absence. The judgement about whether that
         # is enough is the caller's; this just reports the count so it can be made.
         "n_timesteps" => acc.n,
@@ -434,37 +434,24 @@ function _accumulate_cross_cell(selected, load)
         if S === nothing
             time = collect(dims(fd, Ti))
             n = length(time)
-            # Cross-products of the design vector `x = [1, z, glm, glm*z]` (the interaction term is
-            # required — see `derive_decoupling_factor`), against the warm excess `E` and the
-            # temperature `T`. Only the upper triangle of the symmetric XᵀX is stored.
-            S = (; s1 = zeros(Int, n),
-                 z = zeros(n), g = zeros(n), w = zeros(n),
-                 zz = zeros(n), zg = zeros(n), zw = zeros(n),
-                 gg = zeros(n), gw = zeros(n), ww = zeros(n),
-                 E = zeros(n), zE = zeros(n), gE = zeros(n), wE = zeros(n),
-                 T = zeros(n), zT = zeros(n),
-                 # Second moment of the warm excess, for the decoupling fit's `r2`.
-                 EE = zeros(n),
-                 # Second moments involving temperature, for the *lapse* fit's residual scatter —
-                 # see `derive_lapse_rate_uncertainty`. Three are needed rather than one because the
-                 # lapse fit regresses the decoupling-*corrected* temperature, and squaring
-                 # `T + c(α + βz)(1 - glm)` needs the cross terms in `glm` and `glm*z` too.
-                 #
-                 # `TT` accumulates the square of the temperature **about the melting point**, not of
-                 # the temperature itself. The residual sum of squares is translation-invariant, so
-                 # this changes no result — but it is the difference between computing it and not.
-                 # Absolute temperatures are ~270 K, so `ΣT²` runs to ~1e5 per cell while the variance
-                 # about the mean is O(1): forming `ΣT² - (ΣT)²/m` from unshifted sums cancels away
-                 # eleven digits and reports ~5e-6 K of scatter for a fit that is exact. Shifted, the
-                 # magnitudes are O(20) and the floor drops with the square of that ratio.
-                 TT = zeros(n), gT = zeros(n), wT = zeros(n))
+            # Upstream's layout for the two fits, plus the moments `derive_lapse_rate_uncertainty`
+            # needs to square the ice-free temperature: `TT` over every cell, `gT_warm` and `wT_warm`
+            # (Σglm·T and Σglm·z·T) over the cells above melting, where the correction acts.
+            #
+            # `TT` accumulates the square of the temperature **about the melting point**. The residual
+            # sum of squares is translation-invariant, so this changes no result, but absolute
+            # temperatures are ~270 K: `ΣT²` runs to ~1e5 per cell against an O(1) variance, and
+            # forming `ΣT² - (ΣT)²/m` from unshifted sums cancels eleven digits.
+            S = merge(_downscaling_sums(n), (; TT = zeros(n), gT_warm = zeros(n), wT_warm = zeros(n)))
         else
             length(T) == n || throw(ArgumentError(
                 "grid cell $i has $(length(T)) forcing steps but the region's first cell has " *
                 "$n; every cell must share one time axis"))
         end
 
-        _accumulate_cell!(S, T, z, _row_glm(row), n)
+        glm = _row_glm(row)
+        _accumulate_downscaling_cell!(S, T, z, glm)
+        _accumulate_lapse_moments!(S, T, z, glm)
 
         push!(used, i)
         push!(elevations, z)
@@ -527,15 +514,20 @@ table's glacier area, concentrated on the Antarctic Peninsula, north Greenland a
 Arctic — a regional bias rather than noise, which is why the substitution is the default and why
 whatever it cannot reach is counted rather than skipped.
 
-Per grid cell, per band, forcing is adjusted in the order `climate_adjust_for_glacier` requires:
-**lapse to the band center first, then decouple.** `k` multiplies an ambient temperature already at the
-glacier's elevation, so the reverse order is wrong, and the two do not commute — the decoupling damps
-only the excess above a fixed melting point, and lapsing changes which timesteps are above it. Cells
-sharing a band are then averaged weighted by each cell's glacier area in it.
+Per grid cell, per band, forcing is adjusted in three steps (`_cell_forcing_at_interval`):
 
-`k` is applied at **each band's own center**, weighted down per donor cell by that cell's ERA5-Land
-glacier fraction (`_effective_decoupling_factor`): the reanalysis has already damped the share of the
-cell it runs as ice, and only the rest needs correcting.
+1. **to ambient** — the reanalysis already runs a fraction `glm` of the cell as ice, so its warm
+   excess is `[1 - glm·(1 - k)]·E_ambient`. Inverting that with `k` at the cell's own reanalysis
+   elevation and the cell's `glm` gives the ice-free temperature;
+2. **lapse** — to the band center, with the applied ambient lapse rate;
+3. **decouple** — with the band's own `k` at the band center, since the band is glacier.
+
+A region whose forcing follows the mixing model the fits measure therefore gives the band temperature
+`T_ref + k(z_band)·E_ambient(z_band)` from every cell, whatever its `glm`. The order matters: the
+decoupling damps only the excess above a fixed melting point, and lapsing changes which timesteps are
+above it. Cells sharing a band are then averaged weighted by each cell's glacier area in it — every
+layer by plain area weight, except `solar_zenith_angle`, which is the angle whose cosine is the
+shortwave-weighted mean cosine (90° at a step with no shortwave).
 
 Laziness is what makes a large region tractable. All bands at once is `n_bands * 7 * n_time` Float64s
 — ~2 GB for 50 bands of 76 hourly years — so instead each `iterate` streams the cells again and
@@ -560,7 +552,7 @@ function elevation_interval_forcing(grid_cells, applied::AppliedDownscaling;
                                      Float64(donor_max_distance_km))
 end
 
-struct _ElevationIntervalForcing{C,L,B,D}
+struct _ElevationIntervalForcing{C,L,B,D,K}
     grid_cells::C
     load::L
     time::Vector{DateTime}
@@ -570,6 +562,11 @@ struct _ElevationIntervalForcing{C,L,B,D}
     intervals::B
     donor_cells::D
     donor_max_distance_km::Float64
+    # `k` at a reanalysis elevation, from `AppliedDownscaling.decoupling_at`, and the series already
+    # evaluated, keyed by elevation. Cells share elevations only by coincidence, but each cell is met
+    # once per batching pass, so the memo saves the re-evaluation on every pass after the first.
+    decoupling_at::K
+    donor_decoupling::Dict{Float64,Vector{Float64}}
     # Forcing for donors that have been used, and the coordinates already found unusable. Masked cells
     # cluster, so the second one in a tile usually resolves to a donor already here and costs no I/O;
     # the unusable set stops a rejected candidate from being loaded again by the next masked cell.
@@ -589,8 +586,20 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
     return _ElevationIntervalForcing(grid_cells, load, applied.time, applied.lapse_rate,
                                      applied.lapse_rate_source, elevation_interval_batch,
                                      applied.bands, donor_cells, donor_max_distance_km,
+                                     applied.decoupling_at, Dict{Float64,Vector{Float64}}(),
                                      Dict{Tuple{Float64,Float64},Any}(),
                                      Set{Tuple{Float64,Float64}}())
+end
+
+# `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is `glm`, for
+# bringing its forcing to the ice-free state. A cell with no glacier fraction needs no `k` there,
+# which is the one case a resolution without `decoupling_at` can force.
+function _donor_decoupling_factor(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
+    glm == 0 && return ones(length(ivf.time))
+    ivf.decoupling_at === nothing && throw(ArgumentError(
+        "this AppliedDownscaling carries no `decoupling_at`, so the forcing of a cell with glacier " *
+        "fraction $glm cannot be brought to the ice-free state; build it with `resolve_downscaling`"))
+    return get!(() -> ivf.decoupling_at(z), ivf.donor_decoupling, z)
 end
 
 # Forcing to use for `row`, which has ice but no usable forcing of its own: the nearest cell of
@@ -716,9 +725,8 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             continue
         end
 
-        # How much of the correction this cell still needs, after the reanalysis has already applied
-        # its own `glm`-worth of it — the same weighting `cell_decoupling_factor` applies, and the
-        # same one `derive_lapse_rate` undoes to fit the slope.
+        # How much of this cell the reanalysis already runs as ice, which sets how far its forcing is
+        # from the ice-free state the lapse starts from.
         glm = _row_glm(row)
         distance = 0.0
         substituting = false
@@ -743,16 +751,26 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             substituting = true
         end
 
+        missing_layers = [v for v in _FORCING_VARIABLES if !haskey(fd, v)]
+        isempty(missing_layers) || throw(ArgumentError(
+            "forcing for the cell at ($(row.latitude), $(row.longitude)) lacks the layer(s) " *
+            "$(join(missing_layers, ", ")); every band averages all of $(_FORCING_VARIABLES)"))
+
         template === nothing && (template = fd)
         # Whether substituted or not, this is the reference surface of the series in `fd`, which is what
         # the lapse to the interval centre must start from.
         z_cell = Float64(DimensionalData.metadata(fd)["elevation"])
 
+        # The series brought to the ice-free state once per cell, with `k` at the cell's own reanalysis
+        # elevation and the `glm` of the cell the series belongs to, so every band lapses from the same
+        # ambient temperature.
+        ambient = _ambient_forcing(fd, glm, _donor_decoupling_factor(ivf, z_cell, glm))
+
         # A function barrier: with substitution, `fd` may come from the donor memo, whose element type
         # is not concrete. Resolving it at this one call keeps the record-length inner loops specialized
         # on the stack's real type rather than dispatching per timestep.
         _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, reasons, n_substituted,
-                                    substituted, donor_distance, intervals, areas, fd, z_cell, glm,
+                                    substituted, donor_distance, intervals, areas, ambient, z_cell,
                                     ivf, n, substituting, distance)
     end
 
@@ -830,8 +848,12 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
 end
 
 # One cell's contribution to every interval of the current batch. Split out of `_accumulate_intervals`
-# as a function barrier: `forcing` may arrive from the donor memo, whose element type is not concrete,
+# as a function barrier: `ambient` may derive from the donor memo, whose element type is not concrete,
 # and this is where the record-length loops live.
+#
+# `ambient` is the cell's forcing already at the ice-free state, so each interval only lapses it and
+# decouples with the interval's own `k`; `_cell_forcing_at_interval` is handed a glacier fraction of
+# zero, which makes its own ambient step the identity.
 #
 # Threaded over intervals, not over cells. This inner loop is the whole cost of the pass —
 # `n_cells * n_intervals` lapse-and-decouple passes over the record, which for a 335-cell tile of 60
@@ -839,19 +861,20 @@ end
 # order within an interval stays the cell order and the result is bit-for-bit what the serial loop
 # gives. Threading over cells instead would have several threads adding into the same interval, where
 # floating-point addition is not associative.
+#
+# Every layer is a glacier-area weighted mean except `solar_zenith_angle`, whose slot accumulates
+# `w·SW·cos(θ)`; `_interval_stack` divides it by the `w·SW` the shortwave slot already holds.
 function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, reasons,
                                      n_substituted, substituted, donor_distance,
-                                     intervals, areas, forcing, z_cell, glm, ivf, n,
+                                     intervals, areas, ambient, z_cell, ivf, n,
                                      substituting::Bool, distance::Float64)
+    unit_factor = ones(n)
     Threads.@threads for i in eachindex(intervals)
         areas[i] > 0 && !unreachable[i] || continue
         interval = intervals[i]
-        # `k` at *this interval's* elevation, weighted down by the cell's `glm`. Per interval rather
-        # than per cell, because `k` varies with elevation and the interval center is where the forcing
-        # is being delivered — only `glm` differs between cells.
-        cell_factor = [_effective_decoupling_factor(k, glm) for k in interval.decoupling_factor]
         adjusted = try
-            _cell_forcing_at_interval(forcing, interval.center - z_cell, cell_factor, ivf.lapse_rate)
+            _cell_forcing_at_interval(ambient, interval.center - z_cell, interval.decoupling_factor,
+                                      ivf.lapse_rate, 0.0, unit_factor)
         catch e
             e isa InterruptException && rethrow()
             is_caller_error(e) && rethrow()
@@ -863,11 +886,18 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
             continue
         end
         w = areas[i]
+        sw = adjusted[:shortwave_downward]
         for v in _FORCING_VARIABLES
             s = sums[i][v]
             a = adjusted[v]
-            @inbounds for t in 1:n
-                s[t] += w * a[t]
+            if v === :solar_zenith_angle
+                for t in eachindex(s, a, sw)
+                    s[t] += w * sw[t] * cosd(a[t])
+                end
+            else
+                for t in eachindex(s, a)
+                    s[t] += w * a[t]
+                end
             end
         end
         weights[i] += w
@@ -912,11 +942,12 @@ genuinely different microclimates. So this is not a sampling standard error in t
 makes it more apt for this decision rather than less: what it measures is how well *one* linear lapse
 rate describes these cells at this timestep, which is the question behind accepting the fit.
 
-The regression described is the same one `derive_lapse_rate` performs — on the decoupling-**corrected**
-temperature `T' = T + (k-1)(1-glm)·E_ambient(z)`, under the same `fit_ok` screen, so the reported error
-belongs to the reported slope. That is why three extra accumulator sums are needed and not one:
-squaring `T'` brings in the cross terms in `glm` and `glm·z`. `NaN` wherever the slope itself is `NaN`,
-and wherever there are too few cells to have any residual degrees of freedom.
+The regression described is the same one `derive_lapse_rate` performs — on the ice-free temperature
+`T' = T - glm·(γ + δ·z)` for a cell above melting and `T' = T` otherwise, under the same `fit_ok`
+screen, so the reported error belongs to the reported slope. Squaring `T'` needs `Σglm·T` and
+`Σglm·z·T` over the cells above melting beside the regressor moments upstream already keeps. `NaN`
+wherever the slope itself is `NaN`, and wherever there are too few cells to have any residual degrees
+of freedom.
 """
 function derive_lapse_rate_uncertainty(acc, decoupling; min_cells::Int = _MIN_CELLS_DEFAULT)
     n = acc.n
@@ -927,13 +958,14 @@ function derive_lapse_rate_uncertainty(acc, decoupling; min_cells::Int = _MIN_CE
     residual_sd = fill(NaN, n)
 
     S = acc.sums
-    # A tile accumulated before the temperature second moments existed carries no `TT`, and asking it
-    # for a lapse-rate uncertainty must report "not measured" rather than throw on a missing field.
+    # A tile accumulated without the temperature second moments carries no `TT`, and asking it for a
+    # lapse-rate uncertainty must report "not measured" rather than throw on a missing field.
     if S !== nothing && :TT in propertynames(S)
         k = decoupling.decoupling_factor
-        cα, cβ = decoupling.coef_alpha, decoupling.coef_beta
+        cγ, cδ = decoupling.coef_gamma, decoupling.coef_delta
+        r = _DECOUPLING_REFERENCE_TEMPERATURE
 
-        @inbounds for t in 1:n
+        for t in 1:n
             # Three cells give a slope but no residual degrees of freedom; `m - 2` must be positive.
             S.s1[t] >= max(min_cells, 3) || continue
             m = Float64(S.s1[t])
@@ -942,42 +974,30 @@ function derive_lapse_rate_uncertainty(acc, decoupling; min_cells::Int = _MIN_CE
             Szz > 0 || continue
 
             # The same screen `derive_lapse_rate` applies, so this error belongs to that slope: an
-            # out-of-domain `k` makes the correction arbitrary, and both treat such a timestep as
-            # `k = 1`, the exact no-op.
-            fit_ok = isfinite(k[t]) && 0.0 < k[t] <= 1.0 && isfinite(cα[t]) && isfinite(cβ[t])
-            c = fit_ok ? k[t] - 1.0 : 0.0
-            α, β = fit_ok ? (cα[t], cβ[t]) : (0.0, 0.0)
+            # unmeasured or out-of-domain `k` leaves the temperatures uncorrected.
+            fit_ok = isfinite(k[t]) && 0.0 < k[t] <= 1.0 && isfinite(cγ[t]) && isfinite(cδ[t])
+            γ, δ = fit_ok ? (cγ[t], cδ[t]) : (0.0, 0.0)
 
-            # Sums of the correction `u = (α + βz)(1 - glm)` and of its products with `z` and `T`,
-            # all from the stored regressor moments.
-            su   = α * (m - S.g[t])      + β * (S.z[t]  - S.w[t])
-            szu  = α * (S.z[t] - S.w[t]) + β * (S.zz[t] - S.zw[t])
-            suu  = α * α * (m - 2 * S.g[t] + S.gg[t]) +
-                   2 * α * β * (S.z[t] - 2 * S.w[t] + S.gw[t]) +
-                   β * β * (S.zz[t] - 2 * S.zw[t] + S.ww[t])
+            # Sums over the warm cells of the correction `u = glm·(γ + δz)`, of `z·u`, `u²`, and of
+            # `u·(T - T_ref)`. Cells at or below melting have `u = 0`.
+            su  = γ * S.g_warm[t]  + δ * S.w_warm[t]
+            szu = γ * S.zg_warm[t] + δ * S.zw_warm[t]
+            suu = γ * γ * S.gg_warm[t] + 2 * γ * δ * S.gw_warm[t] + δ * δ * S.ww_warm[t]
+            suT = γ * (S.gT_warm[t] - r * S.g_warm[t]) + δ * (S.wT_warm[t] - r * S.w_warm[t])
 
-            # Everything below works in temperature **relative to the melting point**, because that is
-            # the frame `TT` was accumulated in and the frame the cancellation is tolerable in. Every
-            # quantity produced from here — slope, residual, R² — is translation-invariant, so the
-            # shift is free. `S.T`, `S.gT` and `S.wT` are unshifted, and their shifts are exactly
-            # `T_ref` times sums already in hand.
-            r = _DECOUPLING_REFERENCE_TEMPERATURE
-            sT_r  = S.T[t]  - m * r
-            szT_r = S.zT[t] - S.z[t] * r
-            sTu_r = α * ((S.T[t] - m * r) - (S.gT[t] - S.g[t] * r)) +
-                    β * ((S.zT[t] - S.z[t] * r) - (S.wT[t] - S.w[t] * r))
-
-            sT  = sT_r  + c * su
-            szT = szT_r + c * szu
-            sTT = S.TT[t] + 2 * c * sTu_r + c * c * suu
+            # Temperature relative to the melting point, the frame `TT` was accumulated in. Slope,
+            # residual and R² are translation-invariant, so the shift changes none of them.
+            sT  = (S.T[t] - m * r) - su
+            szT = (S.zT[t] - S.z[t] * r) - szu
+            sTT = S.TT[t] - 2 * suT + suu
 
             SzT = szT - S.z[t] * sT / m
             STT = sTT - sT * sT / m
             STT > 0 || continue
 
-            # Residual sum of squares of the corrected temperatures about the fitted line. Clamped at
-            # zero: with a near-perfect fit it is a difference of two nearly equal large numbers and
-            # can land a rounding step below.
+            # Residual sum of squares of the ice-free temperatures about the fitted line. Clamped at
+            # zero: with a near-perfect fit it is a difference of two nearly equal numbers and can
+            # land a rounding step below.
             rss = max(STT - SzT * SzT / Szz, 0.0)
 
             residual_sd[t] = sqrt(rss / (m - 2))
@@ -995,38 +1015,25 @@ function derive_lapse_rate_uncertainty(acc, decoupling; min_cells::Int = _MIN_CE
                      residual_sd = DimArray(residual_sd, ti)); metadata)
 end
 
-# Add one cell's contribution to the cross-cell sums, for every timestep.
+# Add one cell's temperature moments for `derive_lapse_rate_uncertainty` to `S`: `(T - T_ref)²` over
+# every cell, and `glm·T`, `glm·z·T` over the cells above melting — the same warm set upstream's
+# `_accumulate_downscaling_cell!` restricts the decoupling sums to.
 #
-# A separate function purely as a **function barrier**, and it must stay one: inlining it back costs a
-# factor of 200 on this loop.
-#
-# In `_accumulate_cross_cell` the sums start as `nothing` — that sentinel is how the first cell's
-# forcing establishes the time axis — so `S` is inferred there as `Union{Nothing,NamedTuple{...}}`, and
-# a `S.z` in the loop body is then a *dynamic* property lookup: 17 of them, 17,521 timesteps, once per
-# cell. On a real tile that put `Base.getproperty` at 52% of the accumulation's self time and allocated
-# ~13 MiB per cell in boxes. Passed as an argument the type is concrete at the callee, every
-# `getproperty` folds to a field load, and the loop allocates nothing at all.
-function _accumulate_cell!(S, T, z, glm, n)
-    # The interaction regressor, formed once per cell rather than per timestep.
+# Takes `S` as an argument, which makes it a function barrier: in `_accumulate_cross_cell` the sums
+# start as `nothing`, so there `S` is a `Union` and every `S.field` in a loop body would be a dynamic
+# property lookup per timestep.
+function _accumulate_lapse_moments!(S, T, z::Real, glm::Real)
+    z, glm = Float64(z), Float64(glm)
     gz = glm * z
-    @inbounds for t in 1:n
+    for t in eachindex(T, S.TT)
         Tt = T[t]
-        Et = max(Tt - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
-        S.s1[t] += 1
-        S.z[t]  += z;          S.g[t]  += glm;         S.w[t]  += gz
-        S.zz[t] += z * z;      S.zg[t] += z * glm;     S.zw[t] += z * gz
-        S.gg[t] += glm * glm;  S.gw[t] += glm * gz;    S.ww[t] += gz * gz
-        S.E[t]  += Et;         S.zE[t] += z * Et
-        S.gE[t] += glm * Et;   S.wE[t] += gz * Et
-        S.T[t]  += Tt;         S.zT[t] += z * Tt
-        S.EE[t] += Et * Et
-        # About the melting point, for conditioning — see the comment where `TT` is allocated. `gT`
-        # and `wT` stay unshifted: their shift is exactly `T_ref` times `Σglm` and `Σ(glm z)`, both
-        # already accumulated, so it can be applied on the way out without losing anything.
         Tr = Tt - _DECOUPLING_REFERENCE_TEMPERATURE
-        S.TT[t] += Tr * Tr;    S.gT[t] += glm * Tt;    S.wT[t] += gz * Tt
+        S.TT[t] += Tr * Tr
+        Tr > 0 || continue
+        S.gT_warm[t] += glm * Tt
+        S.wT_warm[t] += gz * Tt
     end
-    return nothing
+    return S
 end
 
 # This cell's glacier area (km²) in each of `intervals`, by decoding its flat `hyps_*` columns.
@@ -1044,7 +1051,9 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
     weight > 0 || throw(ArgumentError(
         "elevation interval $(interval.lo)-$(interval.hi) m accumulated zero area"))
     time_dim = dims(template, Ti)
-    layers = NamedTuple(v => DimArray(sums[v] ./ weight, (time_dim,);
+    layers = NamedTuple(v => DimArray(v === :solar_zenith_angle ?
+                                          _band_zenith_angle(sums[v], sums[:shortwave_downward]) :
+                                          sums[v] ./ weight, (time_dim,);
                                       metadata = DimensionalData.metadata(template[v]))
                         for v in _FORCING_VARIABLES)
 
@@ -1095,7 +1104,7 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
         "glacier_decoupling_factor_n_fit_held" => interval.n_fit_held,
         "glacier_decoupling_factor_n_fit_in_domain" => interval.n_fit_in_domain,
         "n_timesteps_above_freezing" => count(warm),
-        "adjustment_order" => "lapse_then_decouple",
+        "adjustment_order" => "ambient_lapse_decouple",
         "temperature_air_mean" => Statistics.mean(layers.temperature_air),
         "precipitation_mean" => Statistics.mean(layers.precipitation),
         "wind_speed_mean" => Statistics.mean(layers.wind_speed)))
@@ -1124,4 +1133,24 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
             albedo_ice = interval.albedo_ice,
             albedo_ice_source = interval.albedo_ice_source,
             forcing = DimStack(layers; metadata = meta))
+end
+
+# A band's solar zenith angle (degrees) from the accumulated `Σ w·SW·cos θ` and `Σ w·SW`: the angle
+# whose cosine is the shortwave-weighted mean cosine, so the band's direct-beam geometry is that of the
+# shortwave it receives. 90° (sun at the horizon) at a step with no shortwave, where no angle is
+# defined and GEMB applies none.
+function _band_zenith_angle(sum_sw_cos, sum_sw)
+    θ = similar(sum_sw)
+    for t in eachindex(θ, sum_sw_cos, sum_sw)
+        if sum_sw[t] > 0
+            c = sum_sw_cos[t] / sum_sw[t]
+            # A weighted mean of cosines lies in [-1, 1]; anything further out than rounding is a bug.
+            abs(c) <= 1 + 1e-12 || throw(ErrorException(
+                "shortwave-weighted mean cos(solar_zenith_angle) is $c at step $t, outside [-1, 1]"))
+            θ[t] = acosd(clamp(c, -1.0, 1.0))
+        else
+            θ[t] = 90.0
+        end
+    end
+    return θ
 end

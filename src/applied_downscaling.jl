@@ -142,12 +142,17 @@ value.
 - `provenance`: where the resolved values came from — the albedo product, the parameter file, the fit
   behind the albedo profile. Recorded but **not** compared: re-wording a product description or
   moving a parameter file does not change what was simulated, and must not invalidate a restart.
+- `decoupling_at`: `z -> Vector{Float64}`, the applied `k` on `time` at a reanalysis elevation `z`
+  (m), resolved by the same tiers as a band's, or `nothing`. A donor cell's forcing is brought to
+  the ice-free state with `k` at the donor's own elevation before it is lapsed
+  ([`elevation_interval_forcing`](@ref)), so a resolution that leaves this `nothing` can force only
+  cells with no glacier fraction.
 
 Use [`downscaling_source_counts`](@ref) to summarize a source vector, and pass it the band's
 above-freezing mask to get the count that matters — `k` is arbitrary at a timestep with no warm excess
 for it to act on, so an unqualified "71% substituted" is not the honest number.
 """
-struct AppliedDownscaling{B}
+struct AppliedDownscaling{B,D}
     time::Vector{DateTime}
     lapse_rate::Vector{Float64}
     lapse_rate_source::Vector{Int8}
@@ -155,14 +160,19 @@ struct AppliedDownscaling{B}
     basis::Symbol
     settings::Dict{String,Any}
     provenance::Dict{String,Any}
+    decoupling_at::D
 end
 
 # Provenance defaults to empty: a caller assembling an `AppliedDownscaling` by hand — a test, or a
 # resolution not read from a parameter file — has nothing to record, and an absent provenance is not
-# an absent setting.
+# an absent setting. Such a caller has no fit to evaluate `k` from either, so `decoupling_at` defaults
+# to `nothing`.
 AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings) =
     AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings,
                        Dict{String,Any}())
+AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings, provenance) =
+    AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings, provenance,
+                       nothing)
 
 Base.show(io::IO, a::AppliedDownscaling) = print(io,
     "AppliedDownscaling(", length(a.time), " timesteps, ", length(a.bands), " bands, basis=",
@@ -205,9 +215,9 @@ published Shaw et al. (2025) factor over its cells, or `nothing` when none of th
 
 This is the `:prior` tier of [`resolve_downscaling`](@ref): an estimate that does not depend on the
 tile's own forcing, for the timesteps that forcing cannot constrain. The **published** factor is
-averaged, not the `glm`-weighted one [`cell_decoupling_factor`](@ref) returns, because the `glm`
-weighting is a property of the donor cell and is applied per cell where the forcing is assembled
-(`_effective_decoupling_factor`). Weighting it in twice would damp the correction toward the identity.
+averaged, not the `glm`-weighted one [`cell_decoupling_factor`](@ref) returns, because `k` here is
+the on-glacier factor a band is decoupled with; a cell's `glm` enters separately, where its forcing is
+brought to the ice-free state ([`elevation_interval_forcing`](@ref)).
 
 `nothing` is the normal outcome in RGI regions 05 (Greenland periphery) and 19 (Antarctic and
 Subantarctic), which are absent from the published table entirely.
@@ -258,12 +268,13 @@ A timestep's own fit is accepted when all of these hold, and used as measured:
 3. it lies inside `lapse_rate_window`, a wide physical sanity range. Wide because it is no longer what
    judges conditioning: a narrow window rejects measured physics, discarding >1% of the fits in 364 of
    739 tiles and clipping the inversions that highly glaciated tiles legitimately fit;
-4. **the same timestep's `k` is not out of domain.** `derive_lapse_rate` consumes `k` to bring the cells
-   to a common on-glacier state, so a `k` outside `(0, 1]` corrupts that timestep's slope through a
-   correction proportional to `k - 1`. Because that correction carries a `1 - glm` weight and `glm`
-   rises with elevation, the damage is a smooth false gradient rather than scatter: at Wrangell it took
-   a 7.0 K/km slope to 46.1, and ordinary least squares, Theil–Sen and Huber all returned 46.1. No
-   robust estimator removes it, so the only defence is to drop the timestep.
+4. **the same timestep's `k` is not out of domain.** `derive_lapse_rate` consumes the decoupling fit to
+   bring the cells to the ice-free state, so a `k` outside `(0, 1]` corrupts that timestep's slope
+   through a correction proportional to the fit's `glm` coefficients. Because that correction carries a
+   `glm` weight and `glm` rises with elevation, the damage is a smooth false gradient rather than
+   scatter: at Wrangell it took a 7.0 K/km slope to 46.1, and ordinary least squares, Theil–Sen and
+   Huber all returned 46.1. No robust estimator removes it, so the only defence is to drop the
+   timestep.
 
    A `NaN` `k` is *not* a rejection. `derive_lapse_rate` treats it as `k = 1` locally, the bit-exact
    no-op, so that timestep's slope is the ambient one and is sound. This is why the stored `fit_usable`
@@ -392,43 +403,30 @@ function resolve_downscaling(fit, intervals, run_time;
     z_range = isempty(intervals) ? nothing :
               (Float64(first(intervals).lo), Float64(last(intervals).hi))
 
-    alpha = collect(Float64, fit.decoupling.coef_alpha)
-    beta = collect(Float64, fit.decoupling.coef_beta)
-
     # The tile's pooled bare-ice albedo profile, absent from any tile derived before it was stored.
     # `resolve_albedo_ice` handles `nothing` by falling every band back to `albedo_ice_default`, so
     # an older tile still resolves — with the tuned constant, exactly as it ran before.
     albedo_profile = hasproperty(fit, :bare_ice_albedo) ? fit.bare_ice_albedo : nothing
 
     bands = map(intervals) do interval
-        raw = decoupling_factor_at_elevation(fit.decoupling, interval.center;
-                                             elevation_range = z_range)
-        kz = collect(Float64, raw)
-        in_domain = [isfinite(x) && _DECOUPLING_FACTOR_LIMITS[1] < x <= _DECOUPLING_FACTOR_LIMITS[2]
-                     for x in kz]
-        # Which timesteps were evaluated at a held-down elevation rather than at the band centre.
-        # `decoupling_factor_at_elevation` reports only how many, and the label needs to know which, so
-        # the same condition is re-formed here from the coefficients it holds: the ambient warm excess
-        # `alpha + beta*z` is what its denominator thresholds.
-        held = [isfinite(alpha[t]) && alpha[t] + beta[t] * interval.center < _MIN_AMBIENT_EXCESS
-                for t in eachindex(kz)]
-
-        factor, source = _resolve_series(fit_time, kz, in_domain, run_time, basis, k_prior;
-                                         held, ambient = 1.0)
-        _assert_applicable(factor, _DECOUPLING_FACTOR_LIMITS,
-                           "decoupling factor at $(interval.center) m"; open_lower = true)
+        k = _resolve_decoupling_at(fit.decoupling, interval.center, fit_time, run_time, basis,
+                                   k_prior; elevation_range = z_range)
 
         albedo_ice, albedo_ice_source = resolve_albedo_ice(albedo_profile, interval.center;
                                                           default = albedo_ice_default,
                                                           range = albedo_ice_range)
 
         (; interval.lo, interval.hi, interval.center,
-         decoupling_factor = factor,
-         decoupling_factor_source = source,
-         n_fit_in_domain = count(in_domain),
-         n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)),
+         decoupling_factor = k.factor,
+         decoupling_factor_source = k.source,
+         k.n_fit_in_domain, k.n_fit_held,
          albedo_ice, albedo_ice_source)
     end
+
+    # `k` at a donor cell's reanalysis elevation, by the same tiers. No elevation range: a reanalysis
+    # surface can sit below the hypsometry, and it is among the elevations the fit was taken over.
+    decoupling_at = z -> _resolve_decoupling_at(fit.decoupling, z, fit_time, run_time, basis,
+                                                k_prior).factor
 
     settings = Dict{String,Any}(
         "downscaling_basis" => string(basis),
@@ -453,7 +451,34 @@ function resolve_downscaling(fit, intervals, run_time;
     end
 
     return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings,
-                              _albedo_provenance(fit, albedo_profile))
+                              _albedo_provenance(fit, albedo_profile), decoupling_at)
+end
+
+# `k` at elevation `z` resolved onto `run_time`: the fit re-evaluated there
+# ([`decoupling_factor_at_elevation`](@ref)), accepted where finite and inside `(0, 1]` and labelled
+# `:held` where the tile's ambient warm excess ran out below `z`, with every other timestep falling
+# through the climatology tiers to `k_prior` and finally to 1. Returns
+# `(; factor, source, n_fit_in_domain, n_fit_held)`; the counts describe the fit series.
+function _resolve_decoupling_at(decoupling, z::Real, fit_time, run_time, basis, k_prior;
+                                elevation_range = nothing)
+    raw = decoupling_factor_at_elevation(decoupling, z; elevation_range)
+    kz = collect(Float64, raw)
+    in_domain = [isfinite(x) && _DECOUPLING_FACTOR_LIMITS[1] < x <= _DECOUPLING_FACTOR_LIMITS[2]
+                 for x in kz]
+    # Which timesteps were evaluated at a held-down elevation rather than at `z`.
+    # `decoupling_factor_at_elevation` reports only how many, and the label needs to know which, so
+    # the same condition is re-formed here from the coefficients: the ambient warm excess
+    # `alpha + beta*z` is what its denominator thresholds.
+    alpha, beta = decoupling.coef_alpha, decoupling.coef_beta
+    held = [isfinite(alpha[t]) && alpha[t] + beta[t] * z < _MIN_AMBIENT_EXCESS
+            for t in eachindex(kz)]
+
+    factor, source = _resolve_series(fit_time, kz, in_domain, run_time, basis, k_prior;
+                                     held, ambient = 1.0)
+    _assert_applicable(factor, _DECOUPLING_FACTOR_LIMITS, "decoupling factor at $(z) m";
+                       open_lower = true)
+    return (; factor, source, n_fit_in_domain = count(in_domain),
+            n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)))
 end
 
 # Where a resolution's bare-ice albedo came from, for the record rather than for comparison.
