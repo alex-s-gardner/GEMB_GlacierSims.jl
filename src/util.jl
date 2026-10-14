@@ -375,9 +375,9 @@ experiment.
 
 The tree is the git tree hash of the package's `src` directory at `HEAD` when the package is a git
 checkout — with `+dirty:` and a CRC-32C of the uncommitted changes to `src` and `Project.toml`
-(including untracked files under `src`) when there are any — and otherwise the `git-tree-sha1` the
-active manifest records for it. A package whose tree cannot be identified either way throws.
-Computed once per process.
+(including untracked files under `src`) when there are any — otherwise the `git-tree-sha1` the
+active manifest records for it, and failing both `crc32c:` and a CRC-32C of every file under `src`
+and of `Project.toml`. Computed once per process.
 """
 function software_provenance()
     cached = _SOFTWARE_PROVENANCE[]
@@ -415,12 +415,18 @@ function _package_tree(mod::Module)
     for env in Base.load_path()
         manifest = Base.project_file_manifest_path(env)
         (manifest === nothing || !isfile(manifest)) && continue
-        deps = get(Base.TOML.parsefile(manifest), "deps", Dict{String,Any}())
+        deps = get(Base.parsed_toml(manifest), "deps", Dict{String,Any}())
         for entry in get(deps, string(nameof(mod)), [])
             get(entry, "uuid", "") == uuid || continue
             haskey(entry, "git-tree-sha1") && return entry["git-tree-sha1"]
         end
     end
-    throw(ArgumentError("cannot identify the source tree of $(mod) at $dir: it is not a git " *
-                        "checkout and no active manifest records a git-tree-sha1 for it"))
+    # A plain directory, such as a `dev`ed copy outside git: identify it by its contents.
+    crc = UInt32(0)
+    files = [joinpath(root, f) for (root, _, fs) in walkdir(joinpath(dir, "src")) for f in fs]
+    for f in sort!(push!(files, joinpath(dir, "Project.toml")))
+        crc = Base._crc32c(relpath(f, dir), crc)
+        crc = Base._crc32c(read(f), crc)
+    end
+    return "crc32c:" * string(crc; base = 16, pad = 8)
 end
