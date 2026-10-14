@@ -82,15 +82,20 @@ const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
 
 # Ceiling on the spinup, not the convergence test: bands exit on the drift criterion well inside this on
-# glacier firn, so the ceiling only binds on an outlier.
+# glacier firn, so the ceiling only binds on an outlier. A column that reaches it is kept and counted
+# (`spinup_n_unconverged`, `spinup_unconverged_area_km2`), not refused.
+#
+# Sized on the slowest tiles: on N82_W048, S78_E168, N66_W156 and N62_W142, at 0 and -3 K, every column
+# converged, the area-weighted mean within 100 years and the slowest at 285 (N82_W048, 250 m band, 0 K).
+# 500 years leaves that column room by a factor of 1.75.
 #
 # A span of simulated years rather than a cycle count, because a cycle count means a different amount of
 # spinup on a different climatology. `gemb_spinup` divides by the measured cycle length to get its own
 # ceiling: under `SPINUP_CLIMATOLOGY_METHOD = :representative` a cycle is `SPINUP_CLIMATOLOGY_N_YEARS`
-# years, so 100 years is about 34 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
-# can judge a slope, so the ceiling has to leave room for that — 34 does, 10 would not.
+# years, so 500 years is 167 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
+# can judge a slope, so the ceiling has to leave room for that.
 const SPINUP_SIMULATION_YEARS_MAXIMUM =
-    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "100"))
+    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "500"))
 # Spinup exits when the FAC trend flattens; see `SPINUP_DRIFT_FAC` in `glacier_run.jl`, including why this
 # value is too loose for an ice-sheet plateau. Stated per **year** and scaled to the cycle by
 # `_spinup_drift_tolerance`, so 1e-2 is 1 cm of firn air per year whatever the cycle length.

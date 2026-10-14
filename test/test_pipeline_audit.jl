@@ -306,3 +306,12 @@ end
                                                    validation_grid = ([-30.0], [1.0]))
 end
 
+@testset "pipeline audit: unconverged spinups are recorded" begin
+    # `TINY_RUN` spins up for one 3-year cycle, fewer than the drift window needs, so neither column
+    # can converge: both are kept, counted, and their bands' area recorded.
+    p = TINY_RUN.provenance
+    @test p["spinup_converged"] == false
+    @test p["spinup_n_unconverged"] == 2
+    @test p["spinup_unconverged_area_km2"] ≈ sum(b.area for b in TINY_RUN.bands)
+    @test all(==(0.0), TINY_RUN.run_provenance["spinup_converged"])
+end
