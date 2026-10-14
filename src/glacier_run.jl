@@ -974,7 +974,8 @@ Where a file's stored run parameters disagree with a requested run's, as
 Only keys present in both are compared: a file written by an older version of `run_parameters`
 simply carries fewer of them, and that is a reason to note the gap rather than to refuse an append.
 Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
-or `Bool`.
+or `Bool`. A one-element vector and its element compare equal, because NetCDF reads a one-element
+attribute back as a scalar — a per-band setting of a one-band tile would otherwise never match itself.
 
 This is what [`gemb_glacier_cell`](@ref) checks a restart against, exposed so a driver can make the
 same comparison up front — before paying for a forcing download — and get the same verdict.
@@ -983,10 +984,14 @@ function run_parameter_differences(saved, requested)
     differences = Dict{String,Tuple{Any,Any}}()
     for (key, value) in requested
         haskey(saved, key) || continue
-        _encode_attribute(saved[key]) == _encode_attribute(value) && continue
+        _attribute_value(saved[key]) == _attribute_value(value) && continue
         differences[key] = (saved[key], value)
     end
     return differences
+end
+
+_attribute_value(x) = let v = _encode_attribute(x)
+    v isa AbstractVector && length(v) == 1 ? only(v) : v
 end
 
 # Compare the stored run parameters against this run's, and refuse the append on a disagreement
