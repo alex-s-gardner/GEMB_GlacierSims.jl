@@ -61,7 +61,8 @@ wrap_lon(lon) = lon > 180 ? lon - 360 : lon
 
 """
     forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=$(_DEFAULT_LAPSE_RATE),
-                         precip_scaling_method=nothing, decoupling_factor=nothing)
+                         precip_scaling_method=nothing, decoupling_factor=nothing,
+                         glacier_fraction=0.0)
 
 Lapse-rate-adjust `forcing_data` by `delta_elevation` metres and convert it to a GEMB
 `ClimateForcing`, ready to hand to `initialize_profile` / `gemb`.
@@ -76,18 +77,25 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
 - `lapse_rate`: temperature lapse rate passed through to `climate_adjust_for_elevation` (K/km).
 - `precip_scaling_method`: precipitation scaling passed through to `climate_adjust_for_elevation`
   (`nothing` leaves precipitation unchanged).
-- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`, applied by
-  `climate_adjust_for_glacier` *after* the elevation adjustment — the order that function
-  requires, since `k` scales an ambient temperature already at the glacier's elevation.
-  `nothing` (the default) leaves the forcing ambient.
+- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`. The forcing is
+  first brought to the ice-free state with `k` and `glacier_fraction`, then lapsed, then decoupled
+  with `k` by `climate_adjust_for_glacier` — the order the decoupling requires, since `k` scales an
+  ambient temperature already at the glacier's elevation. `nothing` (the default) leaves the
+  forcing ambient.
+- `glacier_fraction`: the fraction `glm` of the reanalysis cell its land-surface scheme already runs
+  as ice, whose warm excess is therefore `[1 - glm·(1 - k)]·E_ambient`. Only read with a
+  `decoupling_factor`; `0` treats the forcing as ambient already.
 """
 function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
-                              precip_scaling_method=nothing, decoupling_factor=nothing)
-    adjusted = climate_adjust_for_elevation(forcing_data, delta_elevation;
-                                            lapse_rate, precip_scaling_method)
-    decoupling_factor === nothing ||
-        (adjusted = climate_adjust_for_glacier(adjusted, decoupling_factor))
-    return initialize_forcing(adjusted)
+                              precip_scaling_method=nothing, decoupling_factor=nothing,
+                              glacier_fraction=0.0)
+    decoupling_factor === nothing &&
+        return initialize_forcing(climate_adjust_for_elevation(forcing_data, delta_elevation;
+                                                               lapse_rate, precip_scaling_method))
+    k = fill(Float64(decoupling_factor), length(dims(forcing_data, Ti)))
+    ambient = _ambient_forcing(forcing_data, glacier_fraction, k)
+    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate, precip_scaling_method)
+    return initialize_forcing(climate_adjust_for_glacier(lapsed, decoupling_factor))
 end
 
 # Rewrap glm (the ERA5-Land invariant grid) to the SAME (-180, 180] convention as the Zarr grid.
@@ -116,20 +124,6 @@ function _row_glm(row)
     g = Float64(v)
     return isfinite(g) ? clamp(g, 0.0, 1.0) : 0.0
 end
-
-# The share of a published decoupling factor `k` a cell still needs, given the ERA5-Land glacier-mask
-# fraction `glm` its land-surface scheme has already accounted for:
-#
-#     k_eff = 1 - (1 - k) * (1 - glm)
-#
-# The full correction where the cell carries no glacier (`glm = 0`) and the identity where it is
-# entirely glacier (`glm = 1`). Defined once because this is the package's single convention for
-# that weighting, applied both per cell ([`cell_decoupling_factor`](@ref), one scalar `k` from the
-# published table) and per elevation interval (`derive_decoupling_factor`, a fitted `k` per
-# timestep) — and it is the same weighting `derive_lapse_rate` folds into its regression sums to
-# undo. Two independent spellings would let those paths disagree about the same cell's forcing
-# while both stayed finite and in-domain, so the drift would be invisible.
-_effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)
 
 # How far a cell that carries ice but no forcing of its own may borrow a neighbour's, by default:
 # about four to five ERA5-Land cells (the grid is 0.1°, ~11 km). Loose enough to reach the nearest

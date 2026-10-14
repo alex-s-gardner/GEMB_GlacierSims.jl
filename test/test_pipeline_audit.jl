@@ -51,3 +51,24 @@ end
         end
     end
 end
+
+@testset "pipeline audit: per-cell decoupling" begin
+    # One cell at 1000 m with glacier fraction 0.6, forced 1500 m up with k = 0.7 and Γ = 5 K/km.
+    # Its observed excess is `[1 - glm(1 - k)]·E_ambient`, so the on-glacier temperature at the bin
+    # is `T_ref + k·(E_ambient(1000) - Γ·1.5)` with `E_ambient = E_obs / (1 - glm(1 - k))`.
+    k, glm, Γ = 0.7, 0.6, 5.0
+    T_obs = [280.0, 275.0, 270.0]
+    f0 = _cp_forcing(46.0, 10.0, 1000.0, T_obs)
+    f = DimensionalData.rebuild(f0; metadata = merge(DimensionalData.metadata(f0), Dict{String,Any}(
+        "temperature_air_mean" => 275.0, "wind_speed_mean" => 3.0, "precipitation_mean" => 876.0)))
+    cf = forcing_at_elevation(f, 1500.0; lapse_rate = Γ, decoupling_factor = k,
+                              glacier_fraction = glm)
+    E_amb = @. max(T_obs - 273.15, 0) / (1 - glm * (1 - k)) + min(T_obs - 273.15, 0)
+    E_bin = E_amb .- Γ * 1.5
+    expected = @. 273.15 + ifelse(E_bin > 0, k * E_bin, E_bin)
+    @test cf.temperature_air ≈ expected atol = 1e-10
+    # No glacier in the cell: the forcing is already ambient, and only the band's k acts.
+    cf0 = forcing_at_elevation(f, 1500.0; lapse_rate = Γ, decoupling_factor = k)
+    E0 = (T_obs .- 273.15) .- Γ * 1.5
+    @test cf0.temperature_air ≈ @.(273.15 + ifelse(E0 > 0, k * E0, E0)) atol = 1e-10
+end

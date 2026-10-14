@@ -415,9 +415,9 @@ function _write_coordinates!(ds, run::GlacierCellRun, n_layer::Int)
     dk.attrib["units"] = "1"
     dk.attrib["long_name"] = "on-glacier air temperature decoupling factor"
     dk.attrib["comment"] =
-        "Effective Shaw et al. (2025) factor k applied to this cell's forcing, weighted by the " *
-        "non-glacier fraction as 1 - (1 - k)*(1 - glm) and applied after the elevation " *
-        "adjustment. Absent (fill) when no correction was applied — either it was disabled or " *
+        "Shaw et al. (2025) on-glacier factor k applied to this cell's forcing: the forcing is " *
+        "brought to the ice-free state with k and the cell's glacier-mask fraction glm, lapsed " *
+        "to each bin, then decoupled with k. Absent (fill) when no correction was applied — either it was disabled or " *
         "the cell has no published k (RGI regions 05 and 19 are not covered by the dataset). " *
         "The global attribute of the same name records the same setting as the identity 1.0 " *
         "rather than a fill, because it is compared numerically on restart and a fill would " *
