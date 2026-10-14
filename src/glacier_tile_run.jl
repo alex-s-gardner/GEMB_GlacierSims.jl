@@ -422,9 +422,25 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # in `run_provenance["spinup_converged"]`, which is where a reader finds *which* column failed. A
     # `NaN` slot is a run that produced no output rather than one that failed to settle — those are
     # counted by `n_bands_dropped` — so it does not make the tile unconverged.
+    #
+    # An unconverged spinup is kept, not refused: its column still carries a firn-air trend into the
+    # transient, so how much ice that affects is recorded — the number of columns, and the glacier
+    # area of the bands with any such column — and reported once for the tile.
     if haskey(run_provenance, "spinup_converged")
         flags = run_provenance["spinup_converged"]
         provenance["spinup_converged"] = all(f -> isnan(f) || f == 1.0, flags)
+        unsettled = flags .== 0.0
+        unsettled_bands = [any(view(unsettled, i, :, :)) for i in axes(unsettled, 1)]
+        provenance["spinup_n_unconverged"] = count(unsettled)
+        provenance["spinup_unconverged_area_km2"] = sum(band_areas[unsettled_bands]; init = 0.0)
+        any(unsettled) && @warn("Spinup did not converge for some columns of this tile; they enter " *
+                                "the transient with a residual firn-air trend",
+                                tile = tile.name, n_unconverged = count(unsettled),
+                                n_columns = count(!isnan, flags),
+                                bands = [bands[i].center for i in findall(unsettled_bands)],
+                                unconverged_area_km2 = round(provenance["spinup_unconverged_area_km2"];
+                                                             digits = 2),
+                                simulation_years_maximum)
     end
 
     return GlacierTileRun(
