@@ -284,13 +284,11 @@ function _write_tile_run_globals!(ds, run::GlacierTileRun; institution, referenc
         "the ice at the start of the run. dh is NOT a proxy for surface mass balance and can carry " *
         "the opposite sign: compaction lowers the surface while accumulation raises it."
     ds.attrib["reference_frame_comment"] =
-        "dh and the volume totals dv/dv_mass/dv_firn are cumulative from the start of the run, " *
-        "against a datum fixed in the ice at that time; no reference state has been removed, so " *
-        "adding an independently derived discharge to dv gives total volume change. The " *
-        "decomposition terms dh_mass, dh_water, dh_firn and dh_residual are instead anomalies " *
-        "referenced to the FIRST OUTPUT TIME, which is what makes their closure exact. The " *
-        "identity therefore holds on the anomaly: dh - dh[1] = dh_mass + dh_water + dh_firn + " *
-        "dh_residual. dv_mass and dv_firn inherit that frame from their series; dv does not."
+        "dh, its decomposition terms dh_mass, dh_water, dh_firn and dh_residual, and the volume " *
+        "totals dv/dv_mass/dv_firn are all cumulative from the START OF THE RUN, against a datum " *
+        "fixed in the ice at that time; no reference state has been removed, so adding an " *
+        "independently derived discharge to dv gives total volume change. The identity holds at " *
+        "every output time: dh = dh_mass + dh_water + dh_firn + dh_residual."
     ds.attrib["volume_and_mass_comment"] =
         "Volume totals are the area-weighted height change and mass totals the area-weighted " *
         "fluxes. They are not interconvertible: dh carries the firn compaction term, so " *
@@ -525,19 +523,19 @@ function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, defl
         (:dh, "surface elevation change",
          "-cumsum(ice_flux), against a datum fixed in the ice at the start of the run. This is " *
          "the quantity an altimeter measures, at the band resolution the altimetry dh is binned " *
-         "at. Element 1 already carries the first output interval, so subtract it for an anomaly " *
-         "referenced to the first output time."),
+         "at. Element 1 already carries the first output interval."),
         (:dh_mass, "surface elevation change from surface mass balance",
-         "Cumulative SMB divided by density_ice, referenced to the first output time."),
+         "Cumulative SMB divided by density_ice, from the start of the run."),
         (:dh_water, "surface elevation change from column liquid storage",
-         "Minus the change in stored water divided by density_ice. Water in a pore adds mass " *
-         "without adding thickness, so it belongs to the mass budget but not to the height."),
+         "Minus the change in stored water since the start of the run, divided by density_ice. " *
+         "Water in a pore adds mass without adding thickness, so it belongs to the mass budget " *
+         "but not to the height."),
         (:dh_firn, "surface elevation change from firn compaction",
-         "Change in firn air content, referenced to the first output time."),
+         "Change in firn air content since the start of the run."),
         (:dh_residual, "closure residual of the height change decomposition",
-         "dh - dh[1] minus the sum of the mass, water and firn terms. Should sit at the rounding " *
-         "floor; a growing residual means the column's base is no longer at ice density and the " *
-         "height series under-counts compaction."),
+         "dh minus the sum of the mass, water and firn terms. Should sit at the rounding floor; a " *
+         "growing residual means the column's base is no longer at ice density and the height " *
+         "series under-counts compaction."),
         (:firn_air_content, "firn air content", ""),
     )
         v = NCDatasets.defVar(ds, string(name), precision, dimnames;
@@ -574,7 +572,7 @@ function _write_tile_totals!(ds, run::GlacierTileRun, deflatelevel::Int)
     # `total_melt` holds the record so far. Stated on the group because getting it wrong compares a
     # record-long volume change against a single month's melt.
     ds.attrib["total_accumulation_comment"] =
-        "Every total_* variable except total_fac is CUMULATIVE from the first output time. The " *
+        "Every total_* variable except total_fac is CUMULATIVE from the start of the run. The " *
         "per-band series of the same name are per output interval, as GEMB reports them. total_fac " *
         "is the column's absolute firn air volume, a state, and is neither cumulative nor a flux."
 
