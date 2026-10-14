@@ -62,7 +62,7 @@ const BUFFER = 1
 const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 1950
 const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2027
 const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
-const SPINUP_SIMULATION_YEARS_MAXIMUM = 100.0
+const SPINUP_SIMULATION_YEARS_MAXIMUM = 500.0
 const SPINUP_DRIFT_FAC = 1e-2
 const SPINUP_CLIMATOLOGY_WINDOW = (DateTime(1950, 1, 1), DateTime(1980, 12, 31))
 const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "50.0"))
@@ -235,6 +235,7 @@ function run_native_unit(unit, mp, corrections; token, cache)
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                    convergence_drift_fac = SPINUP_DRIFT_FAC,
+                                   drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
@@ -246,6 +247,10 @@ function run_native_unit(unit, mp, corrections; token, cache)
         return [summary_row(c, tile_name, :no_reference, 0.0; correction) for c in cells]
     end
     assert_matches_reference(reference, tile.name, requested)
+    # The reference sweep's perturbation grid: a cell keeps exactly the bands a run over that grid keeps.
+    ref_status = read_glacier_tile_status(reference)
+    validation_grid = (ref_status.delta_temperatures, ref_status.precipitation_scalings)
+    prior = decoupling_factor_prior(tile.core)
 
     mkpath(tile_dir)
     rows = NamedTuple[]
@@ -253,7 +258,7 @@ function run_native_unit(unit, mp, corrections; token, cache)
         t0 = time()
         try
             push!(rows, run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
-                                 token, cache))
+                                 token, cache, fit, intervals, basis, prior, validation_grid))
         catch e
             e isa InterruptException && rethrow()
             GEMB_GlacierSims.is_caller_error(e) && rethrow()
@@ -273,9 +278,9 @@ function run_native_unit(unit, mp, corrections; token, cache)
 end
 
 # The settings this tile is about to run under, against those stored in the tile sweep the correction
-# was fitted to. `run_parameter_differences` compares the keys both sides carry, so this catches a
-# changed model parameter, spinup policy or downscaling resolution, which would apply the correction to
-# a model it was not fitted for.
+# was fitted to. `run_parameter_differences` reports a key either side lacks as well as a changed value,
+# so this catches a changed model parameter, spinup policy, downscaling resolution or package version,
+# which would apply the correction to a model it was not fitted for.
 function assert_matches_reference(reference, name, requested)
     status = read_glacier_tile_status(reference)
     differences = run_parameter_differences(status.parameters, requested)
@@ -285,7 +290,8 @@ function assert_matches_reference(reference, name, requested)
     return nothing
 end
 
-function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache)
+function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache,
+                  fit, intervals, basis, prior, validation_grid)
     t0 = time()
     path = joinpath(tile_dir, cell.name)
     row = first(eachrow(cell.core))
@@ -298,11 +304,18 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                   cell_run_disposition(status, requested, applied.time, centers, correction, mp)
     disposition === :current && return summary_row(cell, tile_name, :skipped, time() - t0; correction)
 
+    # Per-timestep fits cover the whole record and cannot be resolved onto an appended segment.
+    disposition === :extendable && basis === :fitted && (disposition = :rebuild)
     restart = disposition === :extendable ? read_glacier_tile_restart(path) : nothing
     appending = restart !== nothing && restart.time !== nothing
     fetch_range = appending ?
                   (max(first(TIME_RANGE), restart.time - RESTART_FETCH_OVERLAP), last(TIME_RANGE)) :
                   TIME_RANGE
+    # The band forcing is built on the fetched steps, so the applied parameters are resolved onto them.
+    if appending
+        applied = resolve_downscaling(fit, intervals, probe_run_time(cell, token, cache, fetch_range);
+                                      basis, decoupling_factor_prior = prior)
+    end
 
     local run
     try
@@ -313,6 +326,7 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                                spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                convergence_drift_fac = SPINUP_DRIFT_FAC,
+                               validation_grid,
                                restart = appending ? restart : nothing)
     catch err
         err isa ForcingUpToDate && return summary_row(cell, tile_name, :skipped, time() - t0; correction)
@@ -352,10 +366,10 @@ function cell_run_disposition(status, requested, run_time, centers, correction, 
     return covered ? :current : :extendable
 end
 
-function probe_run_time(tile, token, cache)
+function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     row = first(tile.core)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
-                         time_range = TIME_RANGE, token, cache_path = cache)
+                         time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
 end
 
@@ -369,7 +383,7 @@ end
 
 function summary_row(cell, tile_name, status, seconds; run = nothing, correction = nothing,
                      t_run = missing, error = "")
-    years = run === nothing ? missing : (last(run.time) - first(run.time)).value / (365.25 * 86_400_000)
+    years = run === nothing ? missing : GEMB_GlacierSims.record_years(run)
     p = run === nothing ? Dict{String,Any}() : run.provenance
     return (; tile = tile_name, cell = replace(cell.name, ".nc" => ""),
             geotile_id = geotile_id(cell.bounds),
