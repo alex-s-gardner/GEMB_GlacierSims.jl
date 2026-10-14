@@ -530,8 +530,7 @@ function summary_row(tile, name, status, seconds; run = nothing,
                      t_forcing = missing, t_gemb = missing, basis = missing, error = "")
     i_dt = findfirst(==(0.0), DELTA_TEMPERATURES)
     i_ps = findfirst(==(1.0), PRECIPITATION_SCALINGS)
-    years = run === nothing ? missing :
-            (last(run.time) - first(run.time)).value / (365.25 * 86_400_000)
+    years = run === nothing ? missing : GEMB_GlacierSims.record_years(run)
     return (; name,
             geotile_id = geotile_id(tile.bounds),
             index_lon = tile.index[1], index_lat = tile.index[2],

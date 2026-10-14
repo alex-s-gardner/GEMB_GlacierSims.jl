@@ -85,3 +85,78 @@ end
     @test_throws "above the per-cell cap" GEMB_GlacierSims._band_layer(
         :cloud_optical_thickness, Dict(:cloud_optical_thickness => [1.01 * cap]), 1.0)
 end
+
+# Band forcing for a short GEMB run: `years` of 3-hourly steps from 2000, every layer constant.
+# Shortwave dominates the surface energy budget of a melting surface: the air is at the melting point
+# and saturated, so the turbulent fluxes vanish over a surface at 0 °C, and the downward longwave
+# equals what such a surface emits.
+function _tiny_band_forcing(; years = 3, shortwave = 300.0, temperature = 273.15, precipitation = 0.0,
+                            longwave = 0.97 * 5.670374419e-8 * 273.15^4, elevation = 1050.0)
+    time = collect(DateTime(2000, 1, 1):Hour(3):(DateTime(2000 + years, 1, 1) - Hour(3)))
+    n = length(time)
+    ti = Ti(time)
+    e_sat = 611.2                                # Pa, saturation vapor pressure at 0 °C
+    layers = (temperature_air = fill(temperature, n), pressure_air = fill(9e4, n),
+              vapor_pressure = fill(e_sat, n), wind_speed = fill(2.0, n),
+              precipitation = fill(precipitation, n), shortwave_downward = fill(shortwave, n),
+              longwave_downward = fill(longwave, n), solar_zenith_angle = fill(45.0, n),
+              shortwave_downward_diffuse = fill(0.3 * shortwave, n),
+              cloud_optical_thickness = fill(1.0, n))
+    return DimStack(NamedTuple(k => DimArray(v, (ti,)) for (k, v) in pairs(layers));
+                    metadata = Dict{String,Any}(
+                        "elevation" => elevation, "dataset" => "synthetic",
+                        "temperature_observation_height" => 2.0, "wind_observation_height" => 10.0,
+                        "temperature_air_mean" => temperature, "wind_speed_mean" => 2.0,
+                        "precipitation_mean" => precipitation * 8 * 365))
+end
+
+# A tile run of one band per entry of `albedos`, all on the same forcing.
+function _tiny_tile_run(albedos; forcing = _tiny_band_forcing(), mp = initialize_parameters(
+                            output_frequency = :monthly), kwargs...)
+    n = length(dims(forcing, Ti))
+    bands = [(; lo = 1000 + 100 * (i - 1), hi = 1100 + 100 * (i - 1), center = 1050.0 + 100 * (i - 1),
+              area = 10.0 * i, n_cells = 1, n_cells_substituted = 0, area_substituted = 0.0,
+              area_unrecovered = 0.0, max_donor_distance_km = 0.0,
+              albedo_ice = a, albedo_ice_source = :observed, forcing)
+             for (i, a) in enumerate(albedos)]
+    applied = _flat_applied(collect(dims(forcing, Ti)), [(b.lo, b.hi) for b in bands])
+    tile = (; index = (10, 46), name = "N46_E010.nc",
+            bounds = (lon_min = 10.0, lon_max = 12.0, lat_min = 46.0, lat_max = 48.0),
+            core = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0)])]))
+    window = (first(lookup(forcing, Ti)), last(lookup(forcing, Ti)))
+    return gemb_glacier_tile(tile, applied, bands, mp; spinup_window = window,
+                             simulation_years_maximum = 3, threaded = false, kwargs...)
+end
+
+# Two bands on one shortwave-dominated melting forcing, at bare-ice albedos 0.3 and 0.5. Shared by
+# the height-closure and bare-ice albedo testsets, since a GEMB run is the expensive part of both.
+const TINY_RUN = _tiny_tile_run([0.3, 0.5])
+
+@testset "pipeline audit: height components close" begin
+    # Spec 64: `dh` and its decomposition share the run-start epoch, so the stored series satisfy
+    # dh = dh_mass + dh_water + dh_firn + dh_residual at every output time, and the residual — what
+    # GEMB's own mass budget leaves — sits at the rounding floor.
+    s = TINY_RUN.bands_series
+    @test s[:dh] ≈ s[:dh_mass] .+ s[:dh_water] .+ s[:dh_firn] .+ s[:dh_residual] atol = 1e-12
+    @test maximum(abs, s[:dh_residual]) < 1e-9
+    # The first output interval is in every term, not only in `dh`.
+    @test all(!iszero, s[:dh_mass][1, :, 1, 1])
+    # dv carries the same epoch as the per-band dh it is weighted from.
+    areas = [b.area for b in TINY_RUN.bands]
+    @test TINY_RUN.totals[:dv][:, 1, 1] ≈ tile_volume_change(s[:dh][:, :, 1, 1], areas)
+    @test TINY_RUN.totals[:dv_mass][:, 1, 1] ≈ tile_volume_change(s[:dh_mass][:, :, 1, 1], areas)
+end
+
+@testset "pipeline audit: record-mean rate" begin
+    # Spec 68: hourly forcing from 2000-01-01, weekly output stamped at the last hour of each week,
+    # and dv rising by r every week. The record covers N whole weeks, so the rate is r·365.25/7 per
+    # year, not r·N/(N-1)·365.25/7.
+    r, N = 0.25, 6
+    time = [DateTime(2000, 1, 1) + Day(7i) - Hour(1) for i in 1:N]
+    run = _fake_tile_run(; time)
+    run.totals[:dv] .= reshape([r * i for i in 1:N], N, 1, 1)
+    run.provenance["time_coverage_start"] = DateTime(2000, 1, 1)
+    run.provenance["forcing_time_step_seconds"] = 3600.0
+    @test GEMB_GlacierSims.record_years(run) ≈ 7N / 365.25
+    @test run.totals[:dv][end, 1, 1] / GEMB_GlacierSims.record_years(run) ≈ r * 365.25 / 7
+end

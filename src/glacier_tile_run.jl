@@ -241,6 +241,12 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         @info "Resuming tile from saved profiles" restart_time=restart.time new_steps=n_new bands=n_band
     end
 
+    # The span of forcing this run integrates: from its first step to one step past its last, which is
+    # what every cumulative series in the output accumulates over (see `record_years`).
+    run_time = lookup(first(bands).forcing, Ti)
+    forcing_start = first(run_time)
+    forcing_step = Dates.value(Millisecond(run_time[2] - run_time[1])) / 1000
+
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
     # One flat task list rather than nested threaded loops: bands per tile range from a handful to
@@ -300,13 +306,15 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # Extracted here so `output` goes out of scope with the task. Held for every task at once it
         # would be n_band*n_dt*n_ps profile stacks of (Z x Ti), which for a 60-band tile over decades
         # is far more than the machine has.
-        components = height_change_components(output)
+        # Referenced to the column this run started from, so `dh` and its terms share one epoch and
+        # `dh == dh_mass + dh_water + dh_firn + dh_residual` at every output time.
+        components = height_change_components(output; initial_profile = profile)
         series = Dict{Symbol,Vector{Float64}}()
         for v in TILE_MASS_VARIABLES
             series[v] = haskey(output, v) ? Vector{Float64}(output[v]) :
                         zeros(Float64, length(dims(output, Ti)))
         end
-        series[:dh] = surface_height_change(output)
+        series[:dh] = components.total
         series[:dh_mass] = components.mass
         series[:dh_water] = components.water
         series[:dh_firn] = components.firn
@@ -380,6 +388,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # match. Merged here and not into `parameters` for exactly that reason.
     merge!(provenance, applied.provenance)
     provenance["n_bands"] = n_band
+    provenance["time_coverage_start"] = forcing_start
+    provenance["forcing_time_step_seconds"] = forcing_step
     provenance["glacier_area_km2"] = sum(band_areas)
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
     provenance["max_dh_residual"] = maximum(abs, bands_series[:dh_residual])
@@ -413,6 +423,20 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         delta_temperatures, precipitation_scalings, out_time,
         bands_series, totals, profiles, band_provenance, run_provenance, parameters, provenance,
     )
+end
+
+"""
+    record_years(run::GlacierTileRun) -> Float64
+
+The span, in years of 365.25 days, that the cumulative series of `run` accumulate over: from the
+first forcing step to the end of the last one, `last(run.time) + step - time_coverage_start`. Each
+output time stamps the last forcing step of its interval, so this covers every interval including the
+first. A record-mean rate is `run.totals[name][end, i_dt, i_ps] / record_years(run)`.
+"""
+function record_years(run::GlacierTileRun)
+    start = run.provenance["time_coverage_start"]
+    step = Millisecond(round(Int, 1000 * run.provenance["forcing_time_step_seconds"]))
+    return _decimal_years(last(run.time) + step - start)
 end
 
 # Sort one run's `spinup_*`/`climatology_*` provenance into the per-run arrays and the tile-level
