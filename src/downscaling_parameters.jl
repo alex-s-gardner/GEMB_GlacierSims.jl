@@ -871,16 +871,12 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
         w = areas[i]
         sw = adjusted[:shortwave_downward]
         for v in _FORCING_VARIABLES
-            s = sums[i][v]
-            a = adjusted[v]
+            # `adjusted[v]` is looked up by a runtime name, so its type is not known here; the
+            # record-length loops run behind a function barrier, where it is.
             if v === :solar_zenith_angle
-                for t in eachindex(s, a, sw)
-                    s[t] += w * sw[t] * cosd(a[t])
-                end
+                _add_weighted_cosd!(sums[i][v], w, sw, adjusted[v])
             else
-                for t in eachindex(s, a)
-                    s[t] += w * a[t]
-                end
+                _add_weighted!(sums[i][v], w, adjusted[v])
             end
         end
         weights[i] += w
@@ -895,6 +891,22 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
         end
     end
     return nothing
+end
+
+# `s .+= w .* a`, and `s .+= w .* sw .* cosd.(θ)`, written as loops so the accumulation order is the
+# same as a scalar sum's.
+function _add_weighted!(s, w, a)
+    for t in eachindex(s, a)
+        s[t] += w * a[t]
+    end
+    return s
+end
+
+function _add_weighted_cosd!(s, w, sw, θ)
+    for t in eachindex(s, sw, θ)
+        s[t] += w * sw[t] * cosd(θ[t])
+    end
+    return s
 end
 
 """
