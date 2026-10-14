@@ -337,7 +337,7 @@ function _write_tile_run_parameters!(ds, run::GlacierTileRun)
 end
 
 function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
-    t = NCDatasets.defVar(ds, "time", Float64, ("time",))
+    t = NCDatasets.defVar(ds, "time", Float64, ("time",); chunksizes = _time_chunks(length(run.time)))
     _set_attributes!(t, cf_time_attributes())
     t.attrib["units"] = NC_TIME_UNITS
     t.attrib["calendar"] = NC_CALENDAR
@@ -505,13 +505,24 @@ function _run_provenance_units(key::AbstractString)
     return "1"
 end
 
+# Chunk shape for a variable on the unlimited `time` axis: `TIME_CHUNK` steps by the whole of every
+# other axis. Left to the library, an unlimited axis is chunked one element at a time, and the per-chunk
+# index then outweighs the data many times over — a three-band cell file reaches 8 MB for 0.6 MB of
+# series. A chunk of a few hundred steps keeps an append writing whole chunks and a read of one band's
+# record touching a handful of them.
+const TIME_CHUNK = 512
+_time_chunks(n_time::Int, rest::Int...) = (clamp(n_time, 1, TIME_CHUNK), rest...)
+
 function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, deflatelevel::Int)
     dimnames = ("time", "band", "delta_temperature", "precipitation_scaling")
     deflate = deflatelevel > 0 ? deflatelevel : nothing
+    chunks = _time_chunks(length(run.time), length(run.bands), length(run.delta_temperatures),
+                          length(run.precipitation_scalings))
 
     for name in TILE_MASS_VARIABLES
         v = NCDatasets.defVar(ds, string(name), precision, dimnames;
-                              deflatelevel = deflate, fillvalue = precision(NC_FILL))
+                              deflatelevel = deflate, fillvalue = precision(NC_FILL),
+                              chunksizes = chunks)
         _set_attributes!(v, cf_attributes(name))
         v.attrib["comment"] = get(cf_attributes(name), "comment", "") *
             (haskey(cf_attributes(name), "comment") ? " " : "") *
@@ -541,7 +552,8 @@ function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, defl
         (:firn_air_content, "firn air content", ""),
     )
         v = NCDatasets.defVar(ds, string(name), precision, dimnames;
-                              deflatelevel = deflate, fillvalue = precision(NC_FILL))
+                              deflatelevel = deflate, fillvalue = precision(NC_FILL),
+                              chunksizes = chunks)
         v.attrib["units"] = "m"
         v.attrib["long_name"] = long_name
         isempty(comment) || (v.attrib["comment"] = comment)
@@ -554,12 +566,14 @@ end
 function _write_tile_totals!(ds, run::GlacierTileRun, deflatelevel::Int)
     dimnames = ("time", "delta_temperature", "precipitation_scaling")
     deflate = deflatelevel > 0 ? deflatelevel : nothing
+    chunks = _time_chunks(length(run.time), length(run.delta_temperatures),
+                          length(run.precipitation_scalings))
 
     # Float64 whatever `precision` says: these are what a regional total is summed from, and a tile
     # sum is the point at which a truncation stops being local.
     for name in sort!(collect(keys(run.totals)))
         v = NCDatasets.defVar(ds, _tile_total_variable(name), Float64, dimnames;
-                              deflatelevel = deflate, fillvalue = NC_FILL)
+                              deflatelevel = deflate, fillvalue = NC_FILL, chunksizes = chunks)
         v.attrib["units"] = get(TILE_TOTAL_UNITS, name, "1")
         v.attrib["long_name"] = _tile_total_long_name(name)
         # `fac` is the column's absolute firn air volume — a state. Everything else here accumulates
