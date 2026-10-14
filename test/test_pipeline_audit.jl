@@ -214,3 +214,35 @@ end
     other = merge(stored, Dict{String,Any}("software_gemb_tree" => "0"^40))
     @test haskey(run_parameter_differences(stored, other), "software_gemb_tree")
 end
+
+@testset "pipeline audit: threaded unreachable flags" begin
+    # Spec 69: one cell holding ice in 64 bands that all fail the forcing validator (a 200 K/km lapse
+    # rate is outside the range `climate_adjust_for_elevation` accepts). The flags are set from
+    # `Threads.@threads`, and every one must survive on every repetition: each band is reported as
+    # unreachable, none as merely empty.
+    n = 3
+    bins = [(1050 + 100i, 1.0) for i in 0:63]
+    table = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins)])
+    applied = _flat_applied(_CP_TIME[1:n], [(c - 50, c + 50) for (c, _) in bins]; lapse_rate = 200.0)
+    loader = (m, lat, lon; kw...) -> _cp_forcing(lat, lon, 1000.0, fill(270.0, n))
+    unreachable_counts = map(1:100) do _
+        logs, _ = Test.collect_test_logs() do
+            collect(elevation_interval_forcing(table, applied; climate_model = :synthetic,
+                                               time_range = (_CP_TIME[1], _CP_TIME[n]),
+                                               forcing_loader = loader))
+        end
+        hit = filter(l -> occursin("no donor cell could be adjusted", l.message), logs)
+        isempty(hit) ? 0 : only(hit).kwargs[:n_dropped]
+    end
+    @test all(==(64), unreachable_counts)
+end
+
+@testset "pipeline audit: a failed forcing load propagates" begin
+    cells = [(lon = 10.0 + 0.1i, lat = 46.0, z = 1000.0 + 500i, glm = 0.2i, bins = [(1050 + 500i, 1.0)])
+             for i in 0:3]
+    inner = _cp_loader(cells, c -> fill(280.0 - 5 * c.z / 1000, length(_CP_TIME)))
+    flaky = (m, lat, lon; kw...) -> lon == 10.1 ? error("CDS request timed out") : inner(m, lat, lon; kw...)
+    @test_throws "CDS request timed out" derive_downscaling_parameters(
+        :synthetic, (_CP_TIME[1], _CP_TIME[end]), _cp_table(cells); token = nothing,
+        cache_path = nothing, min_cells = 2, forcing_loader = flaky)
+end

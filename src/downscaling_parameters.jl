@@ -252,7 +252,8 @@ measurements behind this.
 
 Grid cells whose forcing is unavailable are skipped, not fatal: ERA5-Land is land-only, so a
 coastal or island cell can land on water and come back all-`NaN` ([`forcing_is_complete`](@ref)).
-This mirrors how a sweep treats [`ForcingUnavailable`](@ref).
+This mirrors how a sweep treats [`ForcingUnavailable`](@ref). A loader that *throws* — a network or
+cache failure — is not a property of the cell, and the exception propagates.
 """
 function derive_downscaling_parameters(climate_model::Symbol, time_range, glacier_elevation_classes,
                                    roi_polygon;
@@ -411,20 +412,10 @@ function _accumulate_cross_cell(selected, load)
     S = nothing
 
     for (i, row) in enumerate(eachrow(selected))
-        fd = try
-            load(row)
-        catch e
-            e isa InterruptException && rethrow()
-            # A broken *caller* is not a bad cell. A typo, a stale session, or a loader whose
-            # signature has moved fails identically for every cell of every region, and skipping it
-            # per cell turns that into "no cell had usable forcing" — which a sweep then records as
-            # an unrunnable region, i.e. reports a code bug as a property of the data. Let those
-            # through so the real error is what surfaces; the network and data failures this skip
-            # exists for (a CDS timeout, a cell over water) are none of these types.
-            is_caller_error(e) && rethrow()
-            @warn "Forcing load failed for grid cell; skipping" cell=i exception=e
-            continue
-        end
+        # A load that throws is not skipped: a CDS timeout or a broken cache would otherwise drop the
+        # cell from the fits and the band areas without being counted anywhere. A cell over water
+        # loads successfully as all-`NaN`, and that is what `forcing_is_complete` screens out.
+        fd = load(row)
         forcing_is_complete(fd) || continue
 
         meta = DimensionalData.metadata(fd)
@@ -628,14 +619,7 @@ function _nearest_usable_donor(ivf::_ElevationIntervalForcing, row)
         key in ivf.donor_unusable && continue
         fd = get(ivf.donor_forcing, key, nothing)
         if fd === nothing
-            fd = try
-                ivf.load(donor)
-            catch e
-                e isa InterruptException && rethrow()
-                is_caller_error(e) && rethrow()
-                push!(ivf.donor_unusable, key)
-                continue
-            end
+            fd = ivf.load(donor)
             if !forcing_is_complete(fd)
                 push!(ivf.donor_unusable, key)
                 continue
@@ -696,7 +680,9 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
     # longwave there falls below the 50 W/m² floor. That is the validator working, so the interval is
     # refused rather than fudged; refusing the whole interval rather than the failing cell's share keeps
     # the average from silently re-weighting onto whichever donors happened to be close enough.
-    unreachable = falses(length(intervals))
+    # `Vector{Bool}`, not a `BitVector`: threads set flags of neighbouring intervals concurrently, and
+    # a `BitVector` packs 64 of them into one word, so concurrent writes would lose flags.
+    unreachable = fill(false, length(intervals))
     reasons = Vector{String}(undef, length(intervals))
     template = nothing
     # Highest reanalysis surface contributing to each interval. Per interval, not per batch, so the
@@ -714,16 +700,8 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
         areas = _interval_areas(row, intervals)
         all(iszero, areas) && continue
 
-        fd = try
-            ivf.load(row)
-        catch e
-            e isa InterruptException && rethrow()
-            # Same reasoning as in `_accumulate_cross_cell`: a broken caller is not a bad cell, and
-            # swallowing it here would silently drop that cell's ice out of the interval weights.
-            is_caller_error(e) && rethrow()
-            @warn "Forcing load failed during elevation interval aggregation; skipping cell" exception=e
-            continue
-        end
+        # A load that throws propagates, for the reason given in `_accumulate_cross_cell`.
+        fd = ivf.load(row)
 
         # How much of this cell the reanalysis already runs as ice, which sets how far its forcing is
         # from the ice-free state the lapse starts from.
@@ -751,6 +729,11 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
             substituting = true
         end
 
+        lookup(fd, Ti) == ivf.time || throw(DimensionMismatch(
+            "forcing for the cell at ($(row.latitude), $(row.longitude)) covers " *
+            "$(first(lookup(fd, Ti))) .. $(last(lookup(fd, Ti))) ($(length(lookup(fd, Ti))) steps), but " *
+            "the applied downscaling is resolved on $(first(ivf.time)) .. $(last(ivf.time)) " *
+            "($(length(ivf.time)) steps); resolve it on the forcing's time axis"))
         missing_layers = [v for v in _FORCING_VARIABLES if !haskey(fd, v)]
         isempty(missing_layers) || throw(ArgumentError(
             "forcing for the cell at ($(row.latitude), $(row.longitude)) lacks the layer(s) " *
