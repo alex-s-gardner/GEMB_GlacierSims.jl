@@ -112,7 +112,9 @@ rather than a different experiment spliced onto an old record, so they are what
 [`gemb_glacier_cell`](@ref) checks a restart against. Every `ModelParameters` field is included,
 prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gemb` computes from
 the forcing and overwrites whatever it is handed, so they say nothing about how a run was
-configured and would compare unequal for reasons the caller never chose.
+configured and would compare unequal for reasons the caller never chose. The package versions
+and source trees ([`software_provenance`](@ref)) are included too, so a run under different code is
+a different experiment.
 
 Deliberately *excluded* is everything that is not a setting: the output time axis, `history`, the
 `institution`/`references` labels, and the `spinup_*`/`climatology_*` provenance — which describes
@@ -137,6 +139,7 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
         params["model_" * string(field)] = getproperty(mp, field)
     end
     bare_ice_albedo === nothing || _record_bare_ice_albedo!(params, bare_ice_albedo)
+    merge!(params, software_provenance())
     return params
 end
 
@@ -967,8 +970,9 @@ Where a file's stored run parameters disagree with a requested run's, as
 `parameters` field of [`read_glacier_cell_restart`](@ref)) returned; `requested` is a
 [`run_parameters`](@ref) dict.
 
-Only keys present in both are compared: a file written by an older version of `run_parameters`
-simply carries fewer of them, and that is a reason to note the gap rather than to refuse an append.
+A key present on one side only is a difference too, reported with `nothing` for the side that lacks
+it: a setting one run recorded and the other did not — a package version, a newly recorded model
+parameter — cannot be shown to agree, so the two are not known to be the same experiment.
 Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
 or `Bool`.
 
@@ -981,6 +985,12 @@ function run_parameter_differences(saved, requested)
         haskey(saved, key) || continue
         _encode_attribute(saved[key]) == _encode_attribute(value) && continue
         differences[key] = (saved[key], value)
+    end
+    for key in keys(requested)
+        haskey(saved, key) || (differences[key] = (nothing, requested[key]))
+    end
+    for key in keys(saved)
+        haskey(requested, key) || (differences[key] = (saved[key], nothing))
     end
     return differences
 end
@@ -996,11 +1006,6 @@ function _validate_restart_parameters(restart, parameters; force_restart::Bool, 
     end
 
     differences = run_parameter_differences(saved, parameters)
-
-    missing_keys = setdiff(keys(parameters), keys(saved))
-    isempty(missing_keys) ||
-        @warn "The existing $what file does not store every run parameter; these could not be verified" unverified=sort!(collect(missing_keys))
-
     isempty(differences) && return nothing
 
     if force_restart

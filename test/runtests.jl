@@ -478,7 +478,10 @@ end
         for field in GEMB.DERIVED_PARAMETERS
             @test !haskey(p, "model_" * string(field))
         end
-        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3
+        # The three cell settings, the model fields, and a version and tree per package.
+        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3 + 6
+        @test p["software_gemb_version"] == string(pkgversion(GEMB))
+        @test haskey(p, "software_gemb_glaciersims_tree")
 
         # A monthly cycle is stored as the 12-element vector, not flattened to a scalar or a
         # string: NetCDF holds a numeric attribute vector natively, so the restart check compares
@@ -531,9 +534,14 @@ end
                              "model_densification_method" => :Arthern,
                              "model_shortwave_subsurface_absorption" => false)))
 
-        # Only keys present in both are compared: a file written by an older `run_parameters`
-        # carries fewer of them, which is a gap rather than a disagreement.
-        @test isempty(run_parameter_differences(saved, Dict{String,Any}("brand_new_key" => 1.0)))
+        # A key on one side only is a difference, with `nothing` for the side that lacks it: a run
+        # that records a setting the other did not cannot be shown to be the same experiment.
+        one_sided = run_parameter_differences(saved, merge(
+            Dict{String,Any}("brand_new_key" => 1.0, "model_albedo_ice" => 0.48,
+                             "model_densification_method" => :Arthern)))
+        @test one_sided["brand_new_key"] == (nothing, 1.0)
+        @test one_sided["model_shortwave_subsurface_absorption"] == ("false", nothing)
+        @test length(one_sided) == 2
 
         d = run_parameter_differences(saved, Dict{String,Any}("model_albedo_ice" => 0.40,
                                                              "model_densification_method" => :Ligtenberg))
@@ -626,11 +634,13 @@ end
         restart = read_glacier_cell_restart(path)
         @test restart.parameters["model_albedo_ice"] == 0.48
 
-        # An identical parameter set validates silently. Keys the file does not carry are
-        # reported as unverified, not as a mismatch, so the full set can be passed as-is.
-        matching = run_parameters(initialize_parameters(); coverage = 0.95, lapse_rate = 6.5)
+        # An identical parameter set validates silently. One carrying keys the file does not is a
+        # different experiment as far as the file can show, so it is refused.
         @test GEMB_GlacierSims._validate_restart_parameters(
-            restart, matching; force_restart = false) === nothing
+            restart, restart.parameters; force_restart = false) === nothing
+        matching = run_parameters(initialize_parameters(); coverage = 0.95, lapse_rate = 6.5)
+        @test_throws RestartParameterMismatch GEMB_GlacierSims._validate_restart_parameters(
+            restart, matching; force_restart = false)
 
         # A changed parameter is refused, and the exception names the offender and both values.
         changed = Dict{String,Any}("model_albedo_ice" => 0.40)
