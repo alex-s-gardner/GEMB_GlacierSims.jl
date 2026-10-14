@@ -3271,7 +3271,7 @@ end
             applied0.time, applied0.lapse_rate, applied0.lapse_rate_source,
             [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
              for b in applied0.bands],
-            applied0.basis, applied0.settings)
+            applied0.basis, applied0.settings, applied0.provenance, applied0.decoupling_at)
         tile = only(downscaling_tiles(table; tile_size = 2, buffer = 1))
 
         @testset "native_cells splits a tile into one-cell tiles" begin
