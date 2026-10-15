@@ -87,9 +87,11 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
   `decoupling_factor`; `0` treats the forcing as ambient already.
 
 With one scalar `k` and no regional fit, the ambient excess is read off that mixing model directly,
-`E_ambient = E_obs / (1 - glm·(1 - k))`: the glacier term handed to `_ambient_forcing` is
-`(k - 1)·E_ambient`. The division multiplies the observed excess by at most `1/k` (at `glm = 1`), so
-it is bounded for any `k` in `(0, 1]` the caller supplies.
+`E_ambient = E_obs / (1 - glm·(1 - k))` (`_ambient_forcing`, with `k` at every timestep). The
+division multiplies the observed excess by at most `1/k` (at `glm = 1`), so a cell with
+`glacier_fraction > 0` needs `k` inside `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, the range that bounds
+that factor, and a smaller `k` throws. With `glacier_fraction = 0` there is nothing to undo, and
+any `k` in `(0, 1]` is accepted.
 """
 function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
                               precip_scaling_method=nothing, decoupling_factor=nothing,
@@ -102,10 +104,8 @@ function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT
     _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] || throw(ArgumentError(
         "decoupling_factor must be in (0, 1] (got $(decoupling_factor))"))
     0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
-    damping = glm * (1 - k)
-    glacier_offset = [(k - 1) * max(T - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0) / (1 - damping)
-                      for T in forcing_data[:temperature_air]]
-    ambient = _ambient_forcing(forcing_data, glm, glacier_offset)
+    ambient = glm == 0 ? forcing_data :
+              _ambient_forcing(forcing_data, glm, fill(k, length(forcing_data[:temperature_air])))
     lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate, precip_scaling_method)
     return initialize_forcing(climate_adjust_for_glacier(lapsed, decoupling_factor))
 end

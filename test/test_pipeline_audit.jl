@@ -12,7 +12,7 @@ function _flat_applied(time, edges; k = 1.0, lapse_rate = 6.5)
     return GEMB_GlacierSims.AppliedDownscaling(collect(time), fill(Float64(lapse_rate), n),
                                                fill(Int8(1), n), bands, :fitted,
                                                Dict{String,Any}(), Dict{String,Any}(),
-                                               z -> zeros(n))
+                                               z -> ones(n))
 end
 
 @testset "pipeline audit: analytical" begin
@@ -80,42 +80,55 @@ end
 @testset "pipeline audit: a donor where k(z) is near zero" begin
     # One fully glaciated cell (glm = 1) at 1800 m holding 5 km² of ice in the 1000-1100 m band, and
     # a fit, per timestep, with ambient excess α + βz of 8 K at the reference 1000 m and 4 K at
-    # 1800 m, and glacier term γ + δz of -4 K at 1000 m (k = 0.5) and -4·(1 - 1e-7) K at 1800 m
-    # (k = 1e-7). The cell observes 2 K above melting where the fit predicts 4e-7 K, a +2 K
-    # residual. Its ambient excess is the fit's 4 K plus that residual,
-    # 2 + 4·(1 - 1e-7) K; lapsed 750 m down at 6.5 K/km and decoupled with the band's
-    # k(1050) = 1 + g(1050)/E(1050), the band temperature follows in closed form. Inverting the
-    # observed excess with k at the donor instead multiplies it by 1e7, which no validator accepts,
-    # and the band is dropped.
+    # 1800 m, and glacier term γ + δz of -4 K at 1000 m (k = 0.5) and (k_d - 1)·4 K at 1800 m, so
+    # k(1800) = k_d. The cell observes 2 K above melting. Its ambient excess is 2/k_d (glm = 1);
+    # lapsed 750 m down at 6.5 K/km and decoupled with the band's k(1050) = 1 + g(1050)/E(1050), the
+    # band temperature follows in closed form.
     n = length(_CP_TIME)
     ti = Ti(_CP_TIME)
     col(v) = DimArray(fill(Float64(v), n), ti)
     z̄, z_d, z_b = 1000.0, 1800.0, 1050.0
     β = (4.0 - 8.0) / (z_d - z̄)
     α = 8.0 - β * z̄
-    g_ref, g_d = -4.0, (1e-7 - 1) * 4.0
-    δ = (g_d - g_ref) / (z_d - z̄)
-    γ = g_ref - δ * z̄
-    fit = (; time = _CP_TIME,
-           decoupling = DimStack((decoupling_factor = col(0.5), coef_alpha = col(α),
-                                  coef_beta = col(β), coef_gamma = col(γ), coef_delta = col(δ))),
-           lapse_rate = DimStack((lapse_rate = col(6.5), n_cells = DimArray(fill(10, n), ti),
-                                  elevation_spread = col(500.0))))
-    intervals = [(; lo = 1000, hi = 1100, center = z_b)]
-    applied = resolve_downscaling(fit, intervals, _CP_TIME; basis = :fitted)
-    cells = [(lon = 10.0, lat = 46.0, z = z_d, glm = 1.0, bins = [(1050, 5.0)])]
-    T_obs = 273.15 + 2.0
-    bands = collect(elevation_interval_forcing(
-        _cp_table(cells), applied; climate_model = :synthetic,
-        time_range = (_CP_TIME[1], _CP_TIME[end]),
-        forcing_loader = _cp_loader(cells, c -> fill(T_obs, n))))
-    @test length(bands) == 1
-    band = only(bands)
+    function band_for(k_d)
+        g_ref, g_d = -4.0, (k_d - 1) * 4.0
+        δ = (g_d - g_ref) / (z_d - z̄)
+        γ = g_ref - δ * z̄
+        fit = (; time = _CP_TIME,
+               decoupling = DimStack((decoupling_factor = col(0.5), coef_alpha = col(α),
+                                      coef_beta = col(β), coef_gamma = col(γ),
+                                      coef_delta = col(δ))),
+               lapse_rate = DimStack((lapse_rate = col(6.5), n_cells = DimArray(fill(10, n), ti),
+                                      elevation_spread = col(500.0))))
+        intervals = [(; lo = 1000, hi = 1100, center = z_b)]
+        applied = resolve_downscaling(fit, intervals, _CP_TIME; basis = :fitted)
+        cells = [(lon = 10.0, lat = 46.0, z = z_d, glm = 1.0, bins = [(1050, 5.0)])]
+        bands = collect(elevation_interval_forcing(
+            _cp_table(cells), applied; climate_model = :synthetic,
+            time_range = (_CP_TIME[1], _CP_TIME[end]),
+            forcing_loader = _cp_loader(cells, c -> fill(273.15 + 2.0, n))))
+        k_band = 1 + (γ + δ * z_b) / (α + β * z_b)
+        return (; applied, bands, k_band)
+    end
+    lapse_down = 6.5 * (z_d - z_b) / 1000
+
+    # k(z_d) = 1e-7: dividing by it would multiply the 2 K by 1e7. It lies below the donor limit,
+    # so no timestep accepts it, there is no climatology either, and the donor is left as observed
+    # (k = 1, the identity).
+    near_zero = band_for(1e-7)
+    @test near_zero.applied.donor_decoupling_factor_at(z_d) == ones(n)
+    band = only(near_zero.bands)
     @test band.area ≈ 5.0
-    E_ambient = 2.0 + 4.0 * (1 - 1e-7)
-    E_band = E_ambient + 6.5 * (z_d - z_b) / 1000
-    k_band = 1 + (γ + δ * z_b) / (α + β * z_b)
-    @test all(t -> isapprox(t, 273.15 + k_band * E_band; atol = 1e-6),
+    @test all(t -> isapprox(t, 273.15 + near_zero.k_band * (2.0 + lapse_down); atol = 1e-9),
+              band.forcing.temperature_air)
+
+    # k(z_d) at the donor limit itself is accepted, and the conversion is the largest it can be:
+    # 2/0.25 = 8 K, finite and bounded by the observed excess over the limit.
+    k_min = GEMB_GlacierSims._DONOR_DECOUPLING_FACTOR_LIMITS[1]
+    at_limit = band_for(k_min)
+    @test all(k -> isapprox(k, k_min; atol = 1e-12), at_limit.applied.donor_decoupling_factor_at(z_d))
+    band = only(at_limit.bands)
+    @test all(t -> isapprox(t, 273.15 + at_limit.k_band * (2.0 / k_min + lapse_down); atol = 1e-9),
               band.forcing.temperature_air)
 end
 
@@ -185,6 +198,102 @@ end
     @test_throws "band cloud transmissivity" GEMB_GlacierSims._band_cloud_optical_thickness(
         [1.0], [1.1], [0.0], [1.0])
     @test GEMB_GlacierSims._band_cloud_optical_thickness([1.0], [1.0 + 1e-13], [0.0], [1.0]) == [0.0]
+end
+
+# Forcing for a cell on an arbitrary time axis, shaped like `climate_forcing` output.
+function _audit_forcing(times, lat, lon, elevation, temperature)
+    ti = Ti(times)
+    n = length(times)
+    layer(v) = DimArray(fill(Float64(v), n), (ti,))
+    return DimStack((temperature_air = DimArray(collect(Float64, temperature), (ti,)),
+                     pressure_air = layer(8e4), vapor_pressure = layer(300.0),
+                     wind_speed = layer(3.0), precipitation = layer(0.1),
+                     shortwave_downward = layer(100.0), longwave_downward = layer(250.0),
+                     solar_zenith_angle = layer(60.0), shortwave_downward_diffuse = layer(30.0),
+                     cloud_optical_thickness = layer(2.0));
+                    metadata = Dict{String,Any}(
+                        "latitude" => Float64(lat), "longitude" => Float64(lon),
+                        "elevation" => Float64(elevation), "dataset" => "synthetic",
+                        "temperature_observation_height" => 2.0, "wind_observation_height" => 10.0))
+end
+
+@testset "pipeline audit: donor conversion under the climatology basis" begin
+    # A region that follows the fit's model exactly, resolved as production resolves it: the fits
+    # come from one window, the run is another, and every applied parameter is a month-by-hour
+    # median (basis = :climatology). Thirty cells at 300–3000 m with glacier fractions from 0 to 1,
+    # ambient excess E(z, t) = a_t − 0.006 z, and a decoupling factor of 0.8 at 12 UTC and 0.7 at
+    # 15 UTC. A cell above melting observes T_ref + [1 − glm·(1 − k)]·E and one at or below it
+    # observes T_ref + E. The band temperature at z_b is then T_ref + k·E(z_b) where E(z_b) > 0 and
+    # T_ref + E(z_b) otherwise, from every donor — including donors that sit above the melting
+    # level on some steps of the fit window (where the fit's glacier term γ + δz changes sign) and
+    # donors held at the edge of the ambient excess.
+    T_ref = 273.15
+    z = collect(range(300.0, 3000.0; length = 30))
+    glm = [clamp(((zi - 300) / 2700)^1.5 + 0.25 * sin(3i), 0.0, 1.0) for (i, zi) in enumerate(z)]
+    glm[1], glm[15], glm[30] = 0.0, 0.5, 1.0
+    k_at(t) = hour(t) == 12 ? 0.8 : 0.7
+    E(zi, a) = a - 0.006 * zi
+    T_obs(zi, g, a, t) = (e = E(zi, a); e > 0 ? T_ref + (1 - g * (1 - k_at(t))) * e : T_ref + e)
+    T_true(zb, a, t) = (e = E(zb, a); e > 0 ? T_ref + k_at(t) * e : T_ref + e)
+
+    days(year) = [DateTime(year, 7, d, h) for d in 1:31 for h in (12, 15)]
+    fit_time, run_time = days(2001), days(2005)
+    # Fit window: every step has a measurable k (enough cells above melting and > 0.5 K of ambient
+    # excess at the reference elevation), and the 3000 m donor is below melting at a_t < 18 and
+    # held (0 < E < 0.5 K) at a_t = 18.3.
+    a_fit = [18.0 + 7.0 * sin(1.3i) for i in eachindex(fit_time)]
+    a_fit[5] = 18.3
+    # Run window: a different series, with the 3000 m donor held at a_t = 18.2 and every cell below
+    # melting at a_t = 1.
+    a_run = [15.0 + 11.0 * sin(0.7i) for i in eachindex(run_time)]
+    a_run[3], a_run[4] = 18.2, 1.0
+
+    # Every cell holds ice in its own 100 m bin; the 300 m (glm 0), 1603 m (glm 0.5) and 3000 m
+    # (glm 1) donors also force bands 550 m above them, and the 3000 m donor one 450 m below.
+    own_bin(zi) = 100 * floor(Int, zi / 100) + 50
+    cells = [(lon = 10.0 + 0.01i, lat = 46.0, z = z[i], glm = glm[i],
+              bins = [(own_bin(z[i]), 1.0);
+                      i in (1, 15) ? [(own_bin(z[i] + 550), 2.0)] : Tuple{Int,Float64}[];
+                      i == 30 ? [(3550, 2.0), (2550, 1.5)] : Tuple{Int,Float64}[]])
+             for i in eachindex(z)]
+    table = _cp_table(cells)
+    loader(times, a) = function (_model, lat, lon; kwargs...)
+        c = cells[findfirst(c -> c.lat == lat && c.lon == lon, cells)]
+        _audit_forcing(times, lat, lon, c.z, [T_obs(c.z, c.glm, a[i], times[i]) for i in eachindex(times)])
+    end
+
+    p = derive_downscaling_parameters(:synthetic, (first(fit_time), last(fit_time)), table;
+                                      token = nothing, cache_path = nothing,
+                                      forcing_loader = loader(fit_time, a_fit))
+    @test DimensionalData.metadata(p.decoupling)["n_fitted"] == length(fit_time)
+    # The premise: the top donor is above the fitted melting level on some fit steps, so the
+    # glacier term there has the opposite sign to the one on its warm steps.
+    g_top = collect(p.decoupling.coef_gamma) .+ collect(p.decoupling.coef_delta) .* 3000.0
+    @test any(>(0), g_top) && any(<(0), g_top)
+
+    fit = (; time = p.time, p.decoupling, p.lapse_rate, p.lapse_rate_uncertainty)
+    applied = resolve_downscaling(fit, hypsometry_intervals(table), run_time; basis = :climatology)
+    # The donor k is the model's k at each hour, from every donor elevation, held or not.
+    for zi in (z[1], z[15], z[30])
+        @test all(isapprox.(applied.donor_decoupling_factor_at(zi), k_at.(run_time); atol = 1e-12))
+    end
+
+    run_range = (first(run_time), last(run_time))
+    check(bands) = for b in bands
+        truth = [T_true(b.center, a_run[i], run_time[i]) for i in eachindex(run_time)]
+        @test maximum(abs.(collect(b.forcing.temperature_air) .- truth)) <= 1e-9
+    end
+    all_bands = collect(elevation_interval_forcing(table, applied; climate_model = :synthetic,
+                                                   time_range = run_range,
+                                                   forcing_loader = loader(run_time, a_run)))
+    @test length(all_bands) == length(hypsometry_intervals(table))
+    check(all_bands)
+    # Each of the glm 0, 0.5 and 1 donors alone.
+    for i in (1, 15, 30)
+        check(collect(elevation_interval_forcing(table[[i], :], applied; climate_model = :synthetic,
+                                                 time_range = run_range,
+                                                 forcing_loader = loader(run_time, a_run))))
+    end
 end
 
 # Band forcing for a short GEMB run: `years` of 3-hourly steps from 2000, every layer constant.

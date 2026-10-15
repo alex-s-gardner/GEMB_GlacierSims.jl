@@ -142,11 +142,11 @@ value.
 - `provenance`: where the resolved values came from — the albedo product, the parameter file, the fit
   behind the albedo profile. Recorded but **not** compared: re-wording a product description or
   moving a parameter file does not change what was simulated, and must not invalidate a restart.
-- `glacier_offset_at`: `z -> Vector{Float64}`, the applied glacier term of the decoupling fit,
-  `γ + δ·z` (K), on `time` at a reanalysis elevation `z` (m), or `nothing`. A donor cell's forcing is
-  brought to the ice-free state by removing `glm` times this term from its warm excess before it is
-  lapsed ([`elevation_interval_forcing`](@ref)), so a resolution that leaves this `nothing` can force
-  only cells with no glacier fraction.
+- `donor_decoupling_factor_at`: `z -> Vector{Float64}`, the applied decoupling factor `k` on `time`
+  at a donor cell's reanalysis elevation `z` (m), inside `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, or
+  `nothing`. A donor cell's forcing is brought to the ice-free state by dividing its warm excess by
+  `1 - glm·(1 - k)` before it is lapsed ([`elevation_interval_forcing`](@ref)), so a resolution that
+  leaves this `nothing` can force only cells with no glacier fraction.
 
 Use [`downscaling_source_counts`](@ref) to summarize a source vector, and pass it the band's
 above-freezing mask to get the count that matters — `k` is arbitrary at a timestep with no warm excess
@@ -160,13 +160,13 @@ struct AppliedDownscaling{B,G}
     basis::Symbol
     settings::Dict{String,Any}
     provenance::Dict{String,Any}
-    glacier_offset_at::G
+    donor_decoupling_factor_at::G
 end
 
 # Provenance defaults to empty: a caller assembling an `AppliedDownscaling` by hand — a test, or a
 # resolution not read from a parameter file — has nothing to record, and an absent provenance is not
-# an absent setting. Such a caller has no fit to evaluate the glacier term from either, so
-# `glacier_offset_at` defaults to `nothing`.
+# an absent setting. Such a caller has no fit to evaluate a donor's `k` from either, so
+# `donor_decoupling_factor_at` defaults to `nothing`.
 AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings) =
     AppliedDownscaling(time, lapse_rate, lapse_rate_source, bands, basis, settings,
                        Dict{String,Any}())
@@ -300,18 +300,26 @@ Out-of-domain fits are excluded from those medians rather than clamped into them
 warms the glacier surface instead of damping it, and the median of the fits that *are* in domain is a
 better estimate of that month than the bound it would be dragged to.
 
-# The donor glacier term
+# The donor decoupling factor
 
-A donor cell's forcing is brought to the ice-free state with the fit's glacier term at the donor's
-own reanalysis elevation, `g = γ + δ·z`, rather than with `k` there: the conversion removes `glm·g`
-from the donor's warm excess (`GEMB_ClimateForcing._ambient_forcing`), which is bounded by `|glm·g|`,
-where inverting with `k` would divide by `1 - glm·(1 - k)`. `g` is accepted at exactly the timesteps
-`derive_lapse_rate` corrects — `k` at the reference elevation in `(0, 1]` and the coefficients finite
-— so the donor conversion and the lapse fit remove the same term. Everything else falls to the same
-month-and-hour, month and whole-record medians of accepted values, and then to `g = 0`, the identity.
-There is no prior tier: `decoupling_factor_prior` is a `k`, and a `k` alone gives no glacier term
-without a fitted ambient excess to scale. A tile with no accepted fit anywhere is the case that
-reaches the identity, and there `derive_lapse_rate` corrected nothing either.
+A donor cell's forcing is brought to the ice-free state with `k` at the donor's own reanalysis
+elevation: its warm excess is divided by `1 - glm·(1 - k(z_d))` (`GEMB_ClimateForcing._ambient_forcing`).
+`k(z_d)` is resolved as a band's `k` is — re-evaluated from the coefficients, held at the edge of
+the ambient excess, accepted per timestep under `:fitted`, and otherwise the month-and-hour, month
+and whole-record medians of the accepted values — with two differences. A fit is accepted only
+inside `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, the range that bounds the division, rather than
+`(0, 1]`. And there is no prior tier: `decoupling_factor_prior` is a published on-glacier `k`, not
+the damping the reanalysis applied to its own glaciated cells, so a timestep with no accepted fit
+anywhere falls to `k = 1`, the identity. A tile with no accepted fit anywhere is the case that
+reaches it, and there `derive_lapse_rate` corrected nothing either.
+
+The pooled quantity is the ratio `k(z_d) = 1 + g/(α + β·z_d)` rather than the glacier term
+`g = γ + δ·z_d` itself because the medians mix timesteps on which the donor sat below the fitted
+melting level with those on which it sat above it. Above it `α + β·z_d < 0` and `g` changes sign, so
+a median of `g` applied to the warm hours cools a donor that should be warmed. `k(z_d)` is what the
+model holds fixed while the ambient excess varies, and it is held rather than extrapolated where
+that excess runs out, so on a region that follows the model with a constant `k` each month and hour
+the pooled conversion is the per-timestep one exactly.
 
 # Basis
 
@@ -436,10 +444,10 @@ function resolve_downscaling(fit, intervals, run_time;
          albedo_ice, albedo_ice_source)
     end
 
-    # The glacier term at a donor cell's reanalysis elevation, by the same tiers without the prior.
-    # No elevation range: a reanalysis surface can sit below the hypsometry, and it is among the
-    # elevations the fit was taken over.
-    glacier_offset_at = _GlacierOffsetResolver(fit.decoupling, fit_time, run_time, basis)
+    # `k` at a donor cell's reanalysis elevation, by the same tiers without the prior. No elevation
+    # range: a reanalysis surface can sit below the hypsometry, and it is among the elevations the
+    # fit was taken over.
+    donor_decoupling_factor_at = _DonorDecouplingResolver(fit.decoupling, fit_time, run_time, basis)
 
     settings = Dict{String,Any}(
         "downscaling_basis" => string(basis),
@@ -451,6 +459,7 @@ function resolve_downscaling(fit, intervals, run_time;
         "downscaling_lapse_rate_prior" => lapse_prior,
         "downscaling_decoupling_factor_prior" =>
             k_prior === nothing ? "none" : Float64(k_prior),
+        "downscaling_donor_decoupling_factor_limits" => collect(_DONOR_DECOUPLING_FACTOR_LIMITS),
         "downscaling_fit_time_coverage_start" => isempty(fit_time) ? "none" : string(first(fit_time)),
         "downscaling_fit_time_coverage_end" => isempty(fit_time) ? "none" : string(last(fit_time)),
         "downscaling_n_fit_timesteps" => length(fit_time),
@@ -464,46 +473,37 @@ function resolve_downscaling(fit, intervals, run_time;
     end
 
     return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings,
-                              _albedo_provenance(fit, albedo_profile), glacier_offset_at)
+                              _albedo_provenance(fit, albedo_profile), donor_decoupling_factor_at)
 end
 
-# The glacier term at a reanalysis elevation, as `AppliedDownscaling.glacier_offset_at`: holds only
-# what `_resolve_glacier_offset_at` reads, so a resolution does not keep the rest of the fit alive.
-struct _GlacierOffsetResolver{D}
+# `k` at a donor's reanalysis elevation, as `AppliedDownscaling.donor_decoupling_factor_at`: holds
+# only what `_resolve_decoupling_at` reads, so a resolution does not keep the rest of the fit alive.
+# Resolved inside the donor limits, which bound `_ambient_forcing`'s division, and with no prior —
+# see `resolve_downscaling`.
+struct _DonorDecouplingResolver{D}
     decoupling::D
     fit_time::Vector{DateTime}
     run_time::Vector{DateTime}
     basis::Symbol
 end
 
-(r::_GlacierOffsetResolver)(z::Real) =
-    _resolve_glacier_offset_at(r.decoupling, z, r.fit_time, r.run_time, r.basis)
-
-# The glacier term `γ + δ·z` (K) at elevation `z` resolved onto `run_time`: accepted where
-# `_glacier_offset_at_elevation` reports it (the timesteps `derive_lapse_rate` corrects), with every
-# other timestep falling through the climatology tiers to 0, the identity. No prior tier — see
-# `resolve_downscaling`. Finite at every timestep, which is asserted.
-function _resolve_glacier_offset_at(decoupling, z::Real, fit_time, run_time, basis)
-    raw = _glacier_offset_at_elevation(decoupling, z)
-    offset, _ = _resolve_series(fit_time, raw, isfinite.(raw), run_time, basis, nothing;
-                                ambient = 0.0)
-    all(isfinite, offset) || error(
-        "resolved glacier term at $(z) m is not finite everywhere; this is a bug in " *
-        "`resolve_downscaling`, not a property of the fits")
-    return offset
-end
+(r::_DonorDecouplingResolver)(z::Real) =
+    _resolve_decoupling_at(r.decoupling, z, r.fit_time, r.run_time, r.basis, nothing;
+                           limits = _DONOR_DECOUPLING_FACTOR_LIMITS, open_lower = false).factor
 
 # `k` at elevation `z` resolved onto `run_time`: the fit re-evaluated there
-# ([`decoupling_factor_at_elevation`](@ref)), accepted where finite and inside `(0, 1]` and labelled
-# `:held` where the tile's ambient warm excess ran out below `z`, with every other timestep falling
-# through the climatology tiers to `k_prior` and finally to 1. Returns
-# `(; factor, source, n_fit_in_domain, n_fit_held)`; the counts describe the fit series.
+# ([`decoupling_factor_at_elevation`](@ref)), accepted where finite and inside `limits` (`(0, 1]` for
+# a band, the closed donor limits for a donor) and labelled `:held` where the tile's ambient warm
+# excess ran out below `z`, with every other timestep falling through the climatology tiers to
+# `k_prior` and finally to 1. Returns `(; factor, source, n_fit_in_domain, n_fit_held)`; the counts
+# describe the fit series.
 function _resolve_decoupling_at(decoupling, z::Real, fit_time, run_time, basis, k_prior;
-                                elevation_range = nothing)
+                                elevation_range = nothing,
+                                limits = _DECOUPLING_FACTOR_LIMITS, open_lower::Bool = true)
     raw = decoupling_factor_at_elevation(decoupling, z; elevation_range)
     kz = collect(Float64, raw)
-    in_domain = [isfinite(x) && _DECOUPLING_FACTOR_LIMITS[1] < x <= _DECOUPLING_FACTOR_LIMITS[2]
-                 for x in kz]
+    lo, hi = limits
+    in_domain = [isfinite(x) && (open_lower ? lo < x : lo <= x) && x <= hi for x in kz]
     # Which timesteps were evaluated at a held-down elevation rather than at `z`.
     # `decoupling_factor_at_elevation` reports only how many, and the label needs to know which, so
     # the same condition is re-formed here from the coefficients: the ambient warm excess
@@ -514,8 +514,7 @@ function _resolve_decoupling_at(decoupling, z::Real, fit_time, run_time, basis, 
 
     factor, source = _resolve_series(fit_time, kz, in_domain, run_time, basis, k_prior;
                                      held, ambient = 1.0)
-    _assert_applicable(factor, _DECOUPLING_FACTOR_LIMITS, "decoupling factor at $(z) m";
-                       open_lower = true)
+    _assert_applicable(factor, limits, "decoupling factor at $(z) m"; open_lower)
     return (; factor, source, n_fit_in_domain = count(in_domain),
             n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)))
 end

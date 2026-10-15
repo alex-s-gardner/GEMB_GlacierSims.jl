@@ -508,10 +508,11 @@ whatever it cannot reach is counted rather than skipped.
 Per grid cell, per band, forcing is adjusted in three steps (`_cell_forcing_at_interval`):
 
 1. **to ambient** — the reanalysis already runs a fraction `glm` of the cell as ice, and the
-   decoupling fit models its warm excess as `α + β·z + glm·(γ + δ·z)`. Removing `glm·(γ + δ·z)` at the
-   cell's own reanalysis elevation from its observed excess leaves the ice-free part plus the cell's
-   own residual, which is its ice-free temperature (`GEMB_ClimateForcing._ambient_forcing`). No
-   division is involved, so the change is never larger than `glm·|γ + δ·z|`;
+   decoupling fit models its warm excess as `[1 - glm·(1 - k(z))]·E_ambient(z)`. Dividing the
+   observed excess by that factor, with `k` resolved at the cell's own reanalysis elevation, gives
+   its ice-free temperature (`GEMB_ClimateForcing._ambient_forcing`). The donor's `k` is kept inside
+   `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, so the observed excess is multiplied by at most
+   `1/$(_DONOR_DECOUPLING_FACTOR_LIMITS[1])`, and a step at or below melting is left as it is;
 2. **lapse** — to the band center, with the applied ambient lapse rate;
 3. **decouple** — with the band's own `k` at the band center, since the band is glacier.
 
@@ -559,12 +560,12 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     intervals::B
     donor_cells::D
     donor_max_distance_km::Float64
-    # The fit's glacier term at a reanalysis elevation, from `AppliedDownscaling.glacier_offset_at`,
+    # `k` at a donor's reanalysis elevation, from `AppliedDownscaling.donor_decoupling_factor_at`,
     # and the series already evaluated, keyed by elevation. Cells share elevations only by
     # coincidence, but each cell is met once per batching pass, so the memo saves the re-evaluation
     # on every pass after the first.
-    glacier_offset_at::K
-    donor_glacier_offset::Dict{Float64,Vector{Float64}}
+    donor_decoupling_factor_at::K
+    donor_decoupling_factor::Dict{Float64,Vector{Float64}}
     # Forcing for donors that have been used, and the coordinates already found unusable. Masked cells
     # cluster, so the second one in a tile usually resolves to a donor already here and costs no I/O;
     # the unusable set stops a rejected candidate from being loaded again by the next masked cell.
@@ -584,22 +585,23 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
     return _ElevationIntervalForcing(grid_cells, load, applied.time, applied.lapse_rate,
                                      applied.lapse_rate_source, elevation_interval_batch,
                                      applied.bands, donor_cells, donor_max_distance_km,
-                                     applied.glacier_offset_at, Dict{Float64,Vector{Float64}}(),
+                                     applied.donor_decoupling_factor_at,
+                                     Dict{Float64,Vector{Float64}}(),
                                      Dict{Tuple{Float64,Float64},Any}(),
                                      Set{Tuple{Float64,Float64}}())
 end
 
-# The fit's glacier term `γ + δ·z` per timestep at the reanalysis elevation `z` of a cell whose
-# glacier fraction is `glm`, for bringing its forcing to the ice-free state. A cell with no glacier
-# fraction needs no term there, which is the one case a resolution without `glacier_offset_at` can
-# force.
-function _donor_glacier_offset(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
-    glm == 0 && return zeros(length(ivf.time))
-    ivf.glacier_offset_at === nothing && throw(ArgumentError(
-        "this AppliedDownscaling carries no `glacier_offset_at`, so the forcing of a cell with " *
-        "glacier fraction $glm cannot be brought to the ice-free state; build it with " *
+# The applied `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is
+# `glm`, for bringing its forcing to the ice-free state. A cell with no glacier fraction is already
+# ambient (`k = 1` leaves it bit for bit), which is the one case a resolution without
+# `donor_decoupling_factor_at` can force.
+function _donor_decoupling_factor(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
+    glm == 0 && return ones(length(ivf.time))
+    ivf.donor_decoupling_factor_at === nothing && throw(ArgumentError(
+        "this AppliedDownscaling carries no `donor_decoupling_factor_at`, so the forcing of a cell " *
+        "with glacier fraction $glm cannot be brought to the ice-free state; build it with " *
         "`resolve_downscaling`"))
-    return get!(() -> ivf.glacier_offset_at(z), ivf.donor_glacier_offset, z)
+    return get!(() -> ivf.donor_decoupling_factor_at(z), ivf.donor_decoupling_factor, z)
 end
 
 # Forcing to use for `row`, which has ice but no usable forcing of its own: the nearest cell of
@@ -756,10 +758,10 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
         # the lapse to the interval centre must start from.
         z_cell = Float64(DimensionalData.metadata(fd)["elevation"])
 
-        # The series brought to the ice-free state once per cell, with the fit's glacier term at the
-        # cell's own reanalysis elevation and the `glm` of the cell the series belongs to, so every
-        # band lapses from the same ambient temperature.
-        ambient = _ambient_forcing(fd, glm, _donor_glacier_offset(ivf, z_cell, glm))
+        # The series brought to the ice-free state once per cell, with `k` at the cell's own
+        # reanalysis elevation and the `glm` of the cell the series belongs to, so every band lapses
+        # from the same ambient temperature.
+        ambient = _ambient_forcing(fd, glm, _donor_decoupling_factor(ivf, z_cell, glm))
 
         # A function barrier: with substitution, `fd` may come from the donor memo, whose element type
         # is not concrete. Resolving it at this one call keeps the record-length inner loops specialized
@@ -848,7 +850,7 @@ end
 #
 # `ambient` is the cell's forcing already at the ice-free state, so each interval only lapses it and
 # decouples with the interval's own `k`; `_cell_forcing_at_interval` is handed a glacier fraction of
-# zero, which makes its own ambient step the identity.
+# zero and a donor `k` of 1, which make its own ambient step the identity.
 #
 # Threaded over intervals, not over cells. This inner loop is the whole cost of the pass —
 # `n_cells * n_intervals` lapse-and-decouple passes over the record, which for a 335-cell tile of 60
@@ -866,7 +868,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
                                      n_substituted, substituted, donor_distance,
                                      intervals, areas, ambient, z_cell, ivf, n,
                                      substituting::Bool, distance::Float64)
-    no_glacier_term = zeros(n)
+    already_ambient = ones(n)
     # The zenith angle and the cloud optical thickness are the cell's own at every interval (lapsing
     # and decoupling leave them unchanged), so the cosine and the clear-sky ratio `1/t(τ)` are taken
     # once per cell.
@@ -878,7 +880,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
         interval = intervals[i]
         adjusted = try
             _cell_forcing_at_interval(ambient, interval.center - z_cell, interval.decoupling_factor,
-                                      ivf.lapse_rate, 0.0, no_glacier_term)
+                                      ivf.lapse_rate, 0.0, already_ambient)
         catch e
             e isa InterruptException && rethrow()
             is_caller_error(e) && rethrow()
