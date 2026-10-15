@@ -16,7 +16,7 @@
 # re-running the same command after an interruption costs only the cells that did not finish.
 #
 # Environment: NATIVE_BLOCKS (default 96), CLIMATE_CACHE, JULIA, TILE_NAMES, FORCE, FORCING_CORRECTIONS,
-# REFERENCE_TILE_DIR, OUTPUT_DIR, CLAIM_STALE_HOURS, HEAP_SIZE_HINT.
+# REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR, CLAIM_STALE_HOURS, HEAP_SIZE_HINT.
 
 set -uo pipefail
 

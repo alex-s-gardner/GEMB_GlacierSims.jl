@@ -43,6 +43,7 @@ import NCDatasets
 # written with Parquet2 (which GeoParquet already carries) rather than through GeoDataFrames.
 import GeoParquet
 import GeoParquet.Parquet2
+import TOML
 # Read only to learn the span of the cached ERA5-Land record, from the Zarr groups the forcing
 # loader caches on disk.
 import Zarr
@@ -133,5 +134,7 @@ include("forcing_corrections.jl")
 include("glacier_native_run.jl")
 export read_forcing_corrections, forcing_correction, native_cells, gemb_native_cell,
        native_cell_spinup_seed, native_tile_lost_area
+export reference_forcing_corrections, gga_reference_ensemble_file,
+       forcing_corrections_provenance_path, assert_corrections_fitted_on
 
 end # module

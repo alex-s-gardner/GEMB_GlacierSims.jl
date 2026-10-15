@@ -56,7 +56,8 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", s
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 # Overridable so a timing probe on a reduced perturbation grid can share the forcing cache without
 # writing files the production sweep would then have to recognise as a different experiment and rebuild.
-const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "tile_runs"))
+# The default is the directory the native run takes as its reference (`TILE_RUN_DIR`).
+const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, TILE_RUN_DIR))
 
 # Must match the gridding the parameter tiles were derived on, or a tile's parameters describe a
 # different neighbourhood than its cells. The parameter files record their own `tile_size`/`tile_buffer`,

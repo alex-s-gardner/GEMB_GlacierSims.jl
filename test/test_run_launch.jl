@@ -2,6 +2,7 @@
 # statuses, claims, relaunch dispositions and file completeness. Included from `runtests.jl`.
 
 import Zarr
+import TOML
 
 const _REPO = normpath(joinpath(@__DIR__, ".."))
 
@@ -301,5 +302,112 @@ end
             @test !success(pipeline(launch(); stdout = devnull, stderr = err))
             @test occursin("nothing launched", String(take!(err)))
         end
+    end
+end
+
+@testset "run launch: native corrections come from the reference member and its sweep" begin
+    # The reference member GlobalGlacierAnalysis.jl declares, read from its source.
+    gga = mktempdir()
+    mkpath(joinpath(gga, "src"))
+    binned = mktempdir()
+    member = joinpath(binned, "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_aligned.jld2")
+    write(joinpath(gga, "src", "utilities_project.jl"), """
+        const δice = 917;
+        const reference_ensemble_file = "$member";
+        function project_products(; project_id = :v01) end
+        """)
+    @test gga_reference_ensemble_file(gga) == member
+    # Its `gemb_calibration` output, named as GlobalGlacierAnalysis.jl names it.
+    @test_throws "no `gemb_calibration` output for the reference ensemble member" reference_forcing_corrections(member)
+    fit = touch(joinpath(binned, "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_synthesized_gembfit.arrow"))
+    @test reference_forcing_corrections(member) == fit
+    @test_throws "is not an `…_aligned.jld2` file" reference_forcing_corrections(joinpath(binned, "x.jld2"))
+    @test_throws "no GlobalGlacierAnalysis.jl source" gga_reference_ensemble_file(mktempdir())
+    write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = joinpath(\"a\", \"b\")\n")
+    @test_throws "not a string literal" gga_reference_ensemble_file(gga)
+    write(joinpath(gga, "src", "utilities_project.jl"), "const x = 1\n")
+    @test_throws "declares `reference_ensemble_file` 0 times" gga_reference_ensemble_file(gga)
+
+    # The provenance of the fit: the directory of tile runs it read, and their source trees.
+    sweep = mktempdir()
+    other_sweep = mktempdir()
+    trees = Dict("software_gemb_tree" => "a"^40, "software_gemb_climateforcing_tree" => "b"^40,
+                 "software_gemb_glaciersims_tree" => "c"^40)
+    reference_parameters = Dict{String,Any}(trees..., "software_gemb_version" => "2.0.0",
+                                            "model_albedo_ice" => 0.48)
+    provenance = forcing_corrections_provenance_path(fit)
+    @test provenance == replace(fit, ".arrow" => "_provenance.toml")
+    record(dir, parameters) = open(provenance, "w") do io
+        TOML.print(io, Dict("tile_dir" => dir, "tile_run_parameters" => parameters))
+    end
+    @test_throws "carry no tile-run provenance" assert_corrections_fitted_on(fit, sweep)
+    record(sweep, Dict(trees..., "software_gemb_version" => "2.0.0"))
+    @test assert_corrections_fitted_on(fit, sweep) === nothing
+    @test assert_corrections_fitted_on(fit, sweep, reference_parameters) === nothing
+    # The same directory through a link is the same sweep.
+    link = joinpath(mktempdir(), "link")
+    symlink(sweep, link)
+    @test assert_corrections_fitted_on(fit, link, reference_parameters) === nothing
+    # Fitted on another directory of tile runs.
+    @test_throws "not on the reference sweep" assert_corrections_fitted_on(fit, other_sweep)
+    # Fitted on tile runs from other code.
+    @test_throws "software_gemb_tree: fitted on" assert_corrections_fitted_on(
+        fit, sweep, merge(reference_parameters, Dict("software_gemb_tree" => "d"^40)))
+    @test_throws "reference nothing" assert_corrections_fitted_on(
+        fit, sweep, delete!(copy(reference_parameters), "software_gemb_version"))
+    # A record without the source trees cannot show which code the fit saw.
+    record(sweep, Dict("software_gemb_version" => "2.0.0"))
+    @test_throws "does not record software_gemb_tree" assert_corrections_fitted_on(fit, sweep)
+
+    # The tile sweep writes, and the native run reads, the same directory by default; the launcher
+    # agrees with the scripts.
+    settings = Module()
+    Base.eval(settings, :(using Dates))
+    Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
+    @test settings.TILE_RUN_DIR == "tile_runs_v2"
+    for script in ("gemb_tile_sweep.jl", "gemb_native_run.jl")
+        @test occursin("joinpath(CLIMATE_CACHE, TILE_RUN_DIR)",
+                       read(joinpath(_REPO, "scripts", script), String))
+    end
+    @test occursin("OUTPUT_DIR=\"\${OUTPUT_DIR:-\$CLIMATE_CACHE/$(settings.TILE_RUN_DIR)}\"",
+                   read(joinpath(_REPO, "scripts", "run_tile_sweep.sh"), String))
+
+    # The native script's settings pass takes the corrections from the reference member, and stops when
+    # the member's GlobalGlacierAnalysis.jl checkout cannot be found.
+    write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = \"$member\"\n")
+    climate = mktempdir()
+    mv(_fixture_era5_cache(collect(0.0:9.0)), joinpath(climate, "cache"))
+    native(gga_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
+                              $(joinpath(_REPO, "scripts", "gemb_native_run.jl"))`,
+                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)
+    out = read(native(gga), String)
+    @test occursin(fit, out)
+    @test occursin(joinpath(climate, "tile_runs_v2"), out)
+    err = IOBuffer()
+    @test !success(pipeline(native(mktempdir()); stdout = devnull, stderr = err))
+    @test occursin("no GlobalGlacierAnalysis.jl source", String(take!(err)))
+end
+
+@testset "run launch: a native tile over the lost-ice rule fails every launch" begin
+    if Sys.which("bash") === nothing
+        @test_skip "bash is not available"
+    else
+        # A tile whose native run left more than 1 % of its ice unmodelled keeps its
+        # `.lost_ice_exceeded` file, so a launch in which no worker ran it still exits non-zero.
+        climate = mktempdir()
+        mkpath(joinpath(climate, "downscaling_parameters"))
+        mkpath(joinpath(climate, "invariant", "era5_land"))
+        write(joinpath(climate, "invariant", "era5_land", "geo_1279l4_0.1x0.1.grib2_v4_unpack.nc"), "x")
+        output = joinpath(climate, "native_runs")
+        env = ("JULIA" => _stub_julia(mktempdir()), "CLIMATE_CACHE" => climate, "NATIVE_BLOCKS" => "1",
+               "STUB_INVARIANT_TARGET" => joinpath(mktempdir(), "geo_1279l4_0.1x0.1.grib2_v4_unpack.nc"),
+               "OUTPUT_DIR" => output)
+        launch() = addenv(`bash $(joinpath(_REPO, "scripts", "run_native_sweep.sh"))`, env...)
+        @test success(pipeline(launch(); stdout = devnull, stderr = devnull))
+        mkpath(joinpath(output, "N60_W142"))
+        write(joinpath(output, "N60_W142", "N60_W142.lost_ice_exceeded"), "message")
+        err = IOBuffer()
+        @test !success(pipeline(launch(); stdout = devnull, stderr = err))
+        @test occursin("1 tile(s) over the lost-ice rule", String(take!(err)))
     end
 end

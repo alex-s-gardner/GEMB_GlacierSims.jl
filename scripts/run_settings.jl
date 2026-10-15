@@ -12,6 +12,12 @@
 
 const SHOW_SETTINGS = get(ENV, "SHOW_SETTINGS", "0") == "1"
 
+# The directory under `CLIMATE_CACHE` the tile sweep writes by default and the native run takes its
+# reference tile runs from, so the two agree without either being told. `run_tile_sweep.sh` carries the
+# same name. A new name is a new set of tile runs: GlobalGlacierAnalysis.jl reads every file in the
+# directory its GEMB run id names.
+const TILE_RUN_DIR = "tile_runs_v2"
+
 """
     setting(label, value, source = "default") -> NamedTuple
 

@@ -26,7 +26,10 @@
 #
 # Settings must match the tile sweep the correction was fitted against — anything else applies the
 # correction to a different model. Every tile is therefore checked against its file in
-# REFERENCE_TILE_DIR before any forcing is read, and a disagreement throws.
+# REFERENCE_TILE_DIR before any forcing is read, and a disagreement throws. The corrections must have
+# been fitted on that same sweep: their provenance file records the directory of tile runs the fit read
+# and the source trees those runs came from (`assert_corrections_fitted_on`), and both are checked
+# before anything runs and again against every reference tile.
 #
 # Run one block:  julia --project=. -t 1 scripts/gemb_native_run.jl [start] [end]
 # Run them all:   scripts/run_native_sweep.sh [start] [end]
@@ -36,8 +39,8 @@
 # status 1 when any cell or tile it ran failed.
 #
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
-# FORCING_CORRECTIONS, REFERENCE_TILE_DIR, OUTPUT_DIR, CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS,
-# UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM
+# FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
+# CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
@@ -58,12 +61,22 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", s
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "native_runs"))
 
-# The calibration to apply: the reference ensemble member's `gemb_calibration` output.
-const FORCING_CORRECTIONS = get(ENV, "FORCING_CORRECTIONS",
-    "/mnt/bylot-r3/data/binned/2deg/" *
-    "glacier_rgi7_dh_best_cc_nmad3_v01_filled_ac_p6_synthesized_gembfit.arrow")
-# The tile sweep that correction was fitted against, whose stored run parameters this run must match.
-const REFERENCE_TILE_DIR = get(ENV, "REFERENCE_TILE_DIR", joinpath(CLIMATE_CACHE, "tile_runs_merged"))
+# The calibration to apply: the `gemb_calibration` output of GlobalGlacierAnalysis.jl's reference
+# ensemble member. The member is the `reference_ensemble_file` its checkout declares (GGA_PROJECT, by
+# default the checkout beside this one), or REFERENCE_ENSEMBLE_FILE; FORCING_CORRECTIONS names the
+# correction file directly. Whichever is used must exist, or the run stops here.
+const GGA_PROJECT = get(ENV, "GGA_PROJECT",
+                        joinpath(dirname(dirname(@__DIR__)), "GlobalGlacierAnalysis.jl"))
+const FORCING_CORRECTIONS_SOURCE =
+    haskey(ENV, "FORCING_CORRECTIONS") ? "ENV[FORCING_CORRECTIONS]" :
+    haskey(ENV, "REFERENCE_ENSEMBLE_FILE") ? "ENV[REFERENCE_ENSEMBLE_FILE]" :
+    "reference member of $GGA_PROJECT"
+const FORCING_CORRECTIONS = haskey(ENV, "FORCING_CORRECTIONS") ? ENV["FORCING_CORRECTIONS"] :
+    reference_forcing_corrections(get(() -> gga_reference_ensemble_file(GGA_PROJECT), ENV,
+                                      "REFERENCE_ENSEMBLE_FILE"))
+# The tile sweep that correction was fitted against, whose stored run parameters this run must match:
+# by default the directory the sweep writes (`TILE_RUN_DIR`).
+const REFERENCE_TILE_DIR = get(ENV, "REFERENCE_TILE_DIR", joinpath(CLIMATE_CACHE, TILE_RUN_DIR))
 # How far a geotile the calibration did not fit may borrow a neighbour's correction.
 const CORRECTION_MAX_DISTANCE_KM = parse(Float64, get(ENV, "CORRECTION_MAX_DISTANCE_KM", "1000"))
 
@@ -102,7 +115,7 @@ function settings_rows()
         setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         setting("output frequency", OUTPUT_FREQUENCY),
-        env_setting("forcing corrections", FORCING_CORRECTIONS, "FORCING_CORRECTIONS"),
+        setting("forcing corrections", FORCING_CORRECTIONS, FORCING_CORRECTIONS_SOURCE),
         env_setting("correction borrow range", "$(CORRECTION_MAX_DISTANCE_KM) km",
                     "CORRECTION_MAX_DISTANCE_KM"),
         env_setting("reference tile sweep", REFERENCE_TILE_DIR, "REFERENCE_TILE_DIR"),
@@ -141,6 +154,9 @@ function main()
     isdir(PARAMETER_DIR) || error("no downscaling parameters at $PARAMETER_DIR")
     isdir(REFERENCE_TILE_DIR) || error("no reference tile sweep at $REFERENCE_TILE_DIR")
     corrections = read_forcing_corrections(FORCING_CORRECTIONS)
+    # Fitted on the reference sweep's directory, checked before any tile; the source trees are checked
+    # against each reference tile file as its unit runs.
+    assert_corrections_fitted_on(FORCING_CORRECTIONS, REFERENCE_TILE_DIR)
 
     table = GeoDataFrames.read(PARQUET)
     table[!, :longitude] = GI.x.(table.geometry)
@@ -264,6 +280,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
         return [summary_row(c, tile_name, :no_reference, 0.0; correction) for c in cells]
     end
     assert_matches_reference(reference, tile.name, requested)
+    assert_corrections_fitted_on(FORCING_CORRECTIONS, REFERENCE_TILE_DIR,
+                                 reference_status(reference).parameters)
     # The bands the reference tile run modelled: an interval it dropped is dropped from every cell, so
     # the two runs drop the same intervals.
     modelled_intervals = reference_status(reference).band_edges

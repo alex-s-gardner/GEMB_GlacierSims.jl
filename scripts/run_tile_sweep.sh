@@ -20,7 +20,7 @@
 #
 # Each process drains its own contiguous, weight-balanced block of the chunk-ordered tile list first —
 # which is what keeps the forcing cache warm across neighbours — and then steals the heaviest tile still
-# unclaimed. Tiles are claimed by an atomic mkdir under tile_runs/claims, so nothing coordinates beyond the
+# unclaimed. Tiles are claimed by an atomic mkdir under $OUTPUT_DIR/claims, so nothing coordinates beyond the
 # filesystem, and a worker that finishes early takes work instead of idling. That matters more than it used
 # to: with forcing fetched on demand a tile's wall time is partly a CDS download, so band count alone no
 # longer predicts cost.
@@ -37,7 +37,8 @@
 # the package, so a syntax error or a missing dependency surfaces once here rather than 96 times in the
 # logs.
 #
-# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, JULIA, FORCING_CACHE_GIB, TILE_NAMES, FORCE,
+# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, OUTPUT_DIR (default $CLIMATE_CACHE/tile_runs_v2),
+# JULIA, FORCING_CACHE_GIB, TILE_NAMES, FORCE,
 # CLAIM_STALE_HOURS, SPINUP_SIMULATION_YEARS_MAXIMUM, HEAP_SIZE_HINT.
 
 set -uo pipefail
@@ -52,7 +53,11 @@ BLOCKS="${TILE_BLOCKS:-96}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIMATE_CACHE="${CLIMATE_CACHE:-/mnt/bylot-r3/data/era5land}"
-LOG_DIR="$CLIMATE_CACHE/tile_runs/logs"
+# The sweep's own default (`TILE_RUN_DIR` in run_settings.jl), which the native run takes as its
+# reference. Exported so the workers write where the logs and claims below are kept.
+OUTPUT_DIR="${OUTPUT_DIR:-$CLIMATE_CACHE/tile_runs_v2}"
+export OUTPUT_DIR
+LOG_DIR="$OUTPUT_DIR/logs"
 
 [ -x "$JULIA" ] || { echo "no julia at $JULIA; set JULIA=/path/to/julia" >&2; exit 1; }
 [ -f "$REPO/data/era5land_glacier_elevation_classes.parquet" ] ||
@@ -92,7 +97,7 @@ if pgrep -f "$REPO/scripts/gemb_tile_sweep.jl" > /dev/null; then
     pgrep -fa "$REPO/scripts/gemb_tile_sweep.jl" | head -3 >&2
     exit 1
 fi
-rm -rf "$CLIMATE_CACHE/tile_runs/claims"
+rm -rf "$OUTPUT_DIR/claims"
 echo "sweep ${run_args[*]} over $BLOCKS blocks; logs in $LOG_DIR"
 
 pids=()
@@ -120,7 +125,7 @@ printf 'tiles extended : %s\n' "$(grep -ah 'Extended tile' "$LOG_DIR"/block_*of"
 printf 'tiles skipped  : %s\n' "$(grep -ah 'already covers the request' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 tiles_failed=$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l | tr -d ' ')
 printf 'tiles failed   : %s\n' "$tiles_failed"
-echo "summaries      : $CLIMATE_CACHE/tile_runs/tile_runs_summary_block*of$BLOCKS.parquet"
+echo "summaries      : $OUTPUT_DIR/tile_runs_summary_block*of$BLOCKS.parquet"
 
 if [ "$failed" -ne 0 ] || [ "$tiles_failed" -ne 0 ]; then
     echo "sweep incomplete: $tiles_failed tile(s) failed, $failed block(s) exited non-zero" >&2
