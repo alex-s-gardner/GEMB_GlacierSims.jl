@@ -43,10 +43,14 @@ import NCDatasets
 # written with Parquet2 (which GeoParquet already carries) rather than through GeoDataFrames.
 import GeoParquet
 import GeoParquet.Parquet2
+# Read only to learn the span of the cached ERA5-Land record, from the Zarr groups the forcing
+# loader caches on disk.
+import Zarr
 
 include("util.jl")
 export claim_tile!, claim_order, weight_balanced_blocks
 export era5_land_invariant, wrap_lon, forcing_at_elevation, software_provenance
+export era5_land_record_span, run_time_range
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
 include("volume_change.jl")

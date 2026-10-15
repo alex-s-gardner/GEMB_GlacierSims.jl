@@ -3,7 +3,11 @@
 # Derive downscaling parameters for every glacierized 2 degree tile, as TILE_BLOCKS concurrent
 # single-threaded processes.
 #
-#   scripts/run_derive_parameters.sh [start_year] [end_year]
+#   scripts/run_derive_parameters.sh [start] [end]
+#
+# `start` and `end` are read as run_tile_sweep.sh reads them: without `end` the fit window ends at the
+# last step of the cached ERA5-Land record, which is the window the tile sweep runs by default. Exits
+# non-zero when any worker exits non-zero, which a worker does when any tile it claimed failed.
 #
 # The fit window must match the window the tile runs will use, or `gemb_tile_sweep.jl` resolves the
 # parameters on the climatology path rather than the fitted one: it compares the parameter file's own time
@@ -31,8 +35,8 @@
 
 set -uo pipefail
 
-START_YEAR="${1:-1950}"
-END_YEAR="${2:-2027}"
+run_args=("${1:-1950}")
+[ -n "${2:-}" ] && run_args+=("$2")
 BLOCKS="${TILE_BLOCKS:-96}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,11 +55,11 @@ mkdir -p "$LOG_DIR"
 rm -rf "$CLIMATE_CACHE/downscaling_parameters/claims"
 
 TILE_BLOCKS="$BLOCKS" SHOW_SETTINGS=1 "$JULIA" --project="$REPO" --startup-file=no -t 1 \
-    "$REPO/scripts/derive_downscaling_parameter_tiles.jl" "$START_YEAR" "$END_YEAR" ||
+    "$REPO/scripts/derive_downscaling_parameter_tiles.jl" "${run_args[@]}" ||
     { echo "settings pass failed; nothing launched" >&2; exit 1; }
 
 echo
-echo "deriving downscaling parameters $START_YEAR-$END_YEAR as $BLOCKS processes"
+echo "deriving downscaling parameters ${run_args[*]} as $BLOCKS processes"
 echo "logs: $LOG_DIR"
 
 pids=()
@@ -63,7 +67,7 @@ for i in $(seq 1 "$BLOCKS"); do
     log="$LOG_DIR/block_$(printf '%03d' "$i")of$BLOCKS.log"
     TILE_BLOCKS="$BLOCKS" TILE_BLOCK="$i" FORCING_CACHE_GIB="${FORCING_CACHE_GIB:-1}" \
         "$JULIA" --project="$REPO" --startup-file=no -t 1 \
-        "$REPO/scripts/derive_downscaling_parameter_tiles.jl" "$START_YEAR" "$END_YEAR" > "$log" 2>&1 &
+        "$REPO/scripts/derive_downscaling_parameter_tiles.jl" "${run_args[@]}" > "$log" 2>&1 &
     pids+=($!)
 done
 
@@ -79,6 +83,10 @@ echo "blocks finished: $(( ${#pids[@]} - failed )) ok, $failed non-zero exit"
 printf 'tiles written  : %s\n' "$(grep -ah 'Wrote tile\|status = :written' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles skipped  : %s\n' "$(grep -ah 'already covers the request' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles sparse   : %s\n' "$(grep -ah 'below_min_cells\|:sparse' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
-printf 'tiles failed   : %s\n' "$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
+tiles_failed=$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l | tr -d ' ')
+printf 'tiles failed   : %s\n' "$tiles_failed"
 
-[ "$failed" -eq 0 ] || exit 1
+if [ "$failed" -ne 0 ] || [ "$tiles_failed" -ne 0 ]; then
+    echo "derivation incomplete: $tiles_failed tile(s) failed, $failed block(s) exited non-zero" >&2
+    exit 1
+fi

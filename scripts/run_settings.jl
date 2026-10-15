@@ -35,7 +35,8 @@ env_setting(label, value, var::AbstractString) =
 # plainly than yes/no.
 _setting_value(x) = string(x)
 _setting_value(x::Bool) = x ? "yes" : "no"
-_setting_value(x::Dates.DateTime) = Dates.format(x, "yyyy-mm-dd")
+_setting_value(x::Dates.DateTime) =
+    Dates.format(x, x == Dates.DateTime(Dates.Date(x)) ? "yyyy-mm-dd" : "yyyy-mm-ddTHH:MM")
 _setting_value(x::AbstractVector) = join(map(_setting_value, x), ", ")
 _setting_value(x::Tuple{Dates.DateTime,Dates.DateTime}) =
     "$(_setting_value(x[1])) .. $(_setting_value(x[2]))"
@@ -65,3 +66,19 @@ function print_settings(io::IO, title::AbstractString, rows)
 end
 
 print_settings(title::AbstractString, rows) = print_settings(stdout, title, rows)
+
+"""
+    exit_on_failures(summary, what)
+
+End the process with exit status 1 when any row of `summary` (a table with a `status` column, or
+`nothing`) has status `"failed"`, after printing how many to `stderr`. A worker that exits 0 has run
+every unit it claimed without a failure, which is what a launcher's own exit status is built from.
+"""
+function exit_on_failures(summary, what::AbstractString)
+    summary === nothing && return nothing
+    n = isempty(summary) ? 0 : count(==("failed"), summary.status)
+    n == 0 && return nothing
+    println(stderr, "$n $what failed; see the log and the summary for each error")
+    flush(stderr)
+    exit(1)
+end

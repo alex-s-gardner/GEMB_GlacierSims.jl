@@ -28,8 +28,12 @@
 # correction to a different model. Every tile is therefore checked against its file in
 # REFERENCE_TILE_DIR before any forcing is read, and a disagreement throws.
 #
-# Run one block:  julia --project=. -t 1 scripts/gemb_native_run.jl [start_year] [end_year]
-# Run them all:   scripts/run_native_sweep.sh [start_year] [end_year]
+# Run one block:  julia --project=. -t 1 scripts/gemb_native_run.jl [start] [end]
+# Run them all:   scripts/run_native_sweep.sh [start] [end]
+#
+# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year or an ISO
+# date-time, defaulting to 1950 and the end of the cached ERA5-Land record. The process exits with
+# status 1 when any cell or tile it ran failed.
 #
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # FORCING_CORRECTIONS, REFERENCE_TILE_DIR, OUTPUT_DIR, CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS,
@@ -67,9 +71,8 @@ const CORRECTION_MAX_DISTANCE_KM = parse(Float64, get(ENV, "CORRECTION_MAX_DISTA
 # the reference check compares, so a change here is a change of experiment.
 const TILE_SIZE = 2
 const BUFFER = 1
-const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 1950
-const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2027
-const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
+const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const TIME_RANGE = RUN_TIME.time_range
 const SPINUP_SIMULATION_YEARS_MAXIMUM = 500.0
 const SPINUP_DRIFT_FAC = 1e-2
 const SPINUP_CLIMATOLOGY_WINDOW = (DateTime(1950, 1, 1), DateTime(1980, 12, 31))
@@ -94,7 +97,7 @@ const NATIVE_BLOCK = haskey(ENV, "NATIVE_BLOCK") ? parse(Int, ENV["NATIVE_BLOCK"
 
 function settings_rows()
     return [
-        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         setting("output frequency", OUTPUT_FREQUENCY),
         env_setting("forcing corrections", FORCING_CORRECTIONS, "FORCING_CORRECTIONS"),
@@ -430,8 +433,8 @@ end
 # The tile sweep's `tile_run_disposition`, for a cell. One difference: a cell file holds the bands that
 # were runnable, which may be fewer than the cell's populated bands (a band whose forcing the validator
 # refuses is dropped and recorded as such), so the stored bands need only be a subset of the cell's.
-# Coverage is judged against the last forcing step in `run_time`, not the end of `TIME_RANGE`, which
-# lies beyond the available record.
+# Coverage is judged against the last forcing step in `run_time` with the tolerance of one output
+# period, because a coarser output grid never lands on the last forcing step.
 function cell_run_disposition(status, requested, run_time, centers, correction, mp)
     status === nothing && return :rebuild
     (status.n_timesteps == 0 || status.time === nothing) && return :rebuild
@@ -495,4 +498,4 @@ function summary_row(cell, tile_name, status, seconds; run = nothing, correction
             error)
 end
 
-main()
+exit_on_failures(main(), "cells or tiles")

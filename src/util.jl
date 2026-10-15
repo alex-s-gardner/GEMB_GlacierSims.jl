@@ -448,3 +448,92 @@ function _crc_files(dir, files, crc::UInt32)
     end
     return crc
 end
+
+"""
+    era5_land_record_span(cache_path) -> (; start, stop)
+
+The first and last hourly stamps of the ERA5-Land record held in the disk cache at `cache_path`, the
+`cache_path` passed to `climate_forcing`, read from the cached Zarr metadata and time axes alone.
+
+`climate_forcing` serves a cached record as it was when the cache was first filled and refuses any
+request past its end, so this is the latest end a run against the cache can ask for. Throws when a
+variable group is missing from the cache, when its time axis cannot be read in full, when it is not
+strictly increasing in whole hours, when its variables are not all as long as its time axis, or when
+the groups disagree on the record: each of those is a cache `climate_forcing` would also refuse.
+"""
+function era5_land_record_span(cache_path::AbstractString)
+    isdir(cache_path) || throw(ArgumentError("no ERA5-Land disk cache at $cache_path"))
+    spans = Dict{String,Tuple{DateTime,DateTime,Int}}()
+    for group in sort!(collect(keys(GEMB_ClimateForcing.ERA5_LAND_STORES)))
+        spans[group] = _cached_group_span(joinpath(cache_path, group))
+    end
+    distinct = unique(values(spans))
+    length(distinct) == 1 || throw(ArgumentError(
+        "the ERA5-Land variable groups cached under $cache_path disagree on the record " *
+        "($(join(["$g: $(s[1]) to $(s[2]), $(s[3]) steps" for (g, s) in sort!(collect(spans))], "; ")))" *
+        ", so they were cached at different times; `climate_forcing` refuses such a cache"))
+    start, stop, _ = only(distinct)
+    return (; start, stop)
+end
+
+function _cached_group_span(dir)
+    isfile(joinpath(dir, ".zmetadata")) || throw(ArgumentError(
+        "the ERA5-Land cache has no consolidated metadata at $dir; load forcing through " *
+        "`climate_forcing` with this cache_path once to fill it"))
+    g = Zarr.zopen(Zarr.DirectoryStore(dir); consolidated = true, fill_as_missing = false)
+    haskey(g.arrays, "time") || throw(ArgumentError("the cached group $dir has no time axis"))
+    t = g["time"]
+    units = get(t.attrs, "units", "")
+    m = match(r"hours since (\d{4}-\d{2}-\d{2})", units)
+    m === nothing && throw(ArgumentError(
+        "the time axis of $dir is in \"$units\", not hours since a date"))
+    epoch = DateTime(m.captures[1])
+    hours = try
+        collect(Float64, t[:])
+    catch e
+        e isa InterruptException && rethrow()
+        throw(ArgumentError("the time axis of $dir cannot be read in full from the cache " *
+                            "($(sprint(showerror, e)))"))
+    end
+    isempty(hours) && throw(ArgumentError("the time axis of $dir is empty"))
+    all(isfinite, hours) && all(isinteger, hours) && all(>(0), diff(hours)) || throw(ArgumentError(
+        "the time axis of $dir is not strictly increasing in whole hours"))
+    for (name, a) in g.arrays
+        ndims(a) == 3 || continue
+        size(a, 3) == length(hours) || throw(ArgumentError(
+            "variable $name in $dir has $(size(a, 3)) time steps against $(length(hours)) on the " *
+            "time axis"))
+    end
+    return (epoch + Hour(Int(first(hours))), epoch + Hour(Int(last(hours))), length(hours))
+end
+
+"""
+    run_time_range(args, record; start_default = DateTime(1950, 1, 1)) -> (; time_range, source)
+
+The `(start, stop)` a run script covers, from its command-line `args` and the forcing `record`
+(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns). `args[1]` is the start and `args[2]`
+the end, each a year (that year's 1 January, 00:00) or an ISO date-time such as
+`2026-08-14T23:00:00`. Without `args[2]` the run ends at the end of the record. Throws when the range
+is empty or reaches outside the record, naming the record, so a run refuses at start-up rather than
+in every tile. `source` says where each end came from, for the settings table.
+"""
+function run_time_range(args, record; start_default::DateTime = DateTime(1950, 1, 1))
+    start = length(args) >= 1 ? _parse_run_time(args[1]) : start_default
+    stop = length(args) >= 2 ? _parse_run_time(args[2]) : record.stop
+    start < stop || throw(ArgumentError("the run starts at $start, not before its end $stop"))
+    (record.start <= start && stop <= record.stop) || throw(ArgumentError(
+        "the run $start to $stop reaches outside the cached ERA5-Land record, which runs from " *
+        "$(record.start) to $(record.stop); end the run at or before $(record.stop), or refresh " *
+        "the cache"))
+    source = (length(args) >= 1 ? "start from ARGS" : "start default") * ", " *
+             (length(args) >= 2 ? "end from ARGS" : "end of the cached record")
+    return (; time_range = (start, stop), source)
+end
+
+function _parse_run_time(s::AbstractString)
+    occursin(r"^\d{4}$", s) && return DateTime(parse(Int, s), 1, 1)
+    t = tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year nor an ISO date-time such as 2026-08-14T23:00:00"))
+    return t
+end

@@ -12,7 +12,11 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Forcing is cached as Zarr
 # chunks under `CLIMATE_CACHE` and shared between tiles, which is why tiles are visited in chunk order.
 #
-# Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start_year] [end_year]
+# Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start] [end]
+#
+# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year or an ISO
+# date-time, defaulting to 1950 and the end of the cached ERA5-Land record, so a derivation with no
+# arguments fits the window the sweep runs. The process exits with status 1 when any tile failed.
 #
 # Sizing, measured on the 47,121-cell global table at the 2°/1° default: 819 non-empty tiles,
 # ~170,000 cell forcing loads, ~60 MB per tile of fits before compression at the full 1950-2026
@@ -58,14 +62,6 @@ const DERIVE_ALBEDO = get(ENV, "DERIVE_ALBEDO", "1") == "1"
 # bias-correction sweep needs to read the forcing rather than re-derive it.
 const RETAIN_ELEVATION_INTERVAL_FORCING = false
 
-# Default window: two full years, enough for a seasonal cycle with a second year to show it repeats.
-# Widen to the full record (1950, 2027) once a global pass at this window looks right — a wider window
-# re-derives every tile, since a pooled cross-cell regression cannot be appended to.
-const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 2018
-const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2020
-const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
-
-
 const GI = GeoDataFrames.GeoInterface
 
 # Where the forcing cache and the tile outputs live. Kept outside the repo and off `tempdir()`: the
@@ -73,6 +69,13 @@ const GI = GeoDataFrames.GeoInterface
 # with `ENV["CLIMATE_CACHE"]` on a machine without this mount.
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
                           joinpath(BASE_CLIMATE_DIR, string(CLIMATE_MODEL)))
+
+# The fit window. The full record by default, which is the window the tile sweep runs: a different
+# window resolves the parameters on the climatology path there, and a wider window re-derives every
+# tile, since a pooled cross-cell regression cannot be appended to. Pass a shorter window, such as
+# 2018 2020, for a timing probe.
+const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const TIME_RANGE = RUN_TIME.time_range
 
 const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
 # Overridable so a timing probe can share the forcing cache without writing files the production sweep
@@ -118,7 +121,7 @@ const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? Set(split(ENV["TILE_NAMES"], ",")
 # going to do.
 function settings_rows()
     return [
-        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         setting("minimum cells to fit", MIN_CELLS),
         setting("minimum cell glacier area", "$(AREA_MINIMUM) km²"),
@@ -219,4 +222,4 @@ function main()
     return summary
 end
 
-main()
+exit_on_failures(main(), "tiles")

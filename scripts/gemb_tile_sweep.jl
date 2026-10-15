@@ -16,8 +16,13 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and the parameter tiles. Forcing is read
 # from the shared Zarr cache under `CLIMATE_CACHE`, so tiles are visited in chunk order.
 #
-# Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start_year] [end_year]
-# Run the sweep:  scripts/run_tile_sweep.sh [start_year] [end_year]
+# Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start] [end]
+# Run the sweep:  scripts/run_tile_sweep.sh [start] [end]
+#
+# `start` and `end` are each a year (its 1 January, 00:00) or an ISO date-time. `start` defaults to
+# 1950 and `end` to the last step of the cached ERA5-Land record, which is read at start-up; a range
+# reaching outside the cached record is refused then, before any tile is claimed. The process exits with
+# status 1 when any tile it claimed failed.
 #
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
@@ -59,9 +64,10 @@ const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "tile_runs"))
 const TILE_SIZE = 2
 const BUFFER = 1
 
-const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 1950
-const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2027
-const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
+# `climate_forcing` refuses a request past the end of the cached record, so the run ends at that end
+# unless told otherwise, and a range the cache cannot serve fails here rather than in every tile.
+const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const TIME_RANGE = RUN_TIME.time_range
 
 # The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
 # at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
@@ -212,7 +218,7 @@ end
 # What this run is configured to do, for the log and for the terminal that launched it.
 function settings_rows()
     return [
-        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         env_setting("output frequency", OUTPUT_FREQUENCY, "OUTPUT_FREQUENCY"),
         env_setting("temperature offsets (K)", DELTA_TEMPERATURES, "DELTA_TEMPERATURES"),
@@ -585,4 +591,4 @@ function summary_row(tile, name, status, seconds; run = nothing,
             error)
 end
 
-main()
+exit_on_failures(main(), "tiles")

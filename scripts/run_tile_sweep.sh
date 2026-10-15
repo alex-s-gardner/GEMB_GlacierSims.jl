@@ -3,7 +3,11 @@
 # Run the whole (temperature offset x precipitation scaling) sweep over every glacierized 2 degree
 # tile, as TILE_BLOCKS concurrent single-threaded processes.
 #
-#   scripts/run_tile_sweep.sh [start_year] [end_year]
+#   scripts/run_tile_sweep.sh [start] [end]
+#
+# `start` and `end` are each a year or an ISO date-time; without `end` the sweep ends at the last step of
+# the cached ERA5-Land record (see gemb_tile_sweep.jl). Exits non-zero when any worker exits non-zero,
+# which a worker does when any tile it claimed failed, and reports how many tiles failed.
 #
 # One thread per process, one process per physical core. A GEMB spinup cycle allocates about 100 MiB and
 # Julia's collector is per-process and stops every thread, so threads inside one process contend for the
@@ -37,8 +41,10 @@
 
 set -uo pipefail
 
-START_YEAR="${1:-1950}"
-END_YEAR="${2:-2027}"
+# The run's ends, passed through to every worker; the end is left to the workers, which default it to
+# the end of the cached record.
+run_args=("${1:-1950}")
+[ -n "${2:-}" ] && run_args+=("$2")
 # One process per core, less headroom. 96 of 128 leaves room for other work on the machine and for the
 # page cache the Zarr reads live in; raise it when the machine is otherwise idle.
 BLOCKS="${TILE_BLOCKS:-96}"
@@ -61,8 +67,8 @@ LOG_DIR="$CLIMATE_CACHE/tile_runs/logs"
 heap_args=()
 [ -n "${HEAP_SIZE_HINT:-}" ] && heap_args=(--heap-size-hint="$HEAP_SIZE_HINT")
 
-TILE_BLOCKS="$BLOCKS" SHOW_SETTINGS=1 "$JULIA" --project="$REPO" --startup-file=no -t 1 "${heap_args[@]}" \
-    "$REPO/scripts/gemb_tile_sweep.jl" "$START_YEAR" "$END_YEAR" ||
+TILE_BLOCKS="$BLOCKS" SHOW_SETTINGS=1 "$JULIA" --project="$REPO" --startup-file=no -t 1 ${heap_args[@]+"${heap_args[@]}"} \
+    "$REPO/scripts/gemb_tile_sweep.jl" "${run_args[@]}" ||
     { echo "settings pass failed; nothing launched" >&2; exit 1; }
 
 mkdir -p "$LOG_DIR"
@@ -82,14 +88,14 @@ if pgrep -f "$REPO/scripts/gemb_tile_sweep.jl" > /dev/null; then
     exit 1
 fi
 rm -rf "$CLIMATE_CACHE/tile_runs/claims"
-echo "sweep $START_YEAR-$END_YEAR over $BLOCKS blocks; logs in $LOG_DIR"
+echo "sweep ${run_args[*]} over $BLOCKS blocks; logs in $LOG_DIR"
 
 pids=()
 for i in $(seq 1 "$BLOCKS"); do
     log="$LOG_DIR/block_$(printf '%03d' "$i")of$BLOCKS.log"
     TILE_BLOCKS="$BLOCKS" TILE_BLOCK="$i" FORCING_CACHE_GIB="${FORCING_CACHE_GIB:-1}" \
-        "$JULIA" --project="$REPO" --startup-file=no -t 1 "${heap_args[@]}" \
-        "$REPO/scripts/gemb_tile_sweep.jl" "$START_YEAR" "$END_YEAR" > "$log" 2>&1 &
+        "$JULIA" --project="$REPO" --startup-file=no -t 1 ${heap_args[@]+"${heap_args[@]}"} \
+        "$REPO/scripts/gemb_tile_sweep.jl" "${run_args[@]}" > "$log" 2>&1 &
     pids+=($!)
 done
 
@@ -107,7 +113,11 @@ echo "blocks finished: $(( ${#pids[@]} - failed )) ok, $failed non-zero exit"
 printf 'tiles written  : %s\n' "$(grep -ah 'Wrote tile' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles extended : %s\n' "$(grep -ah 'Extended tile' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles skipped  : %s\n' "$(grep -ah 'already covers the request' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
-printf 'tiles failed   : %s\n' "$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
+tiles_failed=$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l | tr -d ' ')
+printf 'tiles failed   : %s\n' "$tiles_failed"
 echo "summaries      : $CLIMATE_CACHE/tile_runs/tile_runs_summary_block*of$BLOCKS.parquet"
 
-[ "$failed" -eq 0 ] || exit 1
+if [ "$failed" -ne 0 ] || [ "$tiles_failed" -ne 0 ]; then
+    echo "sweep incomplete: $tiles_failed tile(s) failed, $failed block(s) exited non-zero" >&2
+    exit 1
+fi
