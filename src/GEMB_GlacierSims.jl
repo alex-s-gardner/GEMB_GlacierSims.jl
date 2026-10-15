@@ -15,6 +15,7 @@ using GEMB_ClimateForcing
 using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
                            decoupling_factor_at_elevation,
                            _decouple_per_timestep, _ambient_forcing,
+                           _glacier_offset_at_elevation, _corrects_to_ambient,
                            _downscaling_sums, _accumulate_downscaling_cell!,
                            _cell_forcing_at_interval, _FORCING_VARIABLES,
                            _MIN_CELLS_DEFAULT, _DECOUPLING_FACTOR_LIMITS,

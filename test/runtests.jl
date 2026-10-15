@@ -2625,15 +2625,15 @@ end
             # untouched between these two tables, so a dependence on it could not show up here.
             #
             # Two conditions have to hold for `glm` to be observable at all, and both are asserted
-            # below rather than assumed: `k` must not be the identity, since the ice-free correction
-            # scales with `1 - k`, and the band must be above freezing, since the correction scales
-            # `max(T - 273.15, 0)`.
+            # below rather than assumed: the fit's glacier term must not be zero, since the ice-free
+            # correction is `glm` times it, and the band must be above freezing, since the correction
+            # acts only on the excess above 273.15 K.
             half = [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
                     for b in applied.bands]
             applied_k = GEMB_GlacierSims.AppliedDownscaling(
                 applied.time, applied.lapse_rate, applied.lapse_rate_source, half,
                 applied.basis, applied.settings, Dict{String,Any}(),
-                z -> fill(0.5, length(applied.time)))
+                z -> fill(-2.0, length(applied.time)))
             hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
             hot_hole(c) = c.lon == 10.1 ? masked(c) : hot(c)
 
@@ -3271,7 +3271,7 @@ end
             applied0.time, applied0.lapse_rate, applied0.lapse_rate_source,
             [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
              for b in applied0.bands],
-            applied0.basis, applied0.settings, applied0.provenance, applied0.decoupling_at)
+            applied0.basis, applied0.settings, applied0.provenance, applied0.glacier_offset_at)
         tile = only(downscaling_tiles(table; tile_size = 2, buffer = 1))
 
         @testset "native_cells splits a tile into one-cell tiles" begin
