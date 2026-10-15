@@ -47,6 +47,10 @@ LOG_DIR="$CLIMATE_CACHE/downscaling_parameters/logs"
 [ -f "$REPO/data/era5land_glacier_elevation_classes.parquet" ] ||
     { echo "no elevation-class table under $REPO/data" >&2; exit 1; }
 
+# Put the invariant geopotential file in place before the workers start, or they race to download it.
+. "$REPO/scripts/restore_invariant.sh"
+restore_invariant "$JULIA" "$REPO" "$CLIMATE_CACHE" || { echo "nothing launched" >&2; exit 1; }
+
 mkdir -p "$LOG_DIR"
 
 # Claims are advisory and only meaningful while their worker lives, so a launcher that starts the whole

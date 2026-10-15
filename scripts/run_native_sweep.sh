@@ -37,17 +37,9 @@ SCRIPT="$REPO/scripts/gemb_native_run.jl"
 [ -d "$CLIMATE_CACHE/downscaling_parameters" ] ||
     { echo "no downscaling parameters under $CLIMATE_CACHE" >&2; exit 1; }
 
-# The invariant geopotential file is cached under the package's install directory, which a dependency
-# bump replaces; restore it before the workers start, or they race to download it (see CLAUDE.md).
-PKGDIR=$("$JULIA" --project="$REPO" --startup-file=no -e \
-    'using GEMB_ClimateForcing; print(pkgdir(GEMB_ClimateForcing))') ||
-    { echo "could not load GEMB_ClimateForcing" >&2; exit 1; }
-INVARIANT="geo_1279l4_0.1x0.1.grib2_v4_unpack.nc"
-if [ ! -f "$PKGDIR/data/invariant/era5_land/$INVARIANT" ]; then
-    mkdir -p "$PKGDIR/data/invariant/era5_land"
-    cp -a "$CLIMATE_CACHE/invariant/era5_land/$INVARIANT" "$PKGDIR/data/invariant/era5_land/" ||
-        { echo "could not restore the invariant geopotential file" >&2; exit 1; }
-fi
+# Put the invariant geopotential file in place before the workers start, or they race to download it.
+. "$REPO/scripts/restore_invariant.sh"
+restore_invariant "$JULIA" "$REPO" "$CLIMATE_CACHE" || { echo "nothing launched" >&2; exit 1; }
 
 heap_args=()
 [ -n "${HEAP_SIZE_HINT:-}" ] && heap_args=(--heap-size-hint="$HEAP_SIZE_HINT")

@@ -73,15 +73,15 @@ end
 end
 
 # A stand-in for `julia` that a launcher can drive without loading anything: the settings pass
-# succeeds, `-e` prints the package directory a launcher asks for, and each worker writes the log
-# line its block is told to (`STUB_FAIL_BLOCK` writes a tile failure) and exits with
-# `STUB_EXIT_<block>`, default 0.
+# succeeds, `-e` prints `STUB_INVARIANT_TARGET` (the invariant path a launcher asks for), and each
+# worker writes the log line its block is told to (`STUB_FAIL_BLOCK` writes a tile failure) and exits
+# with `STUB_EXIT_<block>`, default 0.
 function _stub_julia(dir)
     path = joinpath(dir, "julia")
     write(path, """
         #!/usr/bin/env bash
         for a in "\$@"; do
-            [ "\$a" = "-e" ] && { printf '%s' "\$STUB_PKGDIR"; exit 0; }
+            [ "\$a" = "-e" ] && { printf '%s' "\$STUB_INVARIANT_TARGET"; exit 0; }
         done
         [ "\${SHOW_SETTINGS:-0}" = "1" ] && exit 0
         block="\${TILE_BLOCK:-\${NATIVE_BLOCK:-1}}"
@@ -104,12 +104,13 @@ end
         dir = mktempdir()
         climate = mktempdir()
         mkpath(joinpath(climate, "downscaling_parameters"))
-        pkgdir_stub = mktempdir()
         invariant = joinpath(climate, "invariant", "era5_land")
         mkpath(invariant)
         write(joinpath(invariant, "geo_1279l4_0.1x0.1.grib2_v4_unpack.nc"), "stub")
+        target = joinpath(mktempdir(), "pkg", "data", "invariant", "era5_land",
+                          "geo_1279l4_0.1x0.1.grib2_v4_unpack.nc")
         env = ("JULIA" => _stub_julia(dir), "CLIMATE_CACHE" => climate, "TILE_BLOCKS" => "2",
-               "STUB_PKGDIR" => pkgdir_stub, "OUTPUT_DIR" => joinpath(climate, "out"))
+               "STUB_INVARIANT_TARGET" => target, "OUTPUT_DIR" => joinpath(climate, "out"))
         launch(extra...) = addenv(`bash $(joinpath(_REPO, "scripts", "run_tile_sweep.sh"))`,
                                   env..., extra...)
         run_quiet(cmd) = (err = IOBuffer(); ok = success(pipeline(cmd; stdout = devnull,
@@ -272,4 +273,33 @@ end
     append_glacier_tile_netcdf(path, later)
     @test read_glacier_tile_status(path).complete
     @test read_glacier_tile_status(path).n_timesteps == length(run.time) + 1
+end
+
+@testset "run launch: every launcher restores the invariant cache" begin
+    if Sys.which("bash") === nothing
+        @test_skip "bash is not available"
+    else
+        file = "geo_1279l4_0.1x0.1.grib2_v4_unpack.nc"
+        for launcher in ("run_tile_sweep.sh", "run_native_sweep.sh", "run_derive_parameters.sh")
+            climate = mktempdir()
+            mkpath(joinpath(climate, "downscaling_parameters"))
+            mkpath(joinpath(climate, "invariant", "era5_land"))
+            write(joinpath(climate, "invariant", "era5_land", file), "preserved")
+            target = joinpath(mktempdir(), "data", "invariant", "era5_land", file)
+            env = ("JULIA" => _stub_julia(mktempdir()), "CLIMATE_CACHE" => climate,
+                   "TILE_BLOCKS" => "1", "NATIVE_BLOCKS" => "1", "STUB_INVARIANT_TARGET" => target,
+                   "OUTPUT_DIR" => joinpath(climate, "out"))
+            launch() = addenv(`bash $(joinpath(_REPO, "scripts", launcher))`, env...)
+            # The preserved copy is put in place, once, before any worker starts.
+            @test success(pipeline(launch(); stdout = devnull, stderr = devnull))
+            @test read(target, String) == "preserved"
+            @test !isfile(target * ".part")
+            # With no preserved copy and a download that produces nothing, nothing is launched.
+            rm(target)
+            rm(joinpath(climate, "invariant"); recursive = true)
+            err = IOBuffer()
+            @test !success(pipeline(launch(); stdout = devnull, stderr = err))
+            @test occursin("nothing launched", String(take!(err)))
+        end
+    end
 end

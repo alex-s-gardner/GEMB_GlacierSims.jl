@@ -60,6 +60,10 @@ LOG_DIR="$CLIMATE_CACHE/tile_runs/logs"
 [ -d "$CLIMATE_CACHE/downscaling_parameters" ] ||
     { echo "no downscaling parameters under $CLIMATE_CACHE; run derive_downscaling_parameter_tiles.jl first" >&2; exit 1; }
 
+# Put the invariant geopotential file in place before the workers start, or they race to download it.
+. "$REPO/scripts/restore_invariant.sh"
+restore_invariant "$JULIA" "$REPO" "$CLIMATE_CACHE" || { echo "nothing launched" >&2; exit 1; }
+
 # Julia sizes its GC heap target from total physical memory, so each of TILE_BLOCKS workers defers
 # collection as though it owned the machine alone and the collective high-water mark ratchets up over a
 # multi-day run. A hint bounds each worker instead, trading more frequent collection for a predictable

@@ -37,16 +37,15 @@ content-hash slug (`~/.julia/packages/GEMB_ClimateForcing/<slug>/`), so **any `P
 `data/invariant/era5_land/` starts empty, and every worker that starts after the bump tries to
 redownload it. Starting several workers at once at that moment hits a known race
 (`rename(...): no such file or directory`) — one wins, the rest fail that tile and exit. A copy
-is preserved at `$CLIMATE_CACHE/invariant/era5_land/`; after a dependency bump (or a reboot, which
-has the same effect on other `tempdir()`-cached state in this repo), restore it into the *current*
-slug's path before launching workers:
+is preserved at `$CLIMATE_CACHE/invariant/era5_land/`. The three launchers (`run_tile_sweep.sh`,
+`run_native_sweep.sh`, `run_derive_parameters.sh`) put it into the *current* path before starting any
+worker (`scripts/restore_invariant.sh`, which copies the preserved file or, failing that, downloads it
+once). Workers started by hand after a dependency bump (or a reboot, which has the same effect on other
+`tempdir()`-cached state in this repo) need the same done first:
 
 ```sh
-PKGDIR=$(~/.juliaup/bin/julia +release --project=. -e \
-  'using GEMB_ClimateForcing; print(pkgdir(GEMB_ClimateForcing))')
-mkdir -p "$PKGDIR/data/invariant/era5_land"
-cp -a /mnt/bylot-r3/data/era5land/invariant/era5_land/geo_1279l4_0.1x0.1.grib2_v4_unpack.nc \
-      "$PKGDIR/data/invariant/era5_land/"
+. scripts/restore_invariant.sh
+restore_invariant ~/.juliaup/bin/julia . /mnt/bylot-r3/data/era5land
 ```
 
 Low stakes either way — it is one 50 MB file from a plain HTTP URL, not a CDS-queued request.
