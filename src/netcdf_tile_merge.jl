@@ -66,20 +66,24 @@ function merge_tile_perturbations(out_path::AbstractString,
         n_layers = maximum(ds.dim["layer"] for ds in datasets)
 
         mkpath(dirname(abspath(out_path)))
-        NCDatasets.NCDataset(out_path, "c") do out
-            _copy_tile_dims!(out, first(datasets), length(merged), n_layers)
-            _copy_tile_globals!(out, datasets, paths, offsets, merged, target)
-            _merge_group!(out, datasets, target, merged)
+        # Written beside `out_path` and renamed into place when whole, as the tile writer does.
+        _write_atomically(out_path) do tmp
+            NCDatasets.NCDataset(tmp, "c") do out
+                _copy_tile_dims!(out, first(datasets), length(merged), n_layers)
+                _copy_tile_globals!(out, datasets, paths, offsets, merged, target)
+                _merge_group!(out, datasets, target, merged)
 
-            # The restart group is state rather than series, but it is indexed by offset like everything
-            # else, so a merged file that omitted it would be unrestartable at exactly the new points.
-            if haskey(first(datasets).group, "restart")
-                gout = NCDatasets.defGroup(out, "restart")
-                gsrc = [ds.group["restart"] for ds in datasets]
-                for (k, v) in first(gsrc).attrib
-                    gout.attrib[k] = v
+                # The restart group is state rather than series, but it is indexed by offset like
+                # everything else, so a merged file that omitted it would be unrestartable at exactly
+                # the new points.
+                if haskey(first(datasets).group, "restart")
+                    gout = NCDatasets.defGroup(out, "restart")
+                    gsrc = [ds.group["restart"] for ds in datasets]
+                    for (k, v) in first(gsrc).attrib
+                        gout.attrib[k] = v
+                    end
+                    _merge_group!(gout, gsrc, target, merged)
                 end
-                _merge_group!(gout, gsrc, target, merged)
             end
         end
     finally

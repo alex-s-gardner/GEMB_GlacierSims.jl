@@ -30,8 +30,12 @@ const TILE_TOTAL_UNITS = Dict{Symbol,String}(
 """
     write_glacier_tile_netcdf(path, run::GlacierTileRun; kwargs...) -> path
 
-Write a [`GlacierTileRun`](@ref) to a CF-1.11 netCDF-4 file at `path`, overwriting any existing file.
+Write a [`GlacierTileRun`](@ref) to a CF-1.11 netCDF-4 file at `path`, replacing any existing file.
 The `time` dimension is unlimited so [`append_glacier_tile_netcdf`](@ref) can extend it.
+
+The file is written to `path * ".part"` and renamed onto `path` only once it is whole, with its
+`file_complete` attribute set, so a file at `path` is never a partial one: a writer that dies leaves the
+previous file, or none, in place.
 
 `precision` sets the element type of the band-resolved series, which are the bulk of the file — a
 60-band tile over the full record at 8 perturbations each way is the dominant cost. The tile totals and
@@ -47,21 +51,46 @@ function write_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun;
     mkpath(dirname(abspath(path)))
     n_layer = _max_profile_length(run.profiles)
 
-    NCDatasets.NCDataset(path, "c") do ds
-        NCDatasets.defDim(ds, "time", Inf)          # unlimited, for append
-        NCDatasets.defDim(ds, "band", length(run.bands))
-        NCDatasets.defDim(ds, "delta_temperature", length(run.delta_temperatures))
-        NCDatasets.defDim(ds, "precipitation_scaling", length(run.precipitation_scalings))
-        NCDatasets.defDim(ds, "layer", n_layer)
+    return _write_atomically(path) do tmp
+        NCDatasets.NCDataset(tmp, "c") do ds
+            NCDatasets.defDim(ds, "time", Inf)          # unlimited, for append
+            NCDatasets.defDim(ds, "band", length(run.bands))
+            NCDatasets.defDim(ds, "delta_temperature", length(run.delta_temperatures))
+            NCDatasets.defDim(ds, "precipitation_scaling", length(run.precipitation_scalings))
+            NCDatasets.defDim(ds, "layer", n_layer)
 
-        _write_tile_run_globals!(ds, run; institution, references)
-        _write_tile_run_coordinates!(ds, run, n_layer)
-        _write_tile_run_provenance!(ds, run)
-        _write_tile_band_series!(ds, run, precision, deflatelevel)
-        _write_tile_totals!(ds, run, deflatelevel)
-        _write_tile_restart_group!(ds, run, n_layer)
+            _write_tile_run_globals!(ds, run; institution, references)
+            _write_tile_run_coordinates!(ds, run, n_layer)
+            _write_tile_run_provenance!(ds, run)
+            _write_tile_band_series!(ds, run, precision, deflatelevel)
+            _write_tile_totals!(ds, run, deflatelevel)
+            _write_tile_restart_group!(ds, run, n_layer)
+        end
     end
+end
 
+# The global attribute that marks a tile file as whole. Set last, on the temporary file, before it is
+# renamed into place.
+const TILE_FILE_COMPLETE = "file_complete"
+
+# Build the file at `path` by `f(tmp)` on `tmp = path * ".part"` (a copy of `copy_from` when given),
+# mark it complete and rename it onto `path`. The rename is atomic on POSIX within one filesystem, so a
+# reader sees the old file or the new one, never a partial one; on failure the temporary file is
+# removed and `path` is left as it was.
+function _write_atomically(f, path::AbstractString; copy_from = nothing)
+    tmp = path * ".part"
+    rm(tmp; force = true)
+    try
+        copy_from === nothing || cp(copy_from, tmp)
+        f(tmp)
+        NCDatasets.NCDataset(tmp, "a") do ds
+            ds.attrib[TILE_FILE_COMPLETE] = "true"
+        end
+    catch
+        rm(tmp; force = true)
+        rethrow()
+    end
+    Base.Filesystem.rename(tmp, path)
     return path
 end
 
@@ -75,6 +104,9 @@ The new record must start strictly after the file's last time, and the run grid 
 deltas, precipitation scalings) must match the file's — a mismatch means the arrays would not line up,
 so it is refused rather than reconciled.
 
+The extended file is built on a copy at `path * ".part"` and renamed onto `path` once whole, so an
+append that fails or is interrupted leaves the file as it was.
+
 A continuation's cumulative series start from its own seam, so each is offset by the file's last
 stored value of the same series: the band-resolved `dh`, `dh_mass`, `dh_water`, `dh_firn` and
 `dh_residual`, and every `total_*` except the state `total_fac`. A run slot with no stored value at the
@@ -84,6 +116,11 @@ weighted by the forcing steps of each segment, and a per-step count (`band_*_n_<
 `band_n_timesteps_above_freezing`) is summed. `max_dh_residual` becomes the larger of the two.
 """
 function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
+    isfile(path) || throw(ArgumentError("no tile file to append to at $path"))
+    return _write_atomically(tmp -> _append_glacier_tile!(tmp, run), path; copy_from = path)
+end
+
+function _append_glacier_tile!(path, run::GlacierTileRun)
     NCDatasets.NCDataset(path, "a") do ds
         n_existing = length(ds["time"])
         last_time = _nc_decode_time(ds["time"][n_existing])
@@ -188,10 +225,13 @@ end
     read_glacier_tile_status(path) -> NamedTuple or nothing
 
 What an existing tile file already covers, read from its coordinates and attributes only — **no series
-and no firn state**. `nothing` when the file does not exist.
+and no firn state**. `nothing` when the file does not exist, and `(; complete = false, reason)` when it
+cannot be read or does not carry the `file_complete` mark the writers set last, which is what a partial
+or truncated file looks like.
 
-Returns `(; time, n_timesteps, band_centers, band_edges, delta_temperatures, precipitation_scalings,
-geotile_id, parameters, dropped_band_centers, hypsometry_area_km2, lost_area_km2)`. `time` is the last
+Otherwise returns `(; complete = true, time, n_timesteps, band_centers, band_edges, delta_temperatures,
+precipitation_scalings, geotile_id, parameters, dropped_band_centers, hypsometry_area_km2,
+lost_area_km2)`. `time` is the last
 output time in the file, i.e. the point a continuation must start after. `band_edges` holds each
 stored band's `(lo, hi)`. `dropped_band_centers` lists the intervals holding ice that the run did not
 model (empty when it dropped none), and the two areas are the run's lost-ice accounting in km²
@@ -203,10 +243,22 @@ a re-run cost a file open per tile instead of a forcing pass.
 """
 function read_glacier_tile_status(path::AbstractString)
     isfile(path) || return nothing
+    return try
+        _read_glacier_tile_status(path)
+    catch e
+        e isa InterruptException && rethrow()
+        (; complete = false, reason = "unreadable: " * sprint(showerror, e))
+    end
+end
+
+function _read_glacier_tile_status(path)
     return NCDatasets.NCDataset(path, "r") do ds
+        get(ds.attrib, TILE_FILE_COMPLETE, "") == "true" ||
+            return (; complete = false, reason = "no $(TILE_FILE_COMPLETE) mark")
         n = length(ds["time"])
         area(key) = haskey(ds.attrib, key) ? Float64(ds.attrib[key]) : missing
-        (; time = n == 0 ? nothing : _nc_decode_time(ds["time"][n]),
+        (; complete = true,
+         time = n == 0 ? nothing : _nc_decode_time(ds["time"][n]),
          n_timesteps = n,
          band_centers = collect(Float64, ds["band_center"][:]),
          band_edges = collect(zip(collect(Float64, ds["band_lower"][:]),
@@ -236,7 +288,8 @@ What an existing tile or native-cell file is worth to a request, from its
 
 `requested` is the [`tile_run_parameters`](@ref) of the run about to happen, `run_time` its forcing
 time axis, and `intervals` the elevation intervals (each with a `center`) the request's hypsometry
-holds ice in. The file is the same experiment when its perturbation grid is the requested one, its run
+holds ice in. A partial or unreadable file (`status.complete` false) is rebuilt. The file is the same
+experiment when its perturbation grid is the requested one, its run
 parameters agree with `requested`, and every interval holding ice is accounted for: a band the file
 stores, or a dropped interval it records (`dropped_band_centers`). A file whose bands are a subset of
 the intervals is therefore current when the rest were dropped and recorded as such. A file that does
@@ -251,6 +304,7 @@ function tile_run_disposition(status, requested, run_time, intervals; delta_temp
                               precipitation_scalings, output_frequency::Symbol,
                               lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM)
     status === nothing && return :rebuild
+    status.complete || return :rebuild
     (status.n_timesteps == 0 || status.time === nothing) && return :rebuild
     # The run grid: a band set or perturbation grid other than this request's means the stored arrays
     # describe something else, and no seam could join them.

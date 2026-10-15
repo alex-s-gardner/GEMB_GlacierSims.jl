@@ -222,3 +222,54 @@ end
     @test output_period_bound(:all) === nothing
     @test_throws "no output period is known for output_frequency = :hourly" output_period_bound(:hourly)
 end
+
+@testset "run launch: partial files are rebuilt" begin
+    # Spec 11. Every writer builds the file beside its path and renames it into place when whole, with
+    # the `file_complete` mark set last. A truncated file, or one without the mark, is rebuilt; it does
+    # not throw before `FORCE` is consulted and is never taken as current.
+    run = _fake_tile_run()
+    merge!(run.provenance, Dict{String,Any}("hypsometry_area_km2" => 55.75, "lost_area_km2" => 0.0))
+    intervals = [(; center = b.center) for b in run.bands]
+    grid = (; delta_temperatures = run.delta_temperatures,
+            precipitation_scalings = run.precipitation_scalings, output_frequency = :monthly)
+    disposition(path) = tile_run_disposition(read_glacier_tile_status(path), run.parameters,
+                                             run.time, intervals; grid...)
+    dir = mktempdir()
+    path = write_glacier_tile_netcdf(joinpath(dir, "t.nc"), run)
+    @test readdir(dir) == ["t.nc"]                         # no temporary file left behind
+    @test read_glacier_tile_status(path).complete
+    @test disposition(path) === :current
+
+    truncated = joinpath(dir, "truncated.nc")
+    write(truncated, read(path)[1:(filesize(path) ÷ 2)])
+    status = read_glacier_tile_status(truncated)
+    @test !status.complete
+    @test startswith(status.reason, "unreadable")
+    @test disposition(truncated) === :rebuild
+
+    unmarked = cp(path, joinpath(dir, "unmarked.nc"))
+    NCDatasets.NCDataset(ds -> delete!(ds.attrib, "file_complete"), unmarked, "a")
+    @test read_glacier_tile_status(unmarked) == (; complete = false, reason = "no file_complete mark")
+    @test disposition(unmarked) === :rebuild
+
+    # An append that fails part-way, after the time axis and the series were extended, leaves the file
+    # as it was: here the continuation's columns are deeper than the file's layer dimension.
+    deeper = _fake_tile_run(; time = [last(run.time) + Month(1)])
+    deeper.profiles[1, 1, 1] = _fake_profile(50, 1.0)
+    before = read(path)
+    @test_throws "continuation profiles are deeper" append_glacier_tile_netcdf(path, deeper)
+    @test read(path) == before
+    @test !isfile(path * ".part")
+    # And a write that fails part-way leaves the previous file in place.
+    broken = _fake_tile_run()
+    broken.profiles[1, 1, 1] = DimStack((dz = DimArray([1.0], (Z(1:1),)),))  # lacks most state layers
+    @test_throws Exception write_glacier_tile_netcdf(path, broken)
+    @test read(path) == before
+    @test !isfile(path * ".part")
+    @test disposition(path) === :current
+    # A successful append keeps the mark.
+    later = _fake_tile_run(; time = [last(run.time) + Month(1)])
+    append_glacier_tile_netcdf(path, later)
+    @test read_glacier_tile_status(path).complete
+    @test read_glacier_tile_status(path).n_timesteps == length(run.time) + 1
+end

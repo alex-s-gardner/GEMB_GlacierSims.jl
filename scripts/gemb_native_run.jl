@@ -266,7 +266,7 @@ function run_native_unit(unit, mp, corrections; token, cache)
     assert_matches_reference(reference, tile.name, requested)
     # The bands the reference tile run modelled: an interval it dropped is dropped from every cell, so
     # the two runs drop the same intervals.
-    modelled_intervals = read_glacier_tile_status(reference).band_edges
+    modelled_intervals = reference_status(reference).band_edges
     prior = decoupling_factor_prior(tile.core)
 
     mkpath(tile_dir)
@@ -346,12 +346,21 @@ function check_tile_lost_area(tile, tile_name, intervals)
                        lost_area_km2 = total.lost_area_km2, error = message)
 end
 
+# A reference tile file's status, which must be a whole file: the native run takes its settings and
+# its band set from it.
+function reference_status(reference)
+    status = read_glacier_tile_status(reference)
+    status.complete || error("the reference tile run $reference is not a complete file " *
+                             "($(status.reason)); rebuild it in the tile sweep")
+    return status
+end
+
 # The settings this tile is about to run under, against those stored in the tile sweep the correction
 # was fitted to. `run_parameter_differences` reports a key either side lacks as well as a changed value,
 # so this catches a changed model parameter, spinup policy, downscaling resolution or package version,
 # which would apply the correction to a model it was not fitted for.
 function assert_matches_reference(reference, name, requested)
-    status = read_glacier_tile_status(reference)
+    status = reference_status(reference)
     differences = run_parameter_differences(status.parameters, requested)
     isempty(differences) || error(
         "run settings for $name differ from the reference sweep the correction was fitted " *
