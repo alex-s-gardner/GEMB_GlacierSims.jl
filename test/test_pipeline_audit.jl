@@ -429,18 +429,21 @@ end
 end
 
 @testset "pipeline audit: perturbation chain" begin
-    # Spec 61: T = 263.15 K at 80 % relative humidity, LW = 0.8σT⁴, P = 1 kg m-2 per step. At
-    # ΔT = +2 and pscale 1.5 the chain gives T' = T + 2, e' = 0.8·eₛ(T'), LW' = (ε_cs(e', T') + Δε)σT'⁴
-    # with Δε = 0.8 - ε_cs(e, T), and P' = 1.5; every other layer is untouched.
+    # Spec 61: T = 263.15 K at 80 % relative humidity with respect to ice, LW = 0.8σT⁴, P = 1 kg m-2
+    # per step. At ΔT = +2 and pscale 1.5 the chain gives T' = T + 2, e' = 0.8·eₛ,ᵢ(T') (relative
+    # humidity is held against ice below 273.16 K), LW' = (ε_cs(e', T') + Δε)σT'⁴ with
+    # Δε = 0.8 - ε_cs(e, T), and P' = 1.5; every other layer is untouched.
     CF = GEMB_GlacierSims.GEMB_ClimateForcing
     σ = 5.67e-8                     # the Stefan–Boltzmann value `temperature_adjust` documents
+    # IFS Cy45r1 Part IV eq. 7.5 over ice (AERKi constants), written out independently of the package
+    es_ice(T) = 611.21 * exp(22.587 * (T - 273.16) / (T + 0.7))
     T, n = 263.15, 4
-    e = 0.8 * CF.saturation_vapor_pressure(T)
+    e = 0.8 * es_ice(T)
     f = _cp_forcing(46.0, 10.0, 1000.0, fill(T, n); vapor_pressure = e, longwave_downward = 0.8σ * T^4,
                     precipitation = 1.0)
     g = GEMB_GlacierSims._perturbed_forcing(f, 2.0, 1.5)
     T′ = T + 2
-    e′ = 0.8 * CF.saturation_vapor_pressure(T′)
+    e′ = 0.8 * es_ice(T′)
     Δε = 0.8 - CF.konzelmann_clear_sky_emissivity(e, T)
     @test all(≈(T′), g[:temperature_air])
     @test all(x -> isapprox(x, e′; rtol = 1e-12), g[:vapor_pressure])
