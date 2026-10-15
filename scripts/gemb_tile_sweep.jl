@@ -27,7 +27,7 @@
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
-# Sizing: a 60-band tile over the 10x7 grid is 4,200 simulations, and one simulation is the spinup plus
+# Sizing: a 60-band tile over the 10x10 grid is 6,000 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
 # full ERA5-Land record is eleven times longer with a `:representative` spinup costing about 2.2x the
 # model-years of an averaged one. Measure with a TILE_LIMIT or TILE_NAMES subset before committing to a
@@ -65,7 +65,9 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 
 # The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
 # at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
-# far points exist to bracket it and to show the response is monotonic.
+# far points exist to bracket it and to show the response is monotonic. The fit interpolates linearly
+# between nodes across a concave response, and most fitted scalings land between 1.5 and 4, so that
+# span carries nodes at every 0.5.
 #
 # `1.0` and `0.0` must be present, except under `SUPPLEMENTARY`. They are the baseline the reports and
 # the reference discharge locate with `findfirst`, and a grid without them silently loses both.
@@ -74,21 +76,26 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 # they are what a re-run reproduces, and they are in git.
 const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
     parse.(Float64, split(ENV["PRECIPITATION_SCALINGS"], ",")) :
-    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 4.0]
+    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
 const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
     [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
 
 # Ceiling on the spinup, not the convergence test: bands exit on the drift criterion well inside this on
-# glacier firn, so the ceiling only binds on an outlier.
+# glacier firn, so the ceiling only binds on an outlier. A column that reaches it is kept and counted
+# (`spinup_n_unconverged`, `spinup_unconverged_area_km2`), not refused.
+#
+# Sized on the slowest tiles: on N82_W048, S78_E168, N66_W156 and N62_W142, at 0 and -3 K, every column
+# converged, the area-weighted mean within 100 years and the slowest at 285 (N82_W048, 250 m band, 0 K).
+# 500 years leaves that column room by a factor of 1.75.
 #
 # A span of simulated years rather than a cycle count, because a cycle count means a different amount of
 # spinup on a different climatology. `gemb_spinup` divides by the measured cycle length to get its own
 # ceiling: under `SPINUP_CLIMATOLOGY_METHOD = :representative` a cycle is `SPINUP_CLIMATOLOGY_N_YEARS`
-# years, so 100 years is about 34 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
-# can judge a slope, so the ceiling has to leave room for that — 34 does, 10 would not.
+# years, so 500 years is 167 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
+# can judge a slope, so the ceiling has to leave room for that.
 const SPINUP_SIMULATION_YEARS_MAXIMUM =
-    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "100"))
+    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "500"))
 # Spinup exits when the FAC trend flattens; see `SPINUP_DRIFT_FAC` in `glacier_run.jl`, including why this
 # value is too loose for an ice-sheet plateau. Stated per **year** and scaled to the cycle by
 # `_spinup_drift_tolerance`, so 1e-2 is 1 cm of firn air per year whatever the cycle length.
@@ -129,7 +136,7 @@ const RESTART_FETCH_OVERLAP = Day(1)
 # sweep can no longer see.
 #
 # The bound has to exceed the longest a single tile can legitimately take: reclaiming a running tile would
-# put two processes on one netCDF. A 63-band tile over the 10x7 grid and the full record is the worst case,
+# put two processes on one netCDF. A 63-band tile over the 10x10 grid and the full record is the worst case,
 # so this is deliberately generous. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
 const CLAIM_SUBDIR = "claims"
 const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
@@ -387,6 +394,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                    convergence_drift_fac = SPINUP_DRIFT_FAC,
+                                   drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
@@ -401,6 +409,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
 
     # An extendable file is only extendable if it actually carries a firn state; one written before the
     # restart group existed has to be rebuilt.
+    # A `:fitted` resolution applies each timestep's own fit, which covers the whole record and cannot
+    # be resolved onto an appended segment alone; such a tile is rebuilt.
+    if disposition === :extendable && basis === :fitted
+        @info "Tile was run on per-timestep fits; rebuilding instead of appending" tile=i name
+        disposition = :rebuild
+    end
     restart = disposition === :extendable ? read_glacier_tile_restart(path) : nothing
     appending = restart !== nothing && restart.time !== nothing
     if disposition === :extendable && !appending
@@ -414,6 +428,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
     fetch_range = appending ?
                   (max(first(TIME_RANGE), restart.time - RESTART_FETCH_OVERLAP), last(TIME_RANGE)) :
                   TIME_RANGE
+    # The band forcing is built on the fetched steps, so the applied parameters must be resolved onto
+    # the same axis. Under `:climatology` this changes no setting the run records.
+    if appending
+        applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
+                                      basis, decoupling_factor_prior = prior)
+    end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps
     # its ice by borrowing a neighbour's forcing, and the neighbour contributes no area of its own, so
@@ -458,10 +478,10 @@ end
 
 # The authoritative run time axis, from one cell's forcing rather than assumed to be hourly. Also the
 # earliest point a wrong token or a cold cache surfaces, which is worth paying before a tile-wide pass.
-function probe_run_time(tile, token, cache)
+function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     row = first(tile.core)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
-                         time_range = TIME_RANGE, token, cache_path = cache)
+                         time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
 end
 
@@ -527,8 +547,7 @@ function summary_row(tile, name, status, seconds; run = nothing,
                      t_forcing = missing, t_gemb = missing, basis = missing, error = "")
     i_dt = findfirst(==(0.0), DELTA_TEMPERATURES)
     i_ps = findfirst(==(1.0), PRECIPITATION_SCALINGS)
-    years = run === nothing ? missing :
-            (last(run.time) - first(run.time)).value / (365.25 * 86_400_000)
+    years = run === nothing ? missing : GEMB_GlacierSims.record_years(run)
     return (; name,
             geotile_id = geotile_id(tile.bounds),
             index_lon = tile.index[1], index_lat = tile.index[2],

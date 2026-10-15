@@ -112,7 +112,9 @@ rather than a different experiment spliced onto an old record, so they are what
 [`gemb_glacier_cell`](@ref) checks a restart against. Every `ModelParameters` field is included,
 prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gemb` computes from
 the forcing and overwrites whatever it is handed, so they say nothing about how a run was
-configured and would compare unequal for reasons the caller never chose.
+configured and would compare unequal for reasons the caller never chose. The package versions
+and source trees ([`software_provenance`](@ref)) are included too, so a run under different code is
+a different experiment.
 
 Deliberately *excluded* is everything that is not a setting: the output time axis, `history`, the
 `institution`/`references` labels, and the `spinup_*`/`climatology_*` provenance — which describes
@@ -137,6 +139,7 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
         params["model_" * string(field)] = getproperty(mp, field)
     end
     bare_ice_albedo === nothing || _record_bare_ice_albedo!(params, bare_ice_albedo)
+    merge!(params, software_provenance())
     return params
 end
 
@@ -320,21 +323,17 @@ end
 """
     cell_decoupling_factor(row; max_distance = 10.0)
 
-Effective on-glacier air temperature decoupling factor `k` for a glacier grid cell, or `nothing`
-when the cell has no published `k`.
+On-glacier air temperature decoupling factor `k` for a glacier grid cell, with the cell's
+glacier-mask fraction, or `nothing` when the cell has no published `k`.
 
 `k` comes from the Shaw et al. (2025) per-glacier table via `GEMB_ClimateForcing.glacier_decoupling`,
 looked up by nearest glacier centroid to the cell center (within `max_distance` km). It corrects an
-*ambient* (off-glacier) temperature to on-glacier conditions, so it only applies to the part of the
-reanalysis cell that is not already glacier: ERA5-Land's `:glm` glacier mask says what fraction of
-the cell its land-surface scheme already treats as ice, and that fraction needs no correction.
-The published `k` is therefore weighted by the non-glacier fraction `1 - glm`,
-
-    k_eff = 1 - (1 - k) * (1 - glm)
-
-which is the full correction where the cell carries no glacier (`glm = 0`) and the identity where
-the cell is entirely glacier (`glm = 1`). A cell with no `:glm` column, or a `missing` value, is
-treated as `glm = 0` — the uncorrected reanalysis assumption, hence the full correction.
+*ambient* (off-glacier) temperature to on-glacier conditions. ERA5-Land's `:glm` glacier mask says
+what fraction of the cell its land-surface scheme already runs as ice, so the cell's warm excess is
+`[1 - glm·(1 - k)]·E_ambient` rather than ambient. [`gemb_glacier_cell`](@ref) therefore brings the
+forcing to the ice-free state with `k` and `glm`, lapses it, and decouples it with `k`
+([`forcing_at_elevation`](@ref)). A `missing` or `NaN` glm is treated as `glm = 0`, the uncorrected
+reanalysis assumption.
 
 Returns `(; decoupling_factor, decoupling_factor_published, glm, rgi_id, distance)`, or `nothing`
 when the table has no glacier within `max_distance` — RGI regions 05 (Greenland periphery) and 19
@@ -363,9 +362,7 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
         return nothing
     end
 
-    # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
-    return (; decoupling_factor = _effective_decoupling_factor(found.k, glm),
-            decoupling_factor_published = found.k, glm,
+    return (; decoupling_factor = Float64(found.k), decoupling_factor_published = found.k, glm,
             rgi_id = found.rgi_id, distance = found.distance)
 end
 
@@ -492,11 +489,11 @@ or perturbations.
   accepts is rejected here: its length tracks the forcing record, so it cannot be recorded as a
   run parameter a continuation could match (see [`run_parameters`](@ref)).
 - `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
-  Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
-  ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
-  requires. A cell with no `k` in the table (RGI regions 05 and 19 are not covered) is run on
-  ambient forcing with no correction at all. Set `false` to skip the lookup entirely; pass a
-  `Real` to prescribe `k` directly, bypassing both the table and the `glm` weighting.
+  Shaw et al. (2025) factor `k` ([`cell_decoupling_factor`](@ref)): the forcing is brought to the
+  ice-free state with `k` and the cell's `glm`, lapsed to the bin, then decoupled with `k`. A cell
+  with no `k` in the table (RGI regions 05 and 19 are not covered) is run on ambient forcing with no
+  correction at all. Set `false` to skip the lookup entirely; pass a `Real` to prescribe `k`
+  directly, bypassing the table.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
   year used for spinup. When not given, a continuation inherits the window its saved record was
   spun up on (from the restart's stored provenance) and a cold start takes the first 30 complete
@@ -561,6 +558,8 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     # One lookup per cell, not per (bin x delta x scaling): `k` is a property of the glacier, not
     # of the perturbation or the elevation interval. `nothing` here means every run stays ambient.
     decoupling_factor = resolve_decoupling_factor(row, glacier_decoupling)
+    # Only read when there is a `k` to apply: an ambient run needs no glacier fraction.
+    glacier_fraction = decoupling_factor === nothing ? 0.0 : _row_glm(row)
 
     cov = glacier_hypsometry_coverage(row; coverage)
     isempty(cov.modeled) &&
@@ -669,7 +668,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         # concurrent tasks.
         at_bin(f) = forcing_at_elevation(
             precipitation_adjust(temperature_adjust(f, delta), pscale),
-            bin.center - forcing_elevation; lapse_rate, decoupling_factor)
+            bin.center - forcing_elevation; lapse_rate, decoupling_factor, glacier_fraction)
 
         cf = at_bin(forcing_data)
 
@@ -783,9 +782,9 @@ end
 
 Resolve the `glacier_decoupling` keyword of [`gemb_glacier_cell`](@ref) to the `k` handed to every
 run of this cell, or `nothing` for ambient forcing. `false` skips the lookup; a `Real` is taken as
-`k` verbatim (no `glm` weighting — the caller has prescribed the effective factor); `true` looks
-`k` up and weights it by the cell's non-glacier fraction ([`cell_decoupling_factor`](@ref)). A cell
-absent from the table gets no correction at all, which is why this is not an error.
+`k` verbatim; `true` looks the published `k` up ([`cell_decoupling_factor`](@ref)). Either way the
+cell's `glm` is applied separately, when the forcing is brought to the ice-free state. A cell absent
+from the table gets no correction at all, which is why this is not an error.
 
 Public because it is idempotent — passing its result back as `glacier_decoupling` resolves to
 itself — so a driver can resolve `k` once per cell, build [`run_parameters`](@ref) from it to check
@@ -804,9 +803,9 @@ function _lookup_decoupling_factor(row)
         @info "No Shaw et al. (2025) decoupling factor for this cell; running on ambient forcing"
         return nothing
     end
-    @info "Applying glacier decoupling weighted by the non-glacier fraction" k=found.decoupling_factor k_published=found.decoupling_factor_published glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
-    # An entirely glaciated cell weights k to exactly 1.0, which is the identity — skip the
-    # adjustment rather than paying for a no-op pass over the whole forcing record.
+    @info "Applying glacier decoupling" k=found.decoupling_factor glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
+    # `k = 1` is the identity at every step of the adjustment, so skip it rather than paying for a
+    # no-op pass over the whole forcing record.
     return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
@@ -971,8 +970,9 @@ Where a file's stored run parameters disagree with a requested run's, as
 `parameters` field of [`read_glacier_cell_restart`](@ref)) returned; `requested` is a
 [`run_parameters`](@ref) dict.
 
-Only keys present in both are compared: a file written by an older version of `run_parameters`
-simply carries fewer of them, and that is a reason to note the gap rather than to refuse an append.
+A key present on one side only is a difference too, reported with `nothing` for the side that lacks
+it: a setting one run recorded and the other did not — a package version, a newly recorded model
+parameter — cannot be shown to agree, so the two are not known to be the same experiment.
 Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
 or `Bool`. A one-element vector and its element compare equal, because NetCDF reads a one-element
 attribute back as a scalar — a per-band setting of a one-band tile would otherwise never match itself.
@@ -986,6 +986,12 @@ function run_parameter_differences(saved, requested)
         haskey(saved, key) || continue
         _attribute_value(saved[key]) == _attribute_value(value) && continue
         differences[key] = (saved[key], value)
+    end
+    for key in keys(requested)
+        haskey(saved, key) || (differences[key] = (nothing, requested[key]))
+    end
+    for key in keys(saved)
+        haskey(requested, key) || (differences[key] = (saved[key], nothing))
     end
     return differences
 end
@@ -1005,11 +1011,6 @@ function _validate_restart_parameters(restart, parameters; force_restart::Bool, 
     end
 
     differences = run_parameter_differences(saved, parameters)
-
-    missing_keys = setdiff(keys(parameters), keys(saved))
-    isempty(missing_keys) ||
-        @warn "The existing $what file does not store every run parameter; these could not be verified" unverified=sort!(collect(missing_keys))
-
     isempty(differences) && return nothing
 
     if force_restart

@@ -268,7 +268,7 @@ function _write_lapse_rate!(ds, p, precision, deflatelevel)
 
     # The joint screen, as a variable rather than a comment.
     #
-    # `derive_lapse_rate` consumes `k` to bring the cells to a common on-glacier state, so a `k`
+    # `derive_lapse_rate` consumes the decoupling fit to bring the cells to the ice-free state, so a `k`
     # outside (0, 1] corrupts that timestep's *slope* as well — and the corruption is a smooth false
     # gradient rather than scatter, so it is invisible in the slope series alone and no robust
     # estimator removes it. A reader who screens the two series separately therefore gets a
@@ -357,17 +357,21 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
 
     for (name, values, units, long_name, standard_name) in (
         ("interval_center", [Float64(iv.center) for iv in intervals], "m",
-         "elevation interval center", "height_above_reference_ellipsoid"),
+         "elevation interval center", ELEVATION_STANDARD_NAME),
         ("interval_lower", [Float64(iv.lo) for iv in intervals], "m",
-         "elevation interval lower edge", "height_above_reference_ellipsoid"),
+         "elevation interval lower edge", ELEVATION_STANDARD_NAME),
         ("interval_upper", [Float64(iv.hi) for iv in intervals], "m",
-         "elevation interval upper edge", "height_above_reference_ellipsoid"),
+         "elevation interval upper edge", ELEVATION_STANDARD_NAME),
         ("interval_area", [Float64(iv.area) for iv in intervals], "km2",
          "glacier area in the elevation interval", ""))
         v = NCDatasets.defVar(ds, name, Float64, ("elevation_interval",))
         v.attrib["units"] = units
         v.attrib["long_name"] = long_name
-        isempty(standard_name) || (v.attrib["standard_name"] = standard_name)
+        if standard_name == ELEVATION_STANDARD_NAME
+            _set_elevation_datum!(v)
+        elseif !isempty(standard_name)
+            v.attrib["standard_name"] = standard_name
+        end
         v[:] = values
     end
     ds["interval_area"].attrib["comment"] =
@@ -475,9 +479,9 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
         end
     end
     ds["temperature_air"].attrib["comment"] =
-        "Glacier-area weighted mean over the cells holding ice in this interval, each lapsed to " *
-        "the interval center and then decoupled — in that order, which is the order " *
-        "climate_adjust_for_glacier requires."
+        "Glacier-area weighted mean over the cells holding ice in this interval, each brought to " *
+        "the ice-free state with k at its own elevation, lapsed to the interval center with the " *
+        "ambient lapse rate, and then decoupled with k at the interval center."
     return nothing
 end
 

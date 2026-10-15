@@ -14,10 +14,13 @@ using GEMB_ClimateForcing
 # silently reached for.
 using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
                            decoupling_factor_at_elevation,
-                           _decouple_per_timestep,
+                           _decouple_per_timestep, _ambient_forcing,
+                           _glacier_offset_at_elevation, _corrects_to_ambient,
+                           _downscaling_sums, _accumulate_downscaling_cell!,
                            _cell_forcing_at_interval, _FORCING_VARIABLES,
                            _MIN_CELLS_DEFAULT, _DECOUPLING_FACTOR_LIMITS,
                            _LAPSE_RATE_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE,
+                           CLOUD_OPTICAL_THICKNESS_MAX,
                            _MIN_AMBIENT_EXCESS, _haversine_km
 using DimensionalData
 using Rasters
@@ -43,7 +46,7 @@ import GeoParquet.Parquet2
 
 include("util.jl")
 export claim_tile!, claim_order, weight_balanced_blocks
-export era5_land_invariant, wrap_lon, forcing_at_elevation
+export era5_land_invariant, wrap_lon, forcing_at_elevation, software_provenance
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index
 
 include("volume_change.jl")

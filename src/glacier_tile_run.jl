@@ -28,6 +28,11 @@ const TILE_MASS_VARIABLES = (CELL_MASS_VARIABLES..., :blowing_snow)
 const TILE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual,
                                :firn_air_content)
 
+# Largest fraction of a tile's ice, by default, that may sit in elevation intervals the band forcing
+# could not supply before [`gemb_glacier_tile`](@ref) refuses the tile (see its
+# `dropped_interval_area_fraction_maximum` keyword).
+const DROPPED_INTERVAL_AREA_FRACTION_MAXIMUM = 0.01
+
 """
     GlacierTileRun
 
@@ -159,6 +164,11 @@ published 2° products exclude rain from their aggregates.
   parameters. It changes nothing here — the substitution happens in
   [`elevation_interval_forcing`](@ref), and these bands no longer know which cells borrowed — but two
   runs under different caps rest on different forcing and must not compare as the same experiment.
+- `validation_grid = nothing`: `(delta_temperatures, precipitation_scalings)` a band's forcing must
+  also be perturbable to, beyond this run's own grid. A band is run only if every perturbation of
+  both grids passes the forcing validator, so a run at a few points of a wider grid — a
+  native-resolution run at its calibrated correction — keeps exactly the bands a run over the wider
+  grid keeps.
 - `restart = nothing`: the value [`read_glacier_tile_restart`](@ref) returns, or `nothing`. Each run
   inherits its saved column and the spinup is skipped; the forcing is trimmed to the steps after the
   saved time, so pass only the new forcing rather than refetching the record. Throws
@@ -175,6 +185,18 @@ published 2° products exclude rain from their aggregates.
 - `on_output = nothing`: called as `on_output(output; band, delta, pscale)` with each simulation's full
   output stack, for inspection. Called from inside the task, so with `threaded = true` it runs
   concurrently and in an unspecified order.
+- `dropped_interval_area_fraction_maximum = $(DROPPED_INTERVAL_AREA_FRACTION_MAXIMUM)`: the largest
+  fraction of the tile's ice that may lie in elevation intervals missing from `band_forcing`. An
+  interval of `applied.bands` that holds ice in `tile.core` but has no band is one
+  [`elevation_interval_forcing`](@ref) dropped — none of its cells had usable forcing, or no donor
+  could be adjusted to it within the range `climate_forcing` validates. Its area is counted in
+  `n_bands_dropped` and `dropped_area_km2`; above this fraction of the tile's ice (the hypsometry
+  area of `tile.core` over `applied.bands`) the tile throws an `ErrorException` instead of running,
+  and below it the drop is recorded and the run proceeds.
+
+Every glacier area of the tile's hypsometry ends up in exactly one of `glacier_area_km2` (modeled),
+`dropped_area_km2` (an interval with no band, or a band the perturbation grid could not run) and
+`unrecovered_area_km2` (ice inside a modeled band that no cell could supply forcing for).
 
 A band whose run produces no output is dropped from the aggregation with a warning rather than
 poisoning the tile's totals; a tile where no band produced output throws.
@@ -188,10 +210,16 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            drift_window::Int = SPINUP_DRIFT_WINDOW,
                            threaded::Bool = true,
                            donor_max_distance_km = nothing,
+                           validation_grid = nothing,
                            restart = nothing,
                            force_restart::Bool = false,
                            spinup_seed = nothing,
-                           on_output = nothing)
+                           on_output = nothing,
+                           dropped_interval_area_fraction_maximum::Real =
+                               DROPPED_INTERVAL_AREA_FRACTION_MAXIMUM)
+    0 <= dropped_interval_area_fraction_maximum <= 1 || throw(ArgumentError(
+        "dropped_interval_area_fraction_maximum must be in [0, 1], got " *
+        string(dropped_interval_area_fraction_maximum)))
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
     isempty(delta_temperatures) && throw(ArgumentError("delta_temperatures is empty"))
@@ -211,7 +239,26 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             "elevation); a NaN in an applied downscaling parameter is the usual cause"))
     end
 
-    bands, dropped = _runnable_bands(bands, delta_temperatures, precipitation_scalings)
+    # Intervals the band forcing could not supply at all. Checked before any GEMB run, so a tile
+    # missing more of its ice than the stated fraction fails before it costs a spinup.
+    interval_drops, tile_ice_area = _intervals_without_bands(tile, applied, bands)
+    interval_drop_area = sum(d.area for d in interval_drops; init = 0.0)
+    if interval_drop_area > dropped_interval_area_fraction_maximum * tile_ice_area
+        error("$(length(interval_drops)) elevation interval(s) of tile $(tile.name) at " *
+              "$(join([d.center for d in interval_drops], ", ")) m have no band forcing: " *
+              "$(round(interval_drop_area; digits = 2)) km² of $(round(tile_ice_area; digits = 2)) " *
+              "km² of ice ($(round(100 * interval_drop_area / tile_ice_area; digits = 2)) %), above " *
+              "the $(100 * dropped_interval_area_fraction_maximum) % allowed by " *
+              "`dropped_interval_area_fraction_maximum`. `elevation_interval_forcing` logs why each " *
+              "interval was dropped.")
+    end
+
+    union_grid(axis, extra) = sort!(unique!(vcat(axis, collect(Float64, extra))))
+    validation_deltas, validation_scalings = validation_grid === nothing ?
+        (delta_temperatures, precipitation_scalings) :
+        (union_grid(delta_temperatures, validation_grid[1]),
+         union_grid(precipitation_scalings, validation_grid[2]))
+    bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings)
     isempty(bands) && throw(ForcingUnavailable(
         "no band of this tile could be perturbed into forcing GEMB accepts; the highest bands are " *
         "lapse extrapolations far above every contributing reanalysis surface, and a cold " *
@@ -248,6 +295,12 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         @info "Resuming tile from saved profiles" restart_time=restart.time new_steps=n_new bands=n_band
     end
 
+    # The span of forcing this run integrates: from its first step to one step past its last, which is
+    # what every cumulative series in the output accumulates over (see `record_years`).
+    run_time = lookup(first(bands).forcing, Ti)
+    forcing_start = first(run_time)
+    forcing_step = Dates.value(Millisecond(run_time[2] - run_time[1])) / 1000
+
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
     # One flat task list rather than nested threaded loops: bands per tile range from a handful to
@@ -265,8 +318,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # No elevation or glacier adjustment: the band forcing is already at the band center and
         # already decoupled. Rebuilt per task rather than shared across perturbations, so concurrent
         # tasks never hand each other the same object.
-        adjusted = precipitation_adjust(temperature_adjust(band.forcing, delta), pscale)
-        cf = initialize_forcing(adjusted)
+        cf = initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
 
         # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
         # task, so concurrent tasks never share it, and used for the spinup as well as the run: a
@@ -308,13 +360,15 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # Extracted here so `output` goes out of scope with the task. Held for every task at once it
         # would be n_band*n_dt*n_ps profile stacks of (Z x Ti), which for a 60-band tile over decades
         # is far more than the machine has.
-        components = height_change_components(output)
+        # Referenced to the column this run started from, so `dh` and its terms share one epoch and
+        # `dh == dh_mass + dh_water + dh_firn + dh_residual` at every output time.
+        components = height_change_components(output; initial_profile = profile)
         series = Dict{Symbol,Vector{Float64}}()
         for v in TILE_MASS_VARIABLES
             series[v] = haskey(output, v) ? Vector{Float64}(output[v]) :
                         zeros(Float64, length(dims(output, Ti)))
         end
-        series[:dh] = surface_height_change(output)
+        series[:dh] = components.total
         series[:dh_mass] = components.mass
         series[:dh_water] = components.water
         series[:dh_firn] = components.firn
@@ -388,6 +442,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # match. Merged here and not into `parameters` for exactly that reason.
     merge!(provenance, applied.provenance)
     provenance["n_bands"] = n_band
+    provenance["time_coverage_start"] = forcing_start
+    provenance["forcing_time_step_seconds"] = forcing_step
     provenance["glacier_area_km2"] = sum(band_areas)
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
     provenance["max_dh_residual"] = maximum(abs, bands_series[:dh_residual])
@@ -402,16 +458,40 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # Ice this tile holds but did not model, so the gap between the tile's totals and its hypsometry is
     # a recorded number rather than something a reader has to notice. Zero on a tile whose every band
     # was runnable, which is the common case.
-    provenance["n_bands_dropped"] = length(dropped)
-    provenance["dropped_area_km2"] = isempty(dropped) ? 0.0 : sum(d.area for d in dropped)
+    # Both kinds of drop: an interval the band forcing could not supply, and a band the perturbation
+    # grid could not run. The first is also reported on its own, with the tile's hypsometry area it
+    # is a fraction of.
+    provenance["n_bands_dropped"] = length(dropped) + length(interval_drops)
+    provenance["band_validation_delta_temperatures"] = validation_deltas
+    provenance["band_validation_precipitation_scalings"] = validation_scalings
+    provenance["dropped_area_km2"] = sum(d.area for d in dropped; init = 0.0) + interval_drop_area
+    provenance["n_intervals_without_forcing"] = length(interval_drops)
+    provenance["intervals_without_forcing_area_km2"] = interval_drop_area
+    provenance["hypsometry_area_km2"] = tile_ice_area
     # One tile-level convergence verdict, and the only spinup outcome reduced to a scalar: a tile is
     # settled when every one of its columns is, so this is `all` and not a sample. The per-run detail is
     # in `run_provenance["spinup_converged"]`, which is where a reader finds *which* column failed. A
     # `NaN` slot is a run that produced no output rather than one that failed to settle — those are
     # counted by `n_bands_dropped` — so it does not make the tile unconverged.
+    #
+    # An unconverged spinup is kept, not refused: its column still carries a firn-air trend into the
+    # transient, so how much ice that affects is recorded — the number of columns, and the glacier
+    # area of the bands with any such column — and reported once for the tile.
     if haskey(run_provenance, "spinup_converged")
         flags = run_provenance["spinup_converged"]
         provenance["spinup_converged"] = all(f -> isnan(f) || f == 1.0, flags)
+        unsettled = flags .== 0.0
+        unsettled_bands = [any(view(unsettled, i, :, :)) for i in axes(unsettled, 1)]
+        provenance["spinup_n_unconverged"] = count(unsettled)
+        provenance["spinup_unconverged_area_km2"] = sum(band_areas[unsettled_bands]; init = 0.0)
+        any(unsettled) && @warn("Spinup did not converge for some columns of this tile; they enter " *
+                                "the transient with a residual firn-air trend",
+                                tile = tile.name, n_unconverged = count(unsettled),
+                                n_columns = count(!isnan, flags),
+                                bands = [bands[i].center for i in findall(unsettled_bands)],
+                                unconverged_area_km2 = round(provenance["spinup_unconverged_area_km2"];
+                                                             digits = 2),
+                                simulation_years_maximum)
     end
 
     return GlacierTileRun(
@@ -421,6 +501,20 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         delta_temperatures, precipitation_scalings, out_time,
         bands_series, totals, profiles, band_provenance, run_provenance, parameters, provenance,
     )
+end
+
+"""
+    record_years(run::GlacierTileRun) -> Float64
+
+The span, in years of 365.25 days, that the cumulative series of `run` accumulate over: from the
+first forcing step to the end of the last one, `last(run.time) + step - time_coverage_start`. Each
+output time stamps the last forcing step of its interval, so this covers every interval including the
+first. A record-mean rate is `run.totals[name][end, i_dt, i_ps] / record_years(run)`.
+"""
+function record_years(run::GlacierTileRun)
+    start = run.provenance["time_coverage_start"]
+    step = Millisecond(round(Int, 1000 * run.provenance["forcing_time_step_seconds"]))
+    return _decimal_years(last(run.time) + step - start)
 end
 
 # Sort one run's `spinup_*`/`climatology_*` provenance into the per-run arrays and the tile-level
@@ -458,6 +552,11 @@ function _collect_run_provenance!(run_provenance, provenance, res, parameters, d
     return nothing
 end
 
+# A band's forcing at one perturbation point: the temperature offset, then the precipitation scaling.
+# The one definition the band validation and the run share, so a band validated is the band run.
+_perturbed_forcing(forcing, delta, pscale) =
+    precipitation_adjust(temperature_adjust(forcing, delta), pscale)
+
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
 #
 # The high bands of a tile are lapse extrapolations well above every contributing reanalysis surface —
@@ -482,8 +581,7 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
         failure = nothing
         for pscale in precipitation_scalings, delta in delta_temperatures
             try
-                initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta),
-                                                        pscale))
+                initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
             catch e
                 e isa InterruptException && rethrow()
                 is_caller_error(e) && rethrow()
@@ -511,6 +609,21 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
               first_reason = first(dropped).message)
     end
     return keep, dropped
+end
+
+# The elevation intervals of `applied.bands` holding ice in `tile.core` that `bands` has no band for,
+# each `(; lo, hi, center, area)` with `area` in km², and the tile's total ice over those intervals.
+# A band is matched to its interval by its edges, the identity `elevation_interval_forcing` gives it.
+function _intervals_without_bands(tile, applied, bands)
+    present = Set((Float64(b.lo), Float64(b.hi)) for b in bands)
+    area = zeros(length(applied.bands))
+    for row in eachrow(tile.core)
+        area .+= _interval_areas(row, applied.bands)
+    end
+    drops = [(; lo = iv.lo, hi = iv.hi, center = Float64(iv.center), area = area[i])
+             for (i, iv) in enumerate(applied.bands)
+             if area[i] > 0 && !((Float64(iv.lo), Float64(iv.hi)) in present)]
+    return drops, sum(area; init = 0.0)
 end
 
 # Per-tile totals from the per-band series: volume from the height change, mass from the fluxes.
@@ -596,7 +709,8 @@ The settings that define *how* a tile was run, as netCDF global attributes.
 These are exactly the values that must be identical for a continuation to be a continuation rather than
 a different experiment spliced onto an old record, so they are what a restart is checked against. Every
 `ModelParameters` field is included, prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` —
-the fields `gemb` computes from the forcing and overwrites whatever it is handed.
+the fields `gemb` computes from the forcing and overwrites whatever it is handed. The package versions
+and source trees ([`software_provenance`](@ref)) are included too.
 
 The downscaling settings from `applied` are included for the same reason: two runs of one tile that
 resolved their lapse rate differently are different experiments, and a file that recorded only the
@@ -629,6 +743,7 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     donor_max_distance_km === nothing ||
         (params["forcing_donor_max_distance_km"] = Float64(donor_max_distance_km))
     merge!(params, applied.settings)
+    merge!(params, software_provenance())
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)

@@ -74,6 +74,14 @@ series and overwrite the restart group with the new final profiles.
 The new record must start strictly after the file's last time, and the run grid (bands, temperature
 deltas, precipitation scalings) must match the file's — a mismatch means the arrays would not line up,
 so it is refused rather than reconciled.
+
+A continuation's cumulative series start from its own seam, so each is offset by the file's last
+stored value of the same series: the band-resolved `dh`, `dh_mass`, `dh_water`, `dh_firn` and
+`dh_residual`, and every `total_*` except the state `total_fac`. A run slot with no stored value at the
+seam has no datum to continue from and is written as fill. The per-band forcing summaries become
+record-long: a time mean (`band_temperature_lapse_rate`, `band_glacier_decoupling_factor_mean`) is
+weighted by the forcing steps of each segment, and a per-step count (`band_*_n_<source>`,
+`band_n_timesteps_above_freezing`) is summed. `max_dh_residual` becomes the larger of the two.
 """
 function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
     NCDatasets.NCDataset(path, "a") do ds
@@ -95,10 +103,22 @@ function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
         idx = (n_existing + 1):(n_existing + n_new)
         ds["time"][idx] = _nc_encode_time.(run.time)
         for v in keys(run.bands_series)
-            ds[string(v)][idx, :, :, :] = run.bands_series[v]
+            name = string(v)
+            series = run.bands_series[v]
+            v in TILE_CUMULATIVE_HEIGHT_VARIABLES &&
+                (series = _continue_from_seam(series, ds[name][n_existing, :, :, :]))
+            ds[name][idx, :, :, :] = series
         end
         for v in keys(run.totals)
-            ds[_tile_total_variable(v)][idx, :, :] = run.totals[v]
+            name = _tile_total_variable(v)
+            total = run.totals[v]
+            v === :fac || (total = _continue_from_seam(total, ds[name][n_existing, :, :]))
+            ds[name][idx, :, :] = total
+        end
+        _append_band_forcing_summaries!(ds, run)
+        if haskey(run.provenance, "max_dh_residual")
+            ds.attrib["max_dh_residual"] = max(Float64(get(ds.attrib, "max_dh_residual", 0.0)),
+                                               Float64(run.provenance["max_dh_residual"]))
         end
 
         # The spinup provenance is left as written, both the per-run variables and the reduced
@@ -118,6 +138,50 @@ function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
     end
 
     return path
+end
+
+# The band-resolved height series that accumulate from the start of the run, and so continue across a
+# seam by adding the stored last value. `firn_air_content` is a state and the mass fluxes are per
+# output interval; neither is offset.
+const TILE_CUMULATIVE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual)
+
+# A continuation's cumulative series, offset by the stored value at the seam (fill where there is none)
+# so it continues the record. `seam` has the series' shape without its leading time axis.
+_continue_from_seam(series, seam) =
+    series .+ reshape(coalesce.(seam, NaN), 1, size(seam)...)
+
+# Per-band forcing summaries that are time means over the forcing steps, and those that count steps.
+const BAND_STEP_MEAN_KEYS = ("temperature_lapse_rate", "glacier_decoupling_factor_mean")
+const BAND_LAPSE_SOURCE_KEYS = Tuple("temperature_lapse_rate_n_$s" for s in DOWNSCALING_SOURCES)
+const BAND_STEP_COUNT_KEYS = ("n_timesteps_above_freezing", BAND_LAPSE_SOURCE_KEYS...,
+    ("glacier_decoupling_factor_n_$s" for s in DOWNSCALING_SOURCES)...,
+    ("glacier_decoupling_factor_n_$(s)_above_freezing" for s in DOWNSCALING_SOURCES)...)
+
+# Per-band forcing summaries over the whole record: time means weighted by each segment's forcing steps
+# and per-step counts summed. A band's forcing steps are the sum of its lapse-rate source counts, since
+# every step has exactly one source. Anything else in the band provenance describes the band or the fit
+# and is the same for every segment.
+function _append_band_forcing_summaries!(ds, run::GlacierTileRun)
+    isempty(run.band_provenance) && return nothing
+    present = filter(in(keys(first(run.band_provenance))), (BAND_STEP_MEAN_KEYS..., BAND_STEP_COUNT_KEYS...))
+    stored = Dict(key => begin
+                      haskey(ds, "band_" * key) || throw(ArgumentError(
+                          "the tile file has no band_$key, which the continuation reports; the file " *
+                          "predates that summary and its record-long value cannot be formed"))
+                      collect(Float64, coalesce.(ds["band_" * key][:], NaN))
+                  end for key in present)
+    new = Dict(key => [Float64(p[key]) for p in run.band_provenance] for key in present)
+    sources = filter(in(present), BAND_LAPSE_SOURCE_KEYS)
+    isempty(sources) && throw(ArgumentError(
+        "the continuation's band provenance carries no temperature_lapse_rate_n_* counts, so its " *
+        "forcing steps per band are unknown and the record-long band means cannot be formed"))
+    n_old = sum(stored[k] for k in sources)
+    n_new = sum(new[k] for k in sources)
+    for key in present
+        ds["band_" * key][:] = key in BAND_STEP_MEAN_KEYS ?
+            (stored[key] .* n_old .+ new[key] .* n_new) ./ (n_old .+ n_new) : stored[key] .+ new[key]
+    end
+    return nothing
 end
 
 """
@@ -284,13 +348,11 @@ function _write_tile_run_globals!(ds, run::GlacierTileRun; institution, referenc
         "the ice at the start of the run. dh is NOT a proxy for surface mass balance and can carry " *
         "the opposite sign: compaction lowers the surface while accumulation raises it."
     ds.attrib["reference_frame_comment"] =
-        "dh and the volume totals dv/dv_mass/dv_firn are cumulative from the start of the run, " *
-        "against a datum fixed in the ice at that time; no reference state has been removed, so " *
-        "adding an independently derived discharge to dv gives total volume change. The " *
-        "decomposition terms dh_mass, dh_water, dh_firn and dh_residual are instead anomalies " *
-        "referenced to the FIRST OUTPUT TIME, which is what makes their closure exact. The " *
-        "identity therefore holds on the anomaly: dh - dh[1] = dh_mass + dh_water + dh_firn + " *
-        "dh_residual. dv_mass and dv_firn inherit that frame from their series; dv does not."
+        "dh, its decomposition terms dh_mass, dh_water, dh_firn and dh_residual, and the volume " *
+        "totals dv/dv_mass/dv_firn are all cumulative from the START OF THE RUN, against a datum " *
+        "fixed in the ice at that time; no reference state has been removed, so adding an " *
+        "independently derived discharge to dv gives total volume change. The identity holds at " *
+        "every output time: dh = dh_mass + dh_water + dh_firn + dh_residual."
     ds.attrib["volume_and_mass_comment"] =
         "Volume totals are the area-weighted height change and mass totals the area-weighted " *
         "fluxes. They are not interconvertible: dh carries the firn compaction term, so " *
@@ -367,7 +429,7 @@ function _write_tile_run_coordinates!(ds, run::GlacierTileRun, n_layer::Int)
     )
         v = NCDatasets.defVar(ds, name, Float64, ("band",))
         v.attrib["units"] = "m"
-        v.attrib["standard_name"] = "height_above_reference_ellipsoid"
+        _set_elevation_datum!(v)
         v.attrib["long_name"] = long_name
         v.attrib["positive"] = "up"
         v[:] = values
@@ -536,19 +598,19 @@ function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, defl
         (:dh, "surface elevation change",
          "-cumsum(ice_flux), against a datum fixed in the ice at the start of the run. This is " *
          "the quantity an altimeter measures, at the band resolution the altimetry dh is binned " *
-         "at. Element 1 already carries the first output interval, so subtract it for an anomaly " *
-         "referenced to the first output time."),
+         "at. Element 1 already carries the first output interval."),
         (:dh_mass, "surface elevation change from surface mass balance",
-         "Cumulative SMB divided by density_ice, referenced to the first output time."),
+         "Cumulative SMB divided by density_ice, from the start of the run."),
         (:dh_water, "surface elevation change from column liquid storage",
-         "Minus the change in stored water divided by density_ice. Water in a pore adds mass " *
-         "without adding thickness, so it belongs to the mass budget but not to the height."),
+         "Minus the change in stored water since the start of the run, divided by density_ice. " *
+         "Water in a pore adds mass without adding thickness, so it belongs to the mass budget " *
+         "but not to the height."),
         (:dh_firn, "surface elevation change from firn compaction",
-         "Change in firn air content, referenced to the first output time."),
+         "Change in firn air content since the start of the run."),
         (:dh_residual, "closure residual of the height change decomposition",
-         "dh - dh[1] minus the sum of the mass, water and firn terms. Should sit at the rounding " *
-         "floor; a growing residual means the column's base is no longer at ice density and the " *
-         "height series under-counts compaction."),
+         "dh minus the sum of the mass, water and firn terms. Should sit at the rounding floor; a " *
+         "growing residual means the column's base is no longer at ice density and the height " *
+         "series under-counts compaction."),
         (:firn_air_content, "firn air content", ""),
     )
         v = NCDatasets.defVar(ds, string(name), precision, dimnames;
@@ -588,7 +650,7 @@ function _write_tile_totals!(ds, run::GlacierTileRun, deflatelevel::Int)
     # `total_melt` holds the record so far. Stated on the group because getting it wrong compares a
     # record-long volume change against a single month's melt.
     ds.attrib["total_accumulation_comment"] =
-        "Every total_* variable except total_fac is CUMULATIVE from the first output time. The " *
+        "Every total_* variable except total_fac is CUMULATIVE from the start of the run. The " *
         "per-band series of the same name are per output interval, as GEMB reports them. total_fac " *
         "is the column's absolute firn air volume, a state, and is neither cumulative nor a flux."
 
@@ -628,10 +690,9 @@ function _write_tile_restart_group!(ds, run::GlacierTileRun, n_layer::Int)
     g.attrib["restart_fidelity"] =
         "A resumed run is close to but not identical to a continuous one: GEMB re-zeros its " *
         "per-step evaporation/condensation and surface-melt accumulators on restart, so the " *
-        "trajectory diverges slightly at the seam. Separately, a height series resumed from here " *
-        "restarts its datum: dh is measured against the column as it was at the seam, so a " *
-        "continuation's dh must be offset by the previous record's last value before the two are " *
-        "read as one series."
+        "trajectory diverges slightly at the seam. A run resumed from here measures its height " *
+        "series against the column at the seam; append_glacier_tile_netcdf offsets them by the " *
+        "last stored values, so the file holds one series from the start of the record."
 
     dimnames = ("layer", "band", "delta_temperature", "precipitation_scaling")
     for name in PROFILE_VARIABLES

@@ -61,7 +61,8 @@ wrap_lon(lon) = lon > 180 ? lon - 360 : lon
 
 """
     forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=$(_DEFAULT_LAPSE_RATE),
-                         precip_scaling_method=nothing, decoupling_factor=nothing)
+                         precip_scaling_method=nothing, decoupling_factor=nothing,
+                         glacier_fraction=0.0)
 
 Lapse-rate-adjust `forcing_data` by `delta_elevation` metres and convert it to a GEMB
 `ClimateForcing`, ready to hand to `initialize_profile` / `gemb`.
@@ -76,18 +77,37 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
 - `lapse_rate`: temperature lapse rate passed through to `climate_adjust_for_elevation` (K/km).
 - `precip_scaling_method`: precipitation scaling passed through to `climate_adjust_for_elevation`
   (`nothing` leaves precipitation unchanged).
-- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`, applied by
-  `climate_adjust_for_glacier` *after* the elevation adjustment — the order that function
-  requires, since `k` scales an ambient temperature already at the glacier's elevation.
-  `nothing` (the default) leaves the forcing ambient.
+- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`. The forcing is
+  first brought to the ice-free state with `k` and `glacier_fraction`, then lapsed, then decoupled
+  with `k` by `climate_adjust_for_glacier` — the order the decoupling requires, since `k` scales an
+  ambient temperature already at the glacier's elevation. `nothing` (the default) leaves the
+  forcing ambient.
+- `glacier_fraction`: the fraction `glm` of the reanalysis cell its land-surface scheme already runs
+  as ice, whose warm excess is therefore `[1 - glm·(1 - k)]·E_ambient`. Only read with a
+  `decoupling_factor`; `0` treats the forcing as ambient already.
+
+With one scalar `k` and no regional fit, the ambient excess is read off that mixing model directly,
+`E_ambient = E_obs / (1 - glm·(1 - k))`: the glacier term handed to `_ambient_forcing` is
+`(k - 1)·E_ambient`. The division multiplies the observed excess by at most `1/k` (at `glm = 1`), so
+it is bounded for any `k` in `(0, 1]` the caller supplies.
 """
 function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
-                              precip_scaling_method=nothing, decoupling_factor=nothing)
-    adjusted = climate_adjust_for_elevation(forcing_data, delta_elevation;
-                                            lapse_rate, precip_scaling_method)
-    decoupling_factor === nothing ||
-        (adjusted = climate_adjust_for_glacier(adjusted, decoupling_factor))
-    return initialize_forcing(adjusted)
+                              precip_scaling_method=nothing, decoupling_factor=nothing,
+                              glacier_fraction=0.0)
+    decoupling_factor === nothing &&
+        return initialize_forcing(climate_adjust_for_elevation(forcing_data, delta_elevation;
+                                                               lapse_rate, precip_scaling_method))
+    k = Float64(decoupling_factor)
+    glm = Float64(glacier_fraction)
+    _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] || throw(ArgumentError(
+        "decoupling_factor must be in (0, 1] (got $(decoupling_factor))"))
+    0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
+    damping = glm * (1 - k)
+    glacier_offset = [(k - 1) * max(T - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0) / (1 - damping)
+                      for T in forcing_data[:temperature_air]]
+    ambient = _ambient_forcing(forcing_data, glm, glacier_offset)
+    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate, precip_scaling_method)
+    return initialize_forcing(climate_adjust_for_glacier(lapsed, decoupling_factor))
 end
 
 # Rewrap glm (the ERA5-Land invariant grid) to the SAME (-180, 180] convention as the Zarr grid.
@@ -116,20 +136,6 @@ function _row_glm(row)
     g = Float64(v)
     return isfinite(g) ? clamp(g, 0.0, 1.0) : 0.0
 end
-
-# The share of a published decoupling factor `k` a cell still needs, given the ERA5-Land glacier-mask
-# fraction `glm` its land-surface scheme has already accounted for:
-#
-#     k_eff = 1 - (1 - k) * (1 - glm)
-#
-# The full correction where the cell carries no glacier (`glm = 0`) and the identity where it is
-# entirely glacier (`glm = 1`). Defined once because this is the package's single convention for
-# that weighting, applied both per cell ([`cell_decoupling_factor`](@ref), one scalar `k` from the
-# published table) and per elevation interval (`derive_decoupling_factor`, a fitted `k` per
-# timestep) — and it is the same weighting `derive_lapse_rate` folds into its regression sums to
-# undo. Two independent spellings would let those paths disagree about the same cell's forcing
-# while both stayed finite and in-domain, so the drift would be invisible.
-_effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)
 
 # How far a cell that carries ice but no forcing of its own may borrow a neighbour's, by default:
 # about four to five ERA5-Land cells (the grid is 0.1°, ~11 km). Loose enough to reach the nearest
@@ -369,4 +375,76 @@ function claim_order(weights, block::Int, n_blocks::Int)
     rest = setdiff(eachindex(weights), mine)
     sort!(rest; by = i -> weights[i], rev = true)
     return vcat(collect(mine), rest)
+end
+
+"""
+    software_provenance() -> Dict{String,Any}
+
+The versions and source trees of GEMB, GEMB_ClimateForcing and GEMB_GlacierSims this process runs,
+as `software_<package>_version` and `software_<package>_tree`. Both [`run_parameters`](@ref) and
+[`tile_run_parameters`](@ref) include them, so a run under different code compares as a different
+experiment.
+
+The tree is the git tree hash of the package's `src` directory at `HEAD` when the package is a git
+checkout — with `+dirty:` and a CRC-32C of the uncommitted changes to `src` and `Project.toml`
+(including untracked files under `src`) when there are any — otherwise the `git-tree-sha1` the
+active manifest records for it, and failing both `crc32c:` and a CRC-32C of every file under `src`
+and of `Project.toml`. Computed once per process.
+"""
+function software_provenance()
+    p = lock(_SOFTWARE_PROVENANCE_LOCK) do
+        cached = _SOFTWARE_PROVENANCE[]
+        cached === nothing || return cached
+        p = Dict{String,Any}()
+        for (label, mod) in (("gemb", GEMB), ("gemb_climateforcing", GEMB_ClimateForcing),
+                             ("gemb_glaciersims", @__MODULE__))
+            p["software_$(label)_version"] = string(pkgversion(mod))
+            p["software_$(label)_tree"] = _package_tree(mod)
+        end
+        _SOFTWARE_PROVENANCE[] = p
+    end
+    return copy(p)
+end
+
+# Filled by the first call; the lock keeps concurrent first calls from each running the git queries.
+const _SOFTWARE_PROVENANCE = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
+const _SOFTWARE_PROVENANCE_LOCK = ReentrantLock()
+
+function _package_tree(mod::Module)
+    dir = pkgdir(mod)
+    dir === nothing && throw(ArgumentError("$(mod) has no package directory to identify"))
+    git(args...) = Cmd(`git -C $dir $args`; ignorestatus = true)
+    if isdir(joinpath(dir, ".git")) || isfile(joinpath(dir, ".git"))
+        tree = readchomp(Cmd(`git -C $dir rev-parse HEAD:./src`))
+        dirty = readchomp(git("status", "--porcelain", "--untracked-files=all", "--", "src",
+                              "Project.toml"))
+        isempty(dirty) && return tree
+        untracked = filter(!isempty, split(readchomp(git("ls-files", "--others", "--exclude-standard",
+                                                         "--", "src")), '\n'))
+        crc = _crc_files(dir, untracked, Base._crc32c(read(git("diff", "HEAD", "--", "src", "Project.toml"))))
+        return tree * "+dirty:" * string(crc; base = 16, pad = 8)
+    end
+    uuid = string(Base.PkgId(mod).uuid)
+    for env in Base.load_path()
+        manifest = Base.project_file_manifest_path(env)
+        (manifest === nothing || !isfile(manifest)) && continue
+        deps = get(Base.parsed_toml(manifest), "deps", Dict{String,Any}())
+        for entry in get(deps, string(nameof(mod)), [])
+            get(entry, "uuid", "") == uuid || continue
+            haskey(entry, "git-tree-sha1") && return entry["git-tree-sha1"]
+        end
+    end
+    # A plain directory, such as a `dev`ed copy outside git: identify it by its contents.
+    files = [relpath(joinpath(root, f), dir) for (root, _, fs) in walkdir(joinpath(dir, "src")) for f in fs]
+    crc = _crc_files(dir, sort!(push!(files, "Project.toml")), UInt32(0))
+    return "crc32c:" * string(crc; base = 16, pad = 8)
+end
+
+# CRC-32C over each file's path (relative to `dir`) and contents, continuing from `crc`.
+function _crc_files(dir, files, crc::UInt32)
+    for f in files
+        crc = Base._crc32c(f, crc)
+        crc = Base._crc32c(read(joinpath(dir, f)), crc)
+    end
+    return crc
 end
