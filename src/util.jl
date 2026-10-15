@@ -85,6 +85,11 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
 - `glacier_fraction`: the fraction `glm` of the reanalysis cell its land-surface scheme already runs
   as ice, whose warm excess is therefore `[1 - glm·(1 - k)]·E_ambient`. Only read with a
   `decoupling_factor`; `0` treats the forcing as ambient already.
+
+With one scalar `k` and no regional fit, the ambient excess is read off that mixing model directly,
+`E_ambient = E_obs / (1 - glm·(1 - k))`: the glacier term handed to `_ambient_forcing` is
+`(k - 1)·E_ambient`. The division multiplies the observed excess by at most `1/k` (at `glm = 1`), so
+it is bounded for any `k` in `(0, 1]` the caller supplies.
 """
 function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
                               precip_scaling_method=nothing, decoupling_factor=nothing,
@@ -92,8 +97,15 @@ function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT
     decoupling_factor === nothing &&
         return initialize_forcing(climate_adjust_for_elevation(forcing_data, delta_elevation;
                                                                lapse_rate, precip_scaling_method))
-    k = fill(Float64(decoupling_factor), length(dims(forcing_data, Ti)))
-    ambient = _ambient_forcing(forcing_data, glacier_fraction, k)
+    k = Float64(decoupling_factor)
+    glm = Float64(glacier_fraction)
+    _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] || throw(ArgumentError(
+        "decoupling_factor must be in (0, 1] (got $(decoupling_factor))"))
+    0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
+    damping = glm * (1 - k)
+    glacier_offset = [(k - 1) * max(T - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0) / (1 - damping)
+                      for T in forcing_data[:temperature_air]]
+    ambient = _ambient_forcing(forcing_data, glm, glacier_offset)
     lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate, precip_scaling_method)
     return initialize_forcing(climate_adjust_for_glacier(lapsed, decoupling_factor))
 end

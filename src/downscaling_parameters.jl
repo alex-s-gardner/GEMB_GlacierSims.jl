@@ -507,9 +507,11 @@ whatever it cannot reach is counted rather than skipped.
 
 Per grid cell, per band, forcing is adjusted in three steps (`_cell_forcing_at_interval`):
 
-1. **to ambient** — the reanalysis already runs a fraction `glm` of the cell as ice, so its warm
-   excess is `[1 - glm·(1 - k)]·E_ambient`. Inverting that with `k` at the cell's own reanalysis
-   elevation and the cell's `glm` gives the ice-free temperature;
+1. **to ambient** — the reanalysis already runs a fraction `glm` of the cell as ice, and the
+   decoupling fit models its warm excess as `α + β·z + glm·(γ + δ·z)`. Removing `glm·(γ + δ·z)` at the
+   cell's own reanalysis elevation from its observed excess leaves the ice-free part plus the cell's
+   own residual, which is its ice-free temperature (`GEMB_ClimateForcing._ambient_forcing`). No
+   division is involved, so the change is never larger than `glm·|γ + δ·z|`;
 2. **lapse** — to the band center, with the applied ambient lapse rate;
 3. **decouple** — with the band's own `k` at the band center, since the band is glacier.
 
@@ -553,11 +555,12 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     intervals::B
     donor_cells::D
     donor_max_distance_km::Float64
-    # `k` at a reanalysis elevation, from `AppliedDownscaling.decoupling_at`, and the series already
-    # evaluated, keyed by elevation. Cells share elevations only by coincidence, but each cell is met
-    # once per batching pass, so the memo saves the re-evaluation on every pass after the first.
-    decoupling_at::K
-    donor_decoupling::Dict{Float64,Vector{Float64}}
+    # The fit's glacier term at a reanalysis elevation, from `AppliedDownscaling.glacier_offset_at`,
+    # and the series already evaluated, keyed by elevation. Cells share elevations only by
+    # coincidence, but each cell is met once per batching pass, so the memo saves the re-evaluation
+    # on every pass after the first.
+    glacier_offset_at::K
+    donor_glacier_offset::Dict{Float64,Vector{Float64}}
     # Forcing for donors that have been used, and the coordinates already found unusable. Masked cells
     # cluster, so the second one in a tile usually resolves to a donor already here and costs no I/O;
     # the unusable set stops a rejected candidate from being loaded again by the next masked cell.
@@ -577,20 +580,22 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
     return _ElevationIntervalForcing(grid_cells, load, applied.time, applied.lapse_rate,
                                      applied.lapse_rate_source, elevation_interval_batch,
                                      applied.bands, donor_cells, donor_max_distance_km,
-                                     applied.decoupling_at, Dict{Float64,Vector{Float64}}(),
+                                     applied.glacier_offset_at, Dict{Float64,Vector{Float64}}(),
                                      Dict{Tuple{Float64,Float64},Any}(),
                                      Set{Tuple{Float64,Float64}}())
 end
 
-# `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is `glm`, for
-# bringing its forcing to the ice-free state. A cell with no glacier fraction needs no `k` there,
-# which is the one case a resolution without `decoupling_at` can force.
-function _donor_decoupling_factor(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
-    glm == 0 && return ones(length(ivf.time))
-    ivf.decoupling_at === nothing && throw(ArgumentError(
-        "this AppliedDownscaling carries no `decoupling_at`, so the forcing of a cell with glacier " *
-        "fraction $glm cannot be brought to the ice-free state; build it with `resolve_downscaling`"))
-    return get!(() -> ivf.decoupling_at(z), ivf.donor_decoupling, z)
+# The fit's glacier term `γ + δ·z` per timestep at the reanalysis elevation `z` of a cell whose
+# glacier fraction is `glm`, for bringing its forcing to the ice-free state. A cell with no glacier
+# fraction needs no term there, which is the one case a resolution without `glacier_offset_at` can
+# force.
+function _donor_glacier_offset(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
+    glm == 0 && return zeros(length(ivf.time))
+    ivf.glacier_offset_at === nothing && throw(ArgumentError(
+        "this AppliedDownscaling carries no `glacier_offset_at`, so the forcing of a cell with " *
+        "glacier fraction $glm cannot be brought to the ice-free state; build it with " *
+        "`resolve_downscaling`"))
+    return get!(() -> ivf.glacier_offset_at(z), ivf.donor_glacier_offset, z)
 end
 
 # Forcing to use for `row`, which has ice but no usable forcing of its own: the nearest cell of
@@ -744,10 +749,10 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
         # the lapse to the interval centre must start from.
         z_cell = Float64(DimensionalData.metadata(fd)["elevation"])
 
-        # The series brought to the ice-free state once per cell, with `k` at the cell's own reanalysis
-        # elevation and the `glm` of the cell the series belongs to, so every band lapses from the same
-        # ambient temperature.
-        ambient = _ambient_forcing(fd, glm, _donor_decoupling_factor(ivf, z_cell, glm))
+        # The series brought to the ice-free state once per cell, with the fit's glacier term at the
+        # cell's own reanalysis elevation and the `glm` of the cell the series belongs to, so every
+        # band lapses from the same ambient temperature.
+        ambient = _ambient_forcing(fd, glm, _donor_glacier_offset(ivf, z_cell, glm))
 
         # A function barrier: with substitution, `fd` may come from the donor memo, whose element type
         # is not concrete. Resolving it at this one call keeps the record-length inner loops specialized
@@ -851,7 +856,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
                                      n_substituted, substituted, donor_distance,
                                      intervals, areas, ambient, z_cell, ivf, n,
                                      substituting::Bool, distance::Float64)
-    unit_factor = ones(n)
+    no_glacier_term = zeros(n)
     # The zenith angle is the cell's own at every interval (lapsing and decoupling leave it unchanged),
     # so its cosine is taken once per cell.
     cos_zenith = cosd.(parent(ambient[:solar_zenith_angle]))
@@ -860,7 +865,7 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
         interval = intervals[i]
         adjusted = try
             _cell_forcing_at_interval(ambient, interval.center - z_cell, interval.decoupling_factor,
-                                      ivf.lapse_rate, 0.0, unit_factor)
+                                      ivf.lapse_rate, 0.0, no_glacier_term)
         catch e
             e isa InterruptException && rethrow()
             is_caller_error(e) && rethrow()
@@ -941,9 +946,10 @@ makes it more apt for this decision rather than less: what it measures is how we
 rate describes these cells at this timestep, which is the question behind accepting the fit.
 
 The regression described is the same one `derive_lapse_rate` performs — on the ice-free temperature
-`T' = T - glm·(γ + δ·z)` for a cell above melting and `T' = T` otherwise, under the same `fit_ok`
-screen, so the reported error belongs to the reported slope. Squaring `T'` needs `Σglm·T` and
-`Σglm·z·T` over the cells above melting beside the regressor moments upstream already keeps. `NaN`
+`T' = T - glm·(γ + δ·z)` for a cell above melting and `T' = T` otherwise, under the same
+`_corrects_to_ambient` screen, so the reported error belongs to the reported slope. Squaring `T'`
+needs `Σglm·T` and `Σglm·z·T` over the cells above melting beside the regressor moments upstream
+already keeps. `NaN`
 wherever the slope itself is `NaN`, and wherever there are too few cells to have any residual degrees
 of freedom.
 """
@@ -973,8 +979,7 @@ function derive_lapse_rate_uncertainty(acc, decoupling; min_cells::Int = _MIN_CE
 
             # The same screen `derive_lapse_rate` applies, so this error belongs to that slope: an
             # unmeasured or out-of-domain `k` leaves the temperatures uncorrected.
-            fit_ok = isfinite(k[t]) && 0.0 < k[t] <= 1.0 && isfinite(cγ[t]) && isfinite(cδ[t])
-            γ, δ = fit_ok ? (cγ[t], cδ[t]) : (0.0, 0.0)
+            γ, δ = _corrects_to_ambient(k[t], cγ[t], cδ[t]) ? (cγ[t], cδ[t]) : (0.0, 0.0)
 
             # Sums over the warm cells of the correction `u = glm·(γ + δz)`, of `z·u`, `u²`, and of
             # `u·(T - T_ref)`. Cells at or below melting have `u = 0`.

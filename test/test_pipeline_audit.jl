@@ -12,7 +12,7 @@ function _flat_applied(time, edges; k = 1.0, lapse_rate = 6.5)
     return GEMB_GlacierSims.AppliedDownscaling(collect(time), fill(Float64(lapse_rate), n),
                                                fill(Int8(1), n), bands, :fitted,
                                                Dict{String,Any}(), Dict{String,Any}(),
-                                               z -> fill(Float64(k), n))
+                                               z -> zeros(n))
 end
 
 @testset "pipeline audit: analytical" begin
@@ -73,6 +73,48 @@ end
     @test cf0.temperature_air ≈ @.(273.15 + ifelse(E0 > 0, k * E0, E0)) atol = 1e-10
 end
 
+@testset "pipeline audit: a donor where k(z) is near zero" begin
+    # One fully glaciated cell (glm = 1) at 1800 m holding 5 km² of ice in the 1000-1100 m band, and
+    # a fit, per timestep, with ambient excess α + βz of 8 K at the reference 1000 m and 4 K at
+    # 1800 m, and glacier term γ + δz of -4 K at 1000 m (k = 0.5) and -4·(1 - 1e-7) K at 1800 m
+    # (k = 1e-7). The cell observes 2 K above melting where the fit predicts 4e-7 K, a +2 K
+    # residual. Its ambient excess is the fit's 4 K plus that residual,
+    # 2 + 4·(1 - 1e-7) K; lapsed 750 m down at 6.5 K/km and decoupled with the band's
+    # k(1050) = 1 + g(1050)/E(1050), the band temperature follows in closed form. Inverting the
+    # observed excess with k at the donor instead multiplies it by 1e7, which no validator accepts,
+    # and the band is dropped.
+    n = length(_CP_TIME)
+    ti = Ti(_CP_TIME)
+    col(v) = DimArray(fill(Float64(v), n), ti)
+    z̄, z_d, z_b = 1000.0, 1800.0, 1050.0
+    β = (4.0 - 8.0) / (z_d - z̄)
+    α = 8.0 - β * z̄
+    g_ref, g_d = -4.0, (1e-7 - 1) * 4.0
+    δ = (g_d - g_ref) / (z_d - z̄)
+    γ = g_ref - δ * z̄
+    fit = (; time = _CP_TIME,
+           decoupling = DimStack((decoupling_factor = col(0.5), coef_alpha = col(α),
+                                  coef_beta = col(β), coef_gamma = col(γ), coef_delta = col(δ))),
+           lapse_rate = DimStack((lapse_rate = col(6.5), n_cells = DimArray(fill(10, n), ti),
+                                  elevation_spread = col(500.0))))
+    intervals = [(; lo = 1000, hi = 1100, center = z_b)]
+    applied = resolve_downscaling(fit, intervals, _CP_TIME; basis = :fitted)
+    cells = [(lon = 10.0, lat = 46.0, z = z_d, glm = 1.0, bins = [(1050, 5.0)])]
+    T_obs = 273.15 + 2.0
+    bands = collect(elevation_interval_forcing(
+        _cp_table(cells), applied; climate_model = :synthetic,
+        time_range = (_CP_TIME[1], _CP_TIME[end]),
+        forcing_loader = _cp_loader(cells, c -> fill(T_obs, n))))
+    @test length(bands) == 1
+    band = only(bands)
+    @test band.area ≈ 5.0
+    E_ambient = 2.0 + 4.0 * (1 - 1e-7)
+    E_band = E_ambient + 6.5 * (z_d - z_b) / 1000
+    k_band = 1 + (γ + δ * z_b) / (α + β * z_b)
+    @test all(t -> isapprox(t, 273.15 + k_band * E_band; atol = 1e-6),
+              band.forcing.temperature_air)
+end
+
 @testset "pipeline audit: band optical thickness at the cap" begin
     # Three cells at the per-cell cap whose area-weighted mean rounds one ulp above it, as the
     # accumulation forms it: the band mean is the cap itself, which the forcing validator accepts.
@@ -110,19 +152,23 @@ function _tiny_band_forcing(; years = 3, shortwave = 300.0, temperature = 273.15
                         "precipitation_mean" => precipitation * 8 * 365))
 end
 
-# A tile run of one band per entry of `albedos`, all on the same forcing.
+# A tile run of one band per entry of `albedos`, all on the same forcing. `core_bins` is the tile's
+# hypsometry, `(center, area)` per 100 m bin, and `extra_edges` adds intervals to `applied` that have
+# no band.
 function _tiny_tile_run(albedos; forcing = _tiny_band_forcing(), mp = initialize_parameters(
-                            output_frequency = :monthly), kwargs...)
+                            output_frequency = :monthly), core_bins = [(1050, 10.0)],
+                        extra_edges = Tuple{Int,Int}[], kwargs...)
     n = length(dims(forcing, Ti))
     bands = [(; lo = 1000 + 100 * (i - 1), hi = 1100 + 100 * (i - 1), center = 1050.0 + 100 * (i - 1),
               area = 10.0 * i, n_cells = 1, n_cells_substituted = 0, area_substituted = 0.0,
               area_unrecovered = 0.0, max_donor_distance_km = 0.0,
               albedo_ice = a, albedo_ice_source = :observed, forcing)
              for (i, a) in enumerate(albedos)]
-    applied = _flat_applied(collect(dims(forcing, Ti)), [(b.lo, b.hi) for b in bands])
+    applied = _flat_applied(collect(dims(forcing, Ti)),
+                            sort!([[(b.lo, b.hi) for b in bands]; extra_edges]))
     tile = (; index = (10, 46), name = "N46_E010.nc",
             bounds = (lon_min = 10.0, lon_max = 12.0, lat_min = 46.0, lat_max = 48.0),
-            core = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0)])]))
+            core = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = core_bins)]))
     window = (first(lookup(forcing, Ti)), last(lookup(forcing, Ti)))
     return gemb_glacier_tile(tile, applied, bands, mp; spinup_window = window,
                              simulation_years_maximum = 3, threaded = false, kwargs...)
@@ -304,6 +350,42 @@ end
     @test isempty(kept) && only(dropped).delta == -30.0
     @test_throws ForcingUnavailable _tiny_tile_run([0.4]; forcing = cold,
                                                    validation_grid = ([-30.0], [1.0]))
+end
+
+@testset "pipeline audit: intervals without band forcing" begin
+    # The tile holds 99.5 km² at 1050 m, which has a band, and 0.5 km² at 1150 m, which does not —
+    # an interval `elevation_interval_forcing` dropped. 0.5 % of the tile's ice is under the 1 %
+    # default: the tile runs, and the interval is counted with its area and written to the file.
+    forcing = _tiny_band_forcing()
+    run = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 99.5), (1150, 0.5)],
+                         extra_edges = [(1100, 1200)])
+    p = run.provenance
+    @test length(run.bands) == 1
+    @test p["n_bands_dropped"] == 1
+    @test p["n_intervals_without_forcing"] == 1
+    @test p["intervals_without_forcing_area_km2"] ≈ 0.5
+    @test p["dropped_area_km2"] ≈ 0.5
+    @test p["hypsometry_area_km2"] ≈ 100.0
+    path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), run)
+    NCDatasets.NCDataset(path, "r") do ds
+        @test ds.attrib["n_bands_dropped"] == 1
+        @test ds.attrib["intervals_without_forcing_area_km2"] ≈ 0.5
+    end
+
+    # 2 km² of 100 is above the 1 % default, so the tile is refused before any GEMB run; a looser
+    # stated fraction admits it.
+    @test_throws "above the 1.0 % allowed by `dropped_interval_area_fraction_maximum`" _tiny_tile_run(
+        [0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)], extra_edges = [(1100, 1200)])
+    loose = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)],
+                           extra_edges = [(1100, 1200)],
+                           dropped_interval_area_fraction_maximum = 0.05)
+    @test loose.provenance["intervals_without_forcing_area_km2"] ≈ 2.0
+    @test_throws "dropped_interval_area_fraction_maximum must be in [0, 1]" _tiny_tile_run(
+        [0.4]; forcing, dropped_interval_area_fraction_maximum = 1.5)
+
+    # Every interval with a band: nothing is counted.
+    @test TINY_RUN.provenance["n_intervals_without_forcing"] == 0
+    @test TINY_RUN.provenance["n_bands_dropped"] == 0
 end
 
 @testset "pipeline audit: unconverged spinups are recorded" begin
