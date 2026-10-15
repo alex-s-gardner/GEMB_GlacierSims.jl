@@ -221,6 +221,77 @@ function read_glacier_tile_status(path::AbstractString)
     end
 end
 
+"""
+    tile_run_disposition(status, requested, run_time, intervals; delta_temperatures,
+                         precipitation_scalings, output_frequency,
+                         lost_area_fraction_maximum = LOST_AREA_FRACTION_MAXIMUM) -> Symbol
+
+What an existing tile or native-cell file is worth to a request, from its
+[`read_glacier_tile_status`](@ref) `status` alone, so the decision costs no forcing pass:
+
+- `:current`: it already covers the record; nothing to do.
+- `:extendable`: the same experiment, but the record has grown since. Resume from its firn state and
+  append rather than repeating a spinup and a whole transient to add a few months.
+- `:rebuild`: a different experiment, or nothing usable.
+
+`requested` is the [`tile_run_parameters`](@ref) of the run about to happen, `run_time` its forcing
+time axis, and `intervals` the elevation intervals (each with a `center`) the request's hypsometry
+holds ice in. The file is the same experiment when its perturbation grid is the requested one, its run
+parameters agree with `requested`, and every interval holding ice is accounted for: a band the file
+stores, or a dropped interval it records (`dropped_band_centers`). A file whose bands are a subset of
+the intervals is therefore current when the rest were dropped and recorded as such. A file that does
+not record its lost-ice accounting, or whose loss exceeds `lost_area_fraction_maximum` of its ice, is
+rebuilt.
+
+The stored time is the last *output* sample while `run_time` ends at the last *forcing* step, and a
+coarser output grid never reaches the forcing's final step, so a record extended by less than one
+output period ([`output_period_bound`](@ref)) counts as covered: it spans no further output interval.
+"""
+function tile_run_disposition(status, requested, run_time, intervals; delta_temperatures,
+                              precipitation_scalings, output_frequency::Symbol,
+                              lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM)
+    status === nothing && return :rebuild
+    (status.n_timesteps == 0 || status.time === nothing) && return :rebuild
+    # The run grid: a band set or perturbation grid other than this request's means the stored arrays
+    # describe something else, and no seam could join them.
+    centers = Set(Float64(iv.center) for iv in intervals)
+    stored = Set(status.band_centers)
+    issubset(stored, centers) || return :rebuild
+    Base.union(stored, status.dropped_band_centers) == centers || return :rebuild
+    status.delta_temperatures == collect(Float64, delta_temperatures) || return :rebuild
+    status.precipitation_scalings == collect(Float64, precipitation_scalings) || return :rebuild
+    # The lost-ice accounting, which the rule on it needs.
+    (status.hypsometry_area_km2 === missing || status.lost_area_km2 === missing) && return :rebuild
+    status.lost_area_km2 <= lost_area_fraction_maximum * status.hypsometry_area_km2 ||
+        return :rebuild
+    # The settings: a changed model parameter or downscaling policy makes it a different experiment,
+    # which must not be spliced onto an old record.
+    isempty(status.parameters) && return :rebuild
+    isempty(run_parameter_differences(status.parameters, requested)) || return :rebuild
+    period = output_period_bound(output_frequency)
+    covered = period === nothing ? status.time >= last(run_time) :
+              status.time + period >= last(run_time)
+    return covered ? :current : :extendable
+end
+
+"""
+    output_period_bound(output_frequency::Symbol) -> Period or nothing
+
+The longest span one GEMB output period covers: `Day(31)`, `Day(7)` or `Day(1)` for `:monthly`,
+`:weekly` and `:daily`, and `nothing` for `:all`, where every output step is a forcing step. An upper
+bound, because understating it would declare a complete file short and run it again. Throws for any
+other frequency, which would otherwise be compared exactly against a forcing step its output grid never
+reaches, so every such file would read as short.
+"""
+function output_period_bound(output_frequency::Symbol)
+    output_frequency === :monthly && return Day(31)
+    output_frequency === :weekly && return Day(7)
+    output_frequency === :daily && return Day(1)
+    output_frequency === :all && return nothing
+    throw(ArgumentError("no output period is known for output_frequency = :$output_frequency; add " *
+                        "one before using it for a tile run, or every file reads as short"))
+end
+
 # A numeric vector attribute, or an empty vector when it is absent. NetCDF hands a one-element vector
 # attribute back as a scalar.
 _attribute_vector(ds, key) =

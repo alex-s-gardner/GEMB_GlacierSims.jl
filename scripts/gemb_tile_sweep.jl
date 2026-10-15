@@ -126,7 +126,7 @@ const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "
 # How often the transient is sampled. Weekly resolves the melt season, which monthly averages across:
 # ablation is concentrated in a few weeks and a monthly mean spreads it over the whole month, so a
 # comparison against altimetry binned finer than a month cannot see it. `output_period_bound` must know
-# the period of whatever is chosen here.
+# the period of whatever is chosen here, and the pre-flight checks that it does.
 #
 # The cost is series size, not simulation time: the timestep is the forcing's either way, so this only
 # changes how much of it is written — about 4.4x more steps than monthly over the full record.
@@ -286,6 +286,8 @@ function main()
     end
     all(>=(0), PRECIPITATION_SCALINGS) || error(
         "a negative precipitation scaling is not a scenario; got " * string(PRECIPITATION_SCALINGS))
+    # The skip test needs the output period; an unknown frequency throws here, not per tile.
+    output_period_bound(OUTPUT_FREQUENCY)
 
     isfile(PARQUET) || error("no glacier elevation-class table at $PARQUET")
     isdir(PARAMETER_DIR) || error("no downscaling parameters at $PARAMETER_DIR; run " *
@@ -413,7 +415,10 @@ function run_tile(i, tile, name, path, mp; token, cache)
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :
-                  tile_run_disposition(status, requested, probe_time, intervals, mp)
+                  tile_run_disposition(status, requested, probe_time, intervals;
+                                       delta_temperatures = DELTA_TEMPERATURES,
+                                       precipitation_scalings = PRECIPITATION_SCALINGS,
+                                       output_frequency = mp.output_frequency)
     if disposition === :current
         @info "Tile already covers the request; skipping" tile=i name last_time=status.time
         return summary_row(tile, name, :skipped, time() - t0)
@@ -495,64 +500,6 @@ function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
                          time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
-end
-
-# The longest span one output period can cover. An upper bound is the safe direction for the window test
-# below: understating it would declare a complete file short and re-run it, which is the failure this
-# exists to prevent.
-#
-# `nothing` is reserved for `:all`, where every output step *is* a forcing step and the window end compares
-# exactly. Any coarser frequency must name its period here: a frequency that falls through to `nothing`
-# would be compared exactly against the last forcing step, which a coarser grid never reaches, so every
-# such file would read as short and be re-run or re-appended forever.
-function output_period_bound(mp)
-    f = mp.output_frequency
-    f === :monthly && return Day(31)
-    f === :weekly && return Day(7)
-    f === :daily && return Day(1)
-    f === :all && return nothing
-    # `:last` leaves a single step and is only used inside the spinup, never for a tile run; anything else
-    # is a frequency added to GEMB without a period given here, and silently comparing it exactly is the
-    # bug described above.
-    error("output_period_bound: no period known for output_frequency = :$f; add one before using it " *
-          "for a tile run, or the skip test will treat every file as short")
-end
-
-# What an existing tile file is worth to this request:
-#
-#   `:current`    — it already covers the record; nothing to do.
-#   `:extendable` — the same experiment, but the record has grown since. Resume from its firn state and
-#                   append, rather than repeating a spinup and a whole transient to add a few months.
-#   `:rebuild`    — a different experiment, or nothing usable.
-#
-# Decided from the file's coordinates and attributes only: the point of the check is to avoid the forcing
-# pass, so it must not read one. Splitting `:extendable` out from `:rebuild` is what makes an update
-# cheap; before, both were "not current" and both rebuilt.
-function tile_run_disposition(status, requested, run_time, intervals, mp)
-    status === nothing && return :rebuild
-    status.n_timesteps == 0 && return :rebuild
-    status.time === nothing && return :rebuild
-    # The run grid: a changed band set or perturbation grid means the stored arrays describe something
-    # else entirely, and no seam could join them.
-    status.band_centers == [x.center for x in intervals] || return :rebuild
-    status.delta_temperatures == DELTA_TEMPERATURES || return :rebuild
-    status.precipitation_scalings == PRECIPITATION_SCALINGS || return :rebuild
-    # The settings: a changed model parameter or downscaling policy makes it a different experiment, which
-    # must not be spliced onto an old record.
-    isempty(status.parameters) && return :rebuild
-    isempty(run_parameter_differences(status.parameters, requested)) || return :rebuild
-
-    # Same experiment. Does it already reach the end of the record? The stored time is the last *output*
-    # sample while `run_time` is the last *forcing* step, and a coarser output grid never reaches the
-    # forcing's final step — monthly output for a window ending 2023-01-01T00:00 lands on
-    # 2022-12-31T23:00. Comparing the two directly is what made every file look stale.
-    #
-    # The tolerance means a record extended by less than one output period counts as covered: such an
-    # extension spans no further output interval, so re-running would reproduce the same series.
-    period = output_period_bound(mp)
-    covered = period === nothing ? status.time >= last(run_time) :
-              status.time + period >= last(run_time)
-    return covered ? :current : :extendable
 end
 
 function summary_row(tile, name, status, seconds; run = nothing,

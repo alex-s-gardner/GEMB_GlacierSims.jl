@@ -125,6 +125,7 @@ include("netcdf_tile_merge.jl")
 export merge_tile_perturbations
 export write_glacier_tile_netcdf, append_glacier_tile_netcdf
 export read_glacier_tile_status, read_glacier_tile_restart
+export tile_run_disposition, output_period_bound
 
 # After the tile run, which a native cell run is: one cell's forcing, the tile's downscaling, and the
 # calibrated correction as a one-point perturbation grid.

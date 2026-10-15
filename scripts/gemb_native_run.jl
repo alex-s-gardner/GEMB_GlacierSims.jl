@@ -368,7 +368,6 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
     populated = [iv for (iv, a) in
                  zip(applied.bands, GEMB_GlacierSims._interval_areas(row, applied.bands)) if a > 0]
     isempty(populated) && return summary_row(cell, tile_name, :empty, time() - t0; correction)
-    centers = [iv.center for iv in populated]
     # Every band of this cell lies in an interval the reference tile run dropped: the whole cell's ice
     # is dropped with them, and counted against the tile.
     modelled = Set(modelled_intervals)
@@ -379,8 +378,13 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
     end
 
     status = read_glacier_tile_status(path)
+    # The cell's own lost-ice share is not bounded; the rule applies to the tile.
     disposition = FORCE ? :rebuild :
-                  cell_run_disposition(status, requested, applied.time, centers, correction, mp)
+                  tile_run_disposition(status, requested, applied.time, populated;
+                                       delta_temperatures = [correction.ΔT],
+                                       precipitation_scalings = [correction.pscale],
+                                       output_frequency = mp.output_frequency,
+                                       lost_area_fraction_maximum = 1.0)
     disposition === :current &&
         return summary_row(cell, tile_name, :skipped, time() - t0; correction,
                            hypsometry_area_km2 = status.hypsometry_area_km2,
@@ -436,38 +440,11 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                        run, correction, t_run)
 end
 
-# The tile sweep's `tile_run_disposition`, for a cell. One difference: a cell file holds the bands that
-# were runnable, which may be fewer than the cell's populated bands (a band whose forcing the validator
-# refuses is dropped and recorded as such), so the stored bands need only be a subset of the cell's.
-# Coverage is judged against the last forcing step in `run_time` with the tolerance of one output
-# period, because a coarser output grid never lands on the last forcing step.
-function cell_run_disposition(status, requested, run_time, centers, correction, mp)
-    status === nothing && return :rebuild
-    (status.n_timesteps == 0 || status.time === nothing) && return :rebuild
-    issubset(status.band_centers, centers) || return :rebuild
-    status.delta_temperatures == [correction.ΔT] || return :rebuild
-    status.precipitation_scalings == [correction.pscale] || return :rebuild
-    # The tile-level lost-ice rule needs every cell's accounting.
-    (status.hypsometry_area_km2 === missing || status.lost_area_km2 === missing) && return :rebuild
-    isempty(status.parameters) && return :rebuild
-    isempty(run_parameter_differences(status.parameters, requested)) || return :rebuild
-    covered = status.time + output_period_bound(mp) >= last(run_time)
-    return covered ? :current : :extendable
-end
-
 function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     row = first(tile.core)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
                          time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
-end
-
-function output_period_bound(mp)
-    f = mp.output_frequency
-    f === :weekly && return Day(7)
-    f === :monthly && return Day(31)
-    f === :daily && return Day(1)
-    error("output_period_bound: no period known for output_frequency = :$f")
 end
 
 # One row per cell, or with `cell = nothing` one row for the tile (its `tile` is then required).

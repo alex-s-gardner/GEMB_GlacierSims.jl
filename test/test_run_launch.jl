@@ -182,3 +182,43 @@ end
     @test !claim_tile!(claims, "t", "/nonexistent"; stale_after = Hour(0))
     @test_throws "no claim for absent" start_claim_heartbeat(claims, "absent")
 end
+
+@testset "run launch: relaunch disposition" begin
+    # Spec 10. A tile whose hypsometry holds ice at 1050, 1550 and 2050 m, whose file stores the first
+    # two bands and records 2050 m as dropped: the file accounts for every interval, so a relaunch with
+    # the same settings skips it.
+    run = _fake_tile_run(; bands = [(1050, 12.5), (1550, 40.25)])
+    merge!(run.provenance, Dict{String,Any}("dropped_band_centers" => [2050.0],
+                                            "dropped_band_areas" => [0.5],
+                                            "dropped_band_causes" => [2.0],
+                                            "hypsometry_area_km2" => 53.25,
+                                            "lost_area_km2" => 0.5))
+    path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), run)
+    status = read_glacier_tile_status(path)
+    intervals = [(; center = c) for c in (1050.0, 1550.0, 2050.0)]
+    grid = (; delta_temperatures = run.delta_temperatures,
+            precipitation_scalings = run.precipitation_scalings, output_frequency = :monthly)
+    disposition(s = status; requested = run.parameters, run_time = run.time, ivs = intervals, kw...) =
+        tile_run_disposition(s, requested, run_time, ivs; grid..., kw...)
+    @test disposition() === :current
+    # The record has grown by more than one output period: append.
+    @test disposition(; run_time = [run.time; last(run.time) + Day(40)]) === :extendable
+    # An interval holding ice that the file neither stores nor records as dropped: a different
+    # hypsometry, so the file is rebuilt.
+    @test disposition(; ivs = [intervals; (; center = 2550.0)]) === :rebuild
+    # A stored band the request does not hold ice in.
+    @test disposition(; ivs = intervals[2:3]) === :rebuild
+    # A different experiment.
+    @test disposition(; requested = merge(run.parameters, Dict{String,Any}("model_albedo_ice" => 0.5))) ===
+          :rebuild
+    @test tile_run_disposition(status, run.parameters, run.time, intervals; grid...,
+                               delta_temperatures = [0.0]) === :rebuild
+    # A loss above the rule is rebuilt (and refused again), and so is a file that does not record its
+    # accounting at all.
+    @test disposition(; lost_area_fraction_maximum = 0.005) === :rebuild
+    @test disposition(merge(status, (; lost_area_km2 = missing))) === :rebuild
+    @test disposition(nothing) === :rebuild
+    @test output_period_bound(:weekly) == Day(7)
+    @test output_period_bound(:all) === nothing
+    @test_throws "no output period is known for output_frequency = :hourly" output_period_bound(:hourly)
+end
