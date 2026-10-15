@@ -18,8 +18,10 @@ end
 @testset "pipeline audit: analytical" begin
     @testset "band shortwave layers" begin
         # Two cells holding 1 and 3 km² of one band. The zenith angle is the angle whose cosine is
-        # the shortwave-weighted mean cosine; diffuse shortwave and optical thickness are plain area
-        # means; a step with no shortwave in either cell has the sun at the horizon.
+        # the shortwave-weighted mean cosine; diffuse shortwave is a plain area mean; the optical
+        # thickness is the shortwave-weighted mean τ, which is the τ of the band's mean cloud
+        # transmissivity. A step with no shortwave in either cell has the sun at the horizon and
+        # τ = 0.
         cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 1.0)]),
                  (lon = 10.1, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 3.0)])]
         n = 3
@@ -43,10 +45,12 @@ end
             expected_sza = total_sw > 0 ?
                 acosd((w[1] * sw[1][t] * cosd(sza[1][t]) + w[2] * sw[2][t] * cosd(sza[2][t])) /
                       total_sw) : 90.0
+            expected_tau = total_sw > 0 ?
+                (w[1] * sw[1][t] * tau[1][t] + w[2] * sw[2][t] * tau[2][t]) / total_sw : 0.0
             @test band.forcing[:solar_zenith_angle][t] ≈ expected_sza atol = 1e-10
             @test band.forcing[:shortwave_downward_diffuse][t] ≈
                   (diffuse[1][t] + 3 * diffuse[2][t]) / 4 atol = 1e-12
-            @test band.forcing[:cloud_optical_thickness][t] ≈ (tau[1][t] + 3 * tau[2][t]) / 4 atol = 1e-12
+            @test band.forcing[:cloud_optical_thickness][t] ≈ expected_tau atol = 1e-12
             @test band.forcing[:shortwave_downward][t] ≈ total_sw / 4 atol = 1e-12
         end
     end
@@ -115,17 +119,72 @@ end
               band.forcing.temperature_air)
 end
 
-@testset "pipeline audit: band optical thickness at the cap" begin
-    # Three cells at the per-cell cap whose area-weighted mean rounds one ulp above it, as the
-    # accumulation forms it: the band mean is the cap itself, which the forcing validator accepts.
-    cap = GEMB_GlacierSims.CLOUD_OPTICAL_THICKNESS_MAX
-    w = [0.1, 0.1, 0.7]
-    total = foldl((acc, x) -> acc + x * cap, w; init = 0.0)
-    @test total / foldl(+, w) > cap
-    sums = Dict(:cloud_optical_thickness => [total], :shortwave_downward => [1.0])
-    @test GEMB_GlacierSims._band_layer(:cloud_optical_thickness, sums, foldl(+, w)) == [cap]
-    @test_throws "above the per-cell cap" GEMB_GlacierSims._band_layer(
-        :cloud_optical_thickness, Dict(:cloud_optical_thickness => [1.01 * cap]), 1.0)
+@testset "pipeline audit: band optical thickness" begin
+    # A band's τ is that of its mean cloud transmissivity: with t(τ) = 1/(1 + 0.13τ) per cell, area
+    # w and shortwave SW, the clear-sky shortwave is SW/t, t̄ = Σ w·SW / Σ w·SW/t and τ = (1/t̄ − 1)/0.13
+    # (Lacis & Hansen 1974), capped at the ClimateForcing cap. Expected values below are those
+    # closed forms; τ(0.3) = (1/0.3 − 1)/0.13 is a cell whose transmissivity is 0.3.
+    cap = GEMB_ClimateForcing.CLOUD_OPTICAL_THICKNESS_MAX
+    t_cap = 1 / (1 + 0.13 * cap)
+    τ03 = (1 / 0.3 - 1) / 0.13
+    S = 400.0                                   # clear-sky shortwave, W m-2
+    # Five steps, each a case, for the equal-area pair (A, B):
+    #   1. t = 1 and 0.3 under the same clear sky       → t̄ = 0.65
+    #   2. no shortwave in either cell, τ 0 and the cap  → 0
+    #   3. a clear cell and a capped cell with shortwave → t̄ = (1 + t_cap)/2
+    #   4. a clear cell and a capped cell with none      → 0, the clear cell's τ
+    #   5. one τ in both cells, different shortwave      → that τ exactly
+    sw_A, τ_A = [S, 0.0, S, S, 250.0], [0.0, 0.0, 0.0, 0.0, 3.7]
+    sw_B, τ_B = [0.3S, 0.0, t_cap * S, 0.0, 90.0], [τ03, cap, cap, cap, 3.7]
+    expected_AB = [(1 / 0.65 - 1) / 0.13, 0.0, (2 / (1 + t_cap) - 1) / 0.13, 0.0, 3.7]
+    # Areas 1 and 3 with t = 1 and 0.3 under the same clear sky: t̄ = (1 + 3·0.3)/4 = 0.475.
+    sw_C, τ_C = fill(S, 5), zeros(5)
+    sw_D, τ_D = fill(0.3S, 5), fill(τ03, 5)
+    # A one-cell band carries its cell's τ bit for bit, including a capped step with no shortwave
+    # and a night step.
+    sw_E, τ_E = [S, 0.0, 37.0, 0.0, 212.0], [0.0, cap, 6.25, 0.0, τ03 / 3]
+    cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 1.0)], sw = sw_A, τ = τ_A),
+             (lon = 10.1, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 1.0)], sw = sw_B, τ = τ_B),
+             (lon = 10.2, lat = 46.0, z = 2000.0, glm = 0.0, bins = [(2050, 1.0)], sw = sw_C, τ = τ_C),
+             (lon = 10.3, lat = 46.0, z = 2000.0, glm = 0.0, bins = [(2050, 3.0)], sw = sw_D, τ = τ_D),
+             (lon = 10.4, lat = 46.0, z = 3000.0, glm = 0.0, bins = [(3050, 2.0)], sw = sw_E, τ = τ_E)]
+    n = 5
+    loader = function (_model, lat, lon; kwargs...)
+        c = cells[findfirst(c -> c.lat == lat && c.lon == lon, cells)]
+        _cp_forcing(lat, lon, c.z, fill(270.0, n); shortwave_downward = c.sw,
+                    shortwave_downward_diffuse = 0.3 .* c.sw, cloud_optical_thickness = c.τ)
+    end
+    applied = _flat_applied(_CP_TIME[1:n], [(1000, 1100), (2000, 2100), (3000, 3100)])
+    bands = collect(elevation_interval_forcing(
+        _cp_table(cells), applied; climate_model = :synthetic,
+        time_range = (_CP_TIME[1], _CP_TIME[n]), forcing_loader = loader))
+    @test [b.center for b in bands] == [1050.0, 2050.0, 3050.0]
+    τ_band(b) = collect(b.forcing[:cloud_optical_thickness])
+
+    @test all(isapprox.(τ_band(bands[1]), expected_AB; rtol = 1e-12, atol = 0))
+    @test τ_band(bands[1])[2] == 0.0
+    @test τ_band(bands[1])[4] == 0.0
+    @test τ_band(bands[1])[5] == 3.7
+    # A plain area mean would have given (0 + 17.95)/2 = 8.97 at step 1 and cap/2 at step 4.
+    @test τ_band(bands[1])[1] < τ03 / 2
+    @test all(<=(cap), τ_band(bands[1]))
+    @test all(isapprox.(τ_band(bands[2]), (1 / 0.475 - 1) / 0.13; rtol = 1e-12))
+    @test τ_band(bands[3]) == τ_E
+
+    # The native run forces each cell on its own: a one-cell band of that cell, so its τ is the
+    # cell's τ exactly, as in the tile run's one-cell band above.
+    for c in cells
+        own = collect(elevation_interval_forcing(
+            _cp_table([c]), applied; climate_model = :synthetic,
+            time_range = (_CP_TIME[1], _CP_TIME[n]), forcing_loader = loader))
+        @test τ_band(only(own)) == c.τ
+    end
+
+    # The band transmissivity of finite sums is a weighted mean of values in (0, 1], so anything
+    # above 1 beyond rounding is refused rather than inverted.
+    @test_throws "band cloud transmissivity" GEMB_GlacierSims._band_cloud_optical_thickness(
+        [1.0], [1.1], [0.0], [1.0])
+    @test GEMB_GlacierSims._band_cloud_optical_thickness([1.0], [1.0 + 1e-13], [0.0], [1.0]) == [0.0]
 end
 
 # Band forcing for a short GEMB run: `years` of 3-hourly steps from 2000, every layer constant.

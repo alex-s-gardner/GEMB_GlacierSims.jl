@@ -519,8 +519,12 @@ A region whose forcing follows the mixing model the fits measure therefore gives
 `T_ref + k(z_band)·E_ambient(z_band)` from every cell, whatever its `glm`. The order matters: the
 decoupling damps only the excess above a fixed melting point, and lapsing changes which timesteps are
 above it. Cells sharing a band are then averaged weighted by each cell's glacier area in it — every
-layer by plain area weight, except `solar_zenith_angle`, which is the angle whose cosine is the
-shortwave-weighted mean cosine (90° at a step with no shortwave).
+layer by plain area weight, except two that follow the shortwave. `solar_zenith_angle` is the angle
+whose cosine is the shortwave-weighted mean cosine (90° at a step with no shortwave).
+`cloud_optical_thickness` is the `τ` of the band's mean cloud transmissivity, the band's shortwave
+over its clear-sky shortwave `Σ w·SW/t(τ)` with `t(τ) = 1/(1 + 0.13τ)`, capped at
+`CLOUD_OPTICAL_THICKNESS_MAX`; it equals the shortwave-weighted mean `τ`, a band whose cells all
+report one `τ` takes that `τ` exactly, and a step with no shortwave in any cell takes 0.
 
 Laziness is what makes a large region tractable. All bands at once is `n_bands * 7 * n_time` Float64s
 — ~2 GB for 50 bands of 76 hourly years — so instead each `iterate` streams the cells again and
@@ -675,8 +679,11 @@ end
 function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
     n = length(ivf.time)
     intervals = ivf.intervals[range]
-    # Running weighted sums per interval, one array per forcing layer, plus the weight totals.
-    sums = [Dict(v => zeros(n) for v in _FORCING_VARIABLES) for _ in intervals]
+    # Running weighted sums per interval, one array per forcing layer plus the range of the cells'
+    # cloud optical thickness, and the weight totals.
+    sums = [merge(Dict(v => zeros(n) for v in _FORCING_VARIABLES),
+                  Dict(_TAU_MIN => fill(Inf, n), _TAU_MAX => fill(-Inf, n)))
+            for _ in intervals]
     weights = zeros(length(intervals))
     counts = zeros(Int, length(intervals))
     # Intervals no donor cell can legally be adjusted to, and why. Extrapolating a cell's forcing far
@@ -850,16 +857,22 @@ end
 # gives. Threading over cells instead would have several threads adding into the same interval, where
 # floating-point addition is not associative.
 #
-# Every layer is a glacier-area weighted mean except `solar_zenith_angle`, whose slot accumulates
-# `w·SW·cos(θ)`; `_interval_stack` divides it by the `w·SW` the shortwave slot already holds.
+# Every layer is a glacier-area weighted mean except two. The `solar_zenith_angle` slot accumulates
+# `w·SW·cos(θ)`, which `_interval_stack` divides by the `w·SW` the shortwave slot already holds. The
+# `cloud_optical_thickness` slot accumulates the clear-sky shortwave `w·SW/t(τ)`, from which
+# `_band_layer` forms the band transmissivity, and the `_TAU_MIN`/`_TAU_MAX` slots the range of the
+# cells' `τ`.
 function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, reasons,
                                      n_substituted, substituted, donor_distance,
                                      intervals, areas, ambient, z_cell, ivf, n,
                                      substituting::Bool, distance::Float64)
     no_glacier_term = zeros(n)
-    # The zenith angle is the cell's own at every interval (lapsing and decoupling leave it unchanged),
-    # so its cosine is taken once per cell.
+    # The zenith angle and the cloud optical thickness are the cell's own at every interval (lapsing
+    # and decoupling leave them unchanged), so the cosine and the clear-sky ratio `1/t(τ)` are taken
+    # once per cell.
     cos_zenith = cosd.(parent(ambient[:solar_zenith_angle]))
+    τ = parent(ambient[:cloud_optical_thickness])
+    clear_sky_ratio = inv.(cloud_transmissivity.(τ))
     Threads.@threads for i in eachindex(intervals)
         areas[i] > 0 && !unreachable[i] || continue
         interval = intervals[i]
@@ -883,6 +896,9 @@ function _accumulate_cell_intervals!(sums, weights, counts, z_max, unreachable, 
             # record-length loops run behind a function barrier, where it is.
             if v === :solar_zenith_angle
                 _add_weighted_product!(sums[i][v], w, sw, cos_zenith)
+            elseif v === :cloud_optical_thickness
+                _add_weighted_product!(sums[i][v], w, sw, clear_sky_ratio)
+                _extend_range!(sums[i][_TAU_MIN], sums[i][_TAU_MAX], τ)
             else
                 _add_weighted!(sums[i][v], w, adjusted[v])
             end
@@ -915,6 +931,15 @@ function _add_weighted_product!(s, w, sw, c)
         s[t] += w * sw[t] * c[t]
     end
     return s
+end
+
+# Widen the per-timestep range `[lo, hi]` to include `x`.
+function _extend_range!(lo, hi, x)
+    for t in eachindex(lo, hi, x)
+        lo[t] = min(lo[t], x[t])
+        hi[t] = max(hi[t], x[t])
+    end
+    return lo, hi
 end
 
 """
@@ -1145,24 +1170,56 @@ function _steps_per_year(ti)
     return Dates.value(Millisecond(Day(365))) / Dates.value(Millisecond(t[2] - t[1]))
 end
 
+# Keys of the per-interval sums holding the per-timestep range of the contributing cells'
+# `cloud_optical_thickness`; see `_band_cloud_optical_thickness`.
+const _TAU_MIN = :_cloud_optical_thickness_min
+const _TAU_MAX = :_cloud_optical_thickness_max
+
 # One layer of a band's forcing from its accumulated sums.
-#
-# Cloud optical thickness is capped at `CLOUD_OPTICAL_THICKNESS_MAX` per cell, and an area mean of
-# values at the cap can round a few ulps above it, which the forcing validator rejects. A mean within
-# that rounding of the cap is set to the cap; one further above is an error in the inputs.
 function _band_layer(v::Symbol, sums, weight)
     v === :solar_zenith_angle && return _band_zenith_angle(sums[v], sums[:shortwave_downward])
-    mean = sums[v] ./ weight
-    if v === :cloud_optical_thickness
-        cap = CLOUD_OPTICAL_THICKNESS_MAX
-        for t in eachindex(mean)
-            mean[t] <= cap && continue
-            mean[t] <= cap * (1 + 1e-12) || throw(ErrorException(
-                "band mean cloud_optical_thickness is $(mean[t]) at step $t, above the per-cell cap $cap"))
-            mean[t] = cap
+    v === :cloud_optical_thickness &&
+        return _band_cloud_optical_thickness(sums[v], sums[:shortwave_downward], sums[_TAU_MIN],
+                                             sums[_TAU_MAX])
+    return sums[v] ./ weight
+end
+
+# A band's cloud optical thickness from the accumulated clear-sky shortwave `Σ w·SW/t(τ)`, the
+# shortwave `Σ w·SW`, and the range of the cells' `τ`: the `τ` of the band's mean transmissivity,
+#
+#     t̄ = Σ w·SW / Σ w·SW/t(τ),    τ_band = τ(t̄),
+#
+# with `t(τ) = 1/(1 + 0.13τ)` and its inverse `τ(t)` (capped at `CLOUD_OPTICAL_THICKNESS_MAX`) the
+# ClimateForcing pair `cloud_transmissivity` / `cloud_optical_thickness` (Lacis & Hansen 1974, the
+# relation the cells' `τ` were inverted with). `SW/t(τ)` is each cell's clear-sky shortwave, so `t̄`
+# is the band's shortwave over the band's clear-sky shortwave: it weights each cell's transmissivity by
+# the shortwave it would receive under clear sky, and gives the band the cloud transmission of the
+# shortwave it actually receives. Algebraically this is the shortwave-weighted mean of the cells'
+# `τ`. A plain area mean of `τ` would instead let a dark cell — `τ` at the cap with almost no
+# shortwave — set the band's cloud term.
+#
+# Where every contributing cell reports the same `τ`, that `τ` is the band's exactly: a weighted mean
+# of equal values, which the sums would reproduce only to rounding. This makes a one-cell band carry
+# its cell's `τ` bit for bit. Otherwise, a step whose clear-sky shortwave sums to zero (no cell
+# receives shortwave) has no band transmissivity and takes `τ = 0`, the value
+# `shortwave_forcing_layers` gives a step without sun.
+function _band_cloud_optical_thickness(sum_clear, sum_sw, τ_min, τ_max)
+    τ = similar(sum_sw)
+    for t in eachindex(τ, sum_clear, sum_sw, τ_min, τ_max)
+        if τ_min[t] == τ_max[t]
+            τ[t] = τ_min[t]
+        elseif sum_clear[t] > 0
+            tbar = sum_sw[t] / sum_clear[t]
+            # A weighted mean of transmissivities in (0, 1]; anything further above 1 than rounding
+            # is a bug.
+            0 < tbar <= 1 + 1e-12 || throw(ErrorException(
+                "band cloud transmissivity is $(tbar) at step $t, outside (0, 1]"))
+            τ[t] = cloud_optical_thickness(min(tbar, 1.0))
+        else
+            τ[t] = 0.0
         end
     end
-    return mean
+    return τ
 end
 
 # A band's solar zenith angle (degrees) from the accumulated `Σ w·SW·cos θ` and `Σ w·SW`: the angle

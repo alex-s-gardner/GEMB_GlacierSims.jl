@@ -9,6 +9,7 @@ import GeoInterface
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
 using GEMB_ClimateForcing: climate_adjust_for_elevation
+import GEMB_ClimateForcing
 using NCDatasets
 
 # One-row glacier elevation-class table from bin-center => area (km²) pairs, using the same
@@ -3262,7 +3263,16 @@ end
         table = _cp_table(cells)
         time_range = (_CP_TIME[1], _CP_TIME[end])
         hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
-        loader = _cp_loader(cells, hot)
+        # Shortwave and cloud optical thickness differ between cells, so the band's shortwave-weighted
+        # layers are real averages rather than copies of one cell.
+        sw_cell = Dict(10.0 => 300.0, 10.1 => 120.0, 10.2 => 60.0, 10.3 => 250.0)
+        τ_cell = Dict(10.0 => 0.0, 10.1 => 5.0, 10.2 => 17.0, 10.3 => 1.0)
+        loader = function (_model, lat, lon; kwargs...)
+            c = cells[findfirst(c -> c.lat == lat && c.lon == lon, cells)]
+            _cp_forcing(lat, lon, c.z, hot(c); shortwave_downward = sw_cell[lon],
+                        shortwave_downward_diffuse = 0.3 * sw_cell[lon],
+                        cloud_optical_thickness = τ_cell[lon])
+        end
         applied0 = derive_downscaling_parameters(:synthetic, time_range, table; token = nothing,
                                                  cache_path = nothing, min_cells = 4,
                                                  forcing_loader = loader).applied
@@ -3296,9 +3306,22 @@ end
             for tb in tile_bands
                 parts = [b for n in native for b in n if b.center == tb.center]
                 @test sum(b.area for b in parts) ≈ tb.area
+                # Area means, except the two layers that follow the shortwave: the zenith angle is
+                # the angle of the shortwave-weighted mean cosine, and the optical thickness is the
+                # shortwave-weighted mean τ (the τ of the band's mean transmissivity).
+                w_sw = [b.area .* collect(b.forcing[:shortwave_downward]) for b in parts]
                 for v in GEMB_GlacierSims._FORCING_VARIABLES
-                    mean_v = sum(b.area .* collect(b.forcing[v]) for b in parts) ./ tb.area
-                    @test mean_v ≈ collect(tb.forcing[v]) rtol = 1e-12
+                    tile_v = collect(tb.forcing[v])
+                    if v === :solar_zenith_angle
+                        c = sum(w .* cosd.(collect(b.forcing[v])) for (w, b) in zip(w_sw, parts))
+                        @test acosd.(c ./ sum(w_sw)) ≈ tile_v rtol = 1e-12
+                    elseif v === :cloud_optical_thickness
+                        τw = sum(w .* collect(b.forcing[v]) for (w, b) in zip(w_sw, parts))
+                        @test τw ./ sum(w_sw) ≈ tile_v rtol = 1e-12
+                    else
+                        mean_v = sum(b.area .* collect(b.forcing[v]) for b in parts) ./ tb.area
+                        @test mean_v ≈ tile_v rtol = 1e-12
+                    end
                 end
             end
             # The shared band is where the per-cell forcing actually differs, so the parity above is
