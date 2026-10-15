@@ -8,8 +8,8 @@
 # `start` and `end` are read as run_tile_sweep.sh reads them. Exits non-zero when any worker exits
 # non-zero, which a worker does when any cell or tile it ran failed, and reports how many.
 #
-# The process layout is the tile sweep's (`run_tile_sweep.sh`, which explains it): one thread per process,
-# one process per core less headroom, each draining a weight-balanced block of the chunk-ordered tile list
+# The process layout is the tile sweep's (`run_tile_sweep.sh`, which explains it): one thread per process
+# with a claim heartbeat beside it, one process per core less headroom, each draining a weight-balanced block of the chunk-ordered tile list
 # and then stealing, with tiles claimed by an atomic mkdir under native_runs/claims.
 #
 # Resumable: a cell whose file already covers the request is skipped from its metadata alone, so

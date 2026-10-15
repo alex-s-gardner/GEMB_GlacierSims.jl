@@ -278,18 +278,21 @@ beyond the directory. That is what lets a sweep run as N independent processes t
 other rather than being handed a fixed partition up front, which matters when per-tile cost is not
 predictable in advance.
 
-A claim left behind by a process that died would drop its tile from the sweep silently, so a claim older
-than `stale_after` whose tile still has no output is reclaimed: removed and re-created, the re-creation
-deciding the winner if two callers race. `stale_after` must exceed the longest a single tile can
-legitimately take, because reclaiming a *running* tile would put two writers on one output file — hence
-hours rather than minutes, and hence the output file being checked first. `stale_after <= 0` disables
-reclaiming.
+A claim left behind by a process that died would drop its tile from the sweep silently, so a claim whose
+heartbeat is older than `stale_after` and whose tile still has no output is reclaimed: removed and
+re-created, the re-creation deciding the winner if two callers race. The heartbeat is the modification
+time of the claim's `heartbeat` file, written when the claim is taken and refreshed for as long as the
+owner runs [`start_claim_heartbeat`](@ref); a claim without the file is judged by the directory's own
+modification time. A running tile is therefore never reclaimed however long it takes, provided
+`stale_after` is several heartbeat intervals, and a crashed owner's claim becomes reclaimable
+`stale_after` after its last heartbeat. `stale_after <= 0` disables reclaiming.
 """
 function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
                      output_path::AbstractString; stale_after::Period = Hour(24))
     path = joinpath(claim_dir, tile_name)
     try
         mkdir(path)
+        touch(joinpath(path, CLAIM_HEARTBEAT_FILE))
         return true
     catch err
         err isa Base.IOError || rethrow()
@@ -298,7 +301,7 @@ function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
     stale_after <= Hour(0) && return false
     isfile(output_path) && return false            # finished, not abandoned
     age = try
-        Millisecond(round(Int, (time() - mtime(path)) * 1000))
+        Millisecond(round(Int, (time() - _claim_heartbeat_time(path)) * 1000))
     catch
         return false                               # vanished under us: another caller owns it
     end
@@ -308,10 +311,91 @@ function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
     try
         rm(path; force = true, recursive = true)
         mkdir(path)                                # atomic: only one reclaimer wins
+        touch(joinpath(path, CLAIM_HEARTBEAT_FILE))
         return true
     catch err
         err isa Base.IOError || rethrow()
         return false
+    end
+end
+
+# The file inside a claim whose modification time is the owner's heartbeat.
+const CLAIM_HEARTBEAT_FILE = "heartbeat"
+
+function _claim_heartbeat_time(path)
+    beat = joinpath(path, CLAIM_HEARTBEAT_FILE)
+    return isfile(beat) ? mtime(beat) : (isdir(path) ? mtime(path) : error("no claim at $path"))
+end
+
+"""
+    ClaimHeartbeat
+
+A running heartbeat for one claim, from [`start_claim_heartbeat`](@ref). Stop it with
+[`stop_claim_heartbeat!`](@ref).
+"""
+struct ClaimHeartbeat
+    path::String
+    process::Base.Process
+end
+
+"""
+    start_claim_heartbeat(claim_dir, tile_name; interval = Minute(5), owner = getpid())
+        -> ClaimHeartbeat
+
+Refresh the heartbeat of the claim [`claim_tile!`](@ref) took on `tile_name` every `interval` until
+[`stop_claim_heartbeat!`](@ref). The claim is then never stale while its owner runs, however long the
+tile takes, and a claim whose owner died stops beating.
+
+The refresh runs in a separate `sh` process that touches the claim's heartbeat file and exits within
+one `interval` of the process `owner` (by default this one) ending, however it ends. It is a process and not a task because a tile
+run computes for hours without yielding, and a Julia task waiting on a timer would not run until it did.
+"""
+function start_claim_heartbeat(claim_dir::AbstractString, tile_name::AbstractString;
+                               interval::Period = Minute(5), owner::Integer = getpid())
+    seconds = Dates.value(convert(Millisecond, interval)) / 1000
+    seconds > 0 || throw(ArgumentError("interval must be positive, got $interval"))
+    path = joinpath(claim_dir, tile_name, CLAIM_HEARTBEAT_FILE)
+    isdir(dirname(path)) || throw(ArgumentError("no claim for $tile_name under $claim_dir"))
+    # `$1` is the heartbeat path and `$2` the owner's process id.
+    loop = """
+        while kill -0 "\$2" 2>/dev/null; do
+            touch "\$1" || exit 1
+            sleep $(seconds)
+        done
+        """
+    process = run(pipeline(`sh -c $loop claim-heartbeat $path $owner`;
+                           stdout = devnull, stderr = stderr); wait = false)
+    return ClaimHeartbeat(path, process)
+end
+
+"""
+    stop_claim_heartbeat!(heartbeat::ClaimHeartbeat)
+
+Stop refreshing the claim's heartbeat. Throws if the heartbeat had already stopped on its own, since
+the claim may then have gone stale while its owner ran.
+"""
+function stop_claim_heartbeat!(heartbeat::ClaimHeartbeat)
+    p = heartbeat.process
+    running = process_running(p)
+    running && kill(p)
+    wait(p)
+    running || error("the heartbeat of the claim at $(dirname(heartbeat.path)) stopped while its " *
+                     "owner ran (exit code $(p.exitcode)), so the claim may have been reclaimed")
+    return nothing
+end
+
+"""
+    with_claim_heartbeat(f, claim_dir, tile_name; interval = Minute(5))
+
+Run `f()` with the claim's heartbeat refreshed throughout, and stop it however `f` exits.
+"""
+function with_claim_heartbeat(f, claim_dir::AbstractString, tile_name::AbstractString;
+                              interval::Period = Minute(5))
+    heartbeat = start_claim_heartbeat(claim_dir, tile_name; interval)
+    try
+        return f()
+    finally
+        stop_claim_heartbeat!(heartbeat)
     end
 end
 

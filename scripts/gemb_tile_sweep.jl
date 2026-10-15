@@ -141,11 +141,13 @@ const RESTART_FETCH_OVERLAP = Day(1)
 # shares the filesystem of the file it guards — a claim on a different mount could outlive an output the
 # sweep can no longer see.
 #
-# The bound has to exceed the longest a single tile can legitimately take: reclaiming a running tile would
-# put two processes on one netCDF. A 63-band tile over the 10x10 grid and the full record is the worst case,
-# so this is deliberately generous. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
+# A worker's claim carries a heartbeat refreshed every `CLAIM_HEARTBEAT` while the tile runs
+# (`with_claim_heartbeat`), so a running tile is never reclaimed however long it takes, and a claim is
+# stale once its heartbeat is `CLAIM_STALE_AFTER` old: its worker has died. The bound only has to cover
+# several missed heartbeats. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
 const CLAIM_SUBDIR = "claims"
-const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
+const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "1")))
+const CLAIM_HEARTBEAT = Minute(5)
 
 const TILE_LIMIT = haskey(ENV, "TILE_LIMIT") ? parse(Int, ENV["TILE_LIMIT"]) : typemax(Int)
 const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? split(ENV["TILE_NAMES"], ",") : String[]
@@ -242,7 +244,9 @@ function settings_rows()
                 setting("GC heap hint", "none (target sized from physical memory)") :
                 setting("GC heap hint", "$(round(hint / 2^30; digits = 1)) GiB", "--heap-size-hint")
         end,
-        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
+        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h without a heartbeat",
+                    "CLAIM_STALE_HOURS"),
+        setting("claim heartbeat", "every $(Dates.value(CLAIM_HEARTBEAT)) min"),
         env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
         env_setting("tiles", isempty(TILE_NAMES) ? "all" : join(TILE_NAMES, ", "), "TILE_NAMES"),
         env_setting("force rebuild of current tiles", FORCE, "FORCE"),
@@ -330,7 +334,9 @@ function main()
         claim_tile!(claim_dir, tile.name, path; stale_after = CLAIM_STALE_AFTER) || continue
         t0 = time()
         try
-            push!(rows, run_tile(i, tile, name, path, mp; token, cache))
+            push!(rows, with_claim_heartbeat(claim_dir, tile.name; interval = CLAIM_HEARTBEAT) do
+                run_tile(i, tile, name, path, mp; token, cache)
+            end)
         catch e
             e isa InterruptException && rethrow()
             # A broken caller fails identically for every tile, so it must not be recorded as a

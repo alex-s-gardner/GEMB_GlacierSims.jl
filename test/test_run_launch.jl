@@ -126,3 +126,59 @@ end
         @test occursin("1 tile(s) failed, 0 block(s) exited non-zero", err)
     end
 end
+
+@testset "run launch: a heartbeat keeps a long-running claim" begin
+    claims = mktempdir()
+    output = joinpath(mktempdir(), "N00_E000.nc")              # never written: the tile is running
+    # Without a heartbeat the claim would be stale 2 s in, before the owner's 3 s of work end.
+    stale = Millisecond(2000)
+    @test claim_tile!(claims, "N00_E000.nc", output; stale_after = stale)
+    beat = joinpath(claims, "N00_E000.nc", "heartbeat")
+    hb = start_claim_heartbeat(claims, "N00_E000.nc"; interval = Millisecond(100))
+    # The owner computes for 3 s without yielding to any other task, as a tile run does, while a
+    # second worker tries to take the tile. The heartbeat keeps advancing, so the tile stays claimed.
+    seen = Set{Float64}()
+    stolen = false
+    t_end = time() + 3.0
+    x = 0.0
+    while time() < t_end
+        x += sum(rand(1000))
+        push!(seen, mtime(beat))
+        stolen |= claim_tile!(claims, "N00_E000.nc", output; stale_after = stale)
+    end
+    # About 30 beats in 3 s at a 0.1 s interval; a heartbeat held up by the computation would show one.
+    @test length(seen) >= 10
+    @test !stolen
+    # The owner stops beating, as a crashed owner does: the claim holds until its heartbeat is older
+    # than the bound, and is reclaimed after.
+    stop_claim_heartbeat!(hb)
+    @test !claim_tile!(claims, "N00_E000.nc", output; stale_after = stale)
+    sleep(2.5)
+    @test claim_tile!(claims, "N00_E000.nc", output; stale_after = stale)
+
+    # The heartbeat process ends with its owner: one started for a process that has already exited
+    # stops on its own, and stopping it then reports that the claim was not kept alive.
+    owner = run(`sleep 0.2`; wait = false)
+    orphan_claims = mktempdir()
+    @test claim_tile!(orphan_claims, "t", output)
+    orphan = start_claim_heartbeat(orphan_claims, "t"; interval = Millisecond(100),
+                                   owner = getpid(owner))
+    wait(owner)
+    sleep(0.5)
+    @test !process_running(orphan.process)
+    @test_throws "stopped while its owner ran" stop_claim_heartbeat!(orphan)
+    @test with_claim_heartbeat(() -> 42, claims, "N00_E000.nc"; interval = Millisecond(100)) == 42
+
+    # A claim with no heartbeat file is judged by the age of its directory.
+    claims = mktempdir()
+    mkdir(joinpath(claims, "t"))
+    @test !claim_tile!(claims, "t", "/nonexistent"; stale_after = Hour(1))
+    sleep(0.05)
+    @test claim_tile!(claims, "t", "/nonexistent"; stale_after = Millisecond(10))
+    @test isfile(joinpath(claims, "t", "heartbeat"))        # the reclaimer's own heartbeat
+    # A finished tile is never reclaimed, and reclaiming can be turned off.
+    done = touch(joinpath(mktempdir(), "done.nc"))
+    @test !claim_tile!(claims, "t", done; stale_after = Millisecond(1))
+    @test !claim_tile!(claims, "t", "/nonexistent"; stale_after = Hour(0))
+    @test_throws "no claim for absent" start_claim_heartbeat(claims, "absent")
+end

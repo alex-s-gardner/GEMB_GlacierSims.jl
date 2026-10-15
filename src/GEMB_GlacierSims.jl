@@ -49,6 +49,7 @@ import Zarr
 
 include("util.jl")
 export claim_tile!, claim_order, weight_balanced_blocks
+export ClaimHeartbeat, start_claim_heartbeat, stop_claim_heartbeat!, with_claim_heartbeat
 export era5_land_invariant, wrap_lon, forcing_at_elevation, software_provenance
 export era5_land_record_span, run_time_range
 export cell_output_name, parse_cell_lonlat, tile_output_name, parse_tile_index

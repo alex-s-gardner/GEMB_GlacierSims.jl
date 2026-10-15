@@ -15,7 +15,8 @@
 # The measured curve is in the TILE_BLOCKS comment in gemb_tile_sweep.jl. A worker holds about 5 GB and
 # the heaviest tiles peak near 8 GB, so at 120 blocks the set occupies roughly 600 GB: wide enough that
 # memory, not collector contention, is what bounds the block count on a 1 TB machine. HEAP_SIZE_HINT
-# bounds it if that becomes tight.
+# bounds it if that becomes tight. Each worker keeps a small `sh` process beside it that refreshes the
+# heartbeat of its tile claim, so a tile that runs for days is not reclaimed by another worker.
 #
 # Each process drains its own contiguous, weight-balanced block of the chunk-ordered tile list first —
 # which is what keeps the forcing cache warm across neighbours — and then steals the heaviest tile still

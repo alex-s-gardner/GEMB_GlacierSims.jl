@@ -80,8 +80,10 @@ const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "
 const OUTPUT_FREQUENCY = :weekly
 const RESTART_FETCH_OVERLAP = Day(1)
 
+# Claims are kept alive by a heartbeat while their unit runs, as in the tile sweep (which explains it).
 const CLAIM_SUBDIR = "claims"
-const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
+const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "1")))
+const CLAIM_HEARTBEAT = Minute(5)
 
 # The most columns one work unit holds. A unit runs serially on one single-threaded worker, so its size
 # bounds the tail of the run: the largest tile holds about 5,000 columns, over 100 hours whole, and the
@@ -115,7 +117,9 @@ function settings_rows()
                 setting("GC heap hint", "none (target sized from physical memory)") :
                 setting("GC heap hint", "$(round(hint / 2^30; digits = 1)) GiB", "--heap-size-hint")
         end,
-        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
+        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h without a heartbeat",
+                    "CLAIM_STALE_HOURS"),
+        setting("claim heartbeat", "every $(Dates.value(CLAIM_HEARTBEAT)) min"),
         env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
         env_setting("tiles", isempty(TILE_NAMES) ? "all" : join(TILE_NAMES, ", "), "TILE_NAMES"),
         env_setting("force rebuild of current cells", FORCE, "FORCE"),
@@ -165,7 +169,9 @@ function main()
     for i in order
         unit = units[i]
         claim_tile!(claim_dir, unit.name, unit.marker; stale_after = CLAIM_STALE_AFTER) || continue
-        append!(rows, run_native_unit(unit, mp, corrections; token, cache))
+        append!(rows, with_claim_heartbeat(claim_dir, unit.name; interval = CLAIM_HEARTBEAT) do
+            run_native_unit(unit, mp, corrections; token, cache)
+        end)
     end
 
     if isempty(rows)
