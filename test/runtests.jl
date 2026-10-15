@@ -541,6 +541,16 @@ end
         @test d["model_albedo_ice"] == (0.48, 0.40)
         @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
 
+        # NetCDF reads a one-element attribute back as a scalar, so a one-band tile's per-band
+        # settings must match their own stored form; a longer vector still has to match exactly.
+        one_band = Dict{String,Any}("applied_bare_ice_albedo" => 0.6, "applied_bare_ice_albedo_source" => 4.0)
+        @test isempty(run_parameter_differences(one_band,
+            Dict{String,Any}("applied_bare_ice_albedo" => [0.6], "applied_bare_ice_albedo_source" => [4])))
+        @test haskey(run_parameter_differences(one_band,
+            Dict{String,Any}("applied_bare_ice_albedo" => [0.7])), "applied_bare_ice_albedo")
+        @test haskey(run_parameter_differences(Dict{String,Any}("v" => [0.6, 0.5]),
+            Dict{String,Any}("v" => [0.6, 0.4])), "v")
+
         # A monthly lapse-rate cycle compares elementwise, so a stored integer cycle matches the
         # float form and a single changed month is a disagreement. Without vector encoding these
         # would compare by print formatting, where `Any[...]` and `Float64[...]` differ while the
@@ -2717,6 +2727,15 @@ end
                 @test ds["dh"].attrib["units"] == "m"
                 @test size(ds["total_dv"]) == (length(run.time), length(run.delta_temperatures),
                                                length(run.precipitation_scalings))
+                # Chunked over many time steps and the whole of every other axis, not one element
+                # at a time, whose chunk index would outweigh the data.
+                n_t = length(run.time)
+                @test NCDatasets.chunking(ds["dh"]) ==
+                      (:chunked, (n_t, length(run.bands), length(run.delta_temperatures),
+                                  length(run.precipitation_scalings)))
+                @test NCDatasets.chunking(ds["total_dv"]) ==
+                      (:chunked, (n_t, length(run.delta_temperatures),
+                                  length(run.precipitation_scalings)))
                 @test ds["total_dv"].attrib["units"] == "km3"
                 @test ds["total_dm"].attrib["units"] == "Gt"
                 # A per-band flux and its tile total share a name, so the total is prefixed; both must
@@ -3133,6 +3152,130 @@ end
                 merge(band, (; albedo_ice = 0.48, albedo_ice_source = :default)))
             @test fell_back["bare_ice_albedo"] === 0.48
             @test bare_ice_albedo_source_name(fell_back["bare_ice_albedo_source"]) === :default
+        end
+    end
+
+    @testset "native resolution run" begin
+        @testset "forcing corrections" begin
+            GI = GeoDataFrames.GeoInterface
+            box(lon, lat) = GI.Polygon([GI.LinearRing([(lon, lat), (lon + 2, lat), (lon + 2, lat + 2),
+                                                       (lon, lat + 2), (lon, lat)])])
+            function corrections_file(rows)
+                path = joinpath(mktempdir(), "fit_gembfit.arrow")
+                GeoDataFrames.write(path, DataFrame(rows))
+                return path
+            end
+            good = [(; geometry = box(-142, 60), id = "lat[+60+62]lon[-142-140]", group = 7,
+                       pscale = 1.6, ΔT = 2.2, rgi = 1, area_km2 = 100.0),
+                    (; geometry = box(-140, 60), id = "lat[+60+62]lon[-140-138]", group = 7,
+                       pscale = 1.6, ΔT = 2.2, rgi = 1, area_km2 = 50.0),
+                    (; geometry = box(-138, 58), id = "lat[+58+60]lon[-138-136]", group = 9,
+                       pscale = 0.9, ΔT = -0.5, rgi = 1, area_km2 = 20.0)]
+            c = read_forcing_corrections(corrections_file(good))
+            @test length(c) == 3
+            @test c["lat[+58+60]lon[-138-136]"] == (; pscale = 0.9, ΔT = -0.5, group = 9)
+
+            own = forcing_correction("lat[+60+62]lon[-142-140]", c)
+            @test (own.pscale, own.ΔT, own.group) == (1.6, 2.2, 7)
+            @test own.donor == "lat[+60+62]lon[-142-140]"
+            @test own.distance_km == 0.0
+
+            # An unfitted geotile borrows the nearest fitted center. At 59°N two degrees of longitude
+            # (114 km) are nearer than two of latitude (222 km), so lat[+58+60]lon[-140-138] takes the
+            # tile east of it, not the one north.
+            near = forcing_correction("lat[+58+60]lon[-140-138]", c)
+            @test near.donor == "lat[+58+60]lon[-138-136]"
+            @test near.distance_km ≈ GEMB_GlacierSims._haversine_km(59.0, -139.0, 59.0, -137.0)
+            @test (near.pscale, near.ΔT, near.group) == (0.9, -0.5, 9)
+            @test_throws "beyond the 1000 km cap" forcing_correction("lat[-46-44]lon[+168+170]", c)
+            @test_throws "not a geotile id" forcing_correction("N60_W142", c)
+
+            # The id a cell's tile produces is the key the calibration writes, including at the
+            # antimeridian, where the native 0-360 longitude has to be wrapped first.
+            @test geotile_id(tile_index(wrap_lon(219.95), 60.05; tile_size = 2), 2) ==
+                  "lat[+60+62]lon[-142-140]"
+            @test geotile_id(tile_index(wrap_lon(180.0), -16.5; tile_size = 2), 2) ==
+                  "lat[-18-16]lon[-180-178]"
+
+            bad(f) = corrections_file([f(good[1])])
+            @test_throws "lacks column(s) ΔT" read_forcing_corrections(corrections_file(
+                [(; geometry = box(-142, 60), id = "lat[+60+62]lon[-142-140]", group = 7, pscale = 1.6)]))
+            @test_throws "a scaling must be positive and finite" read_forcing_corrections(
+                bad(r -> merge(r, (; pscale = 0.0))))
+            @test_throws "an offset must be finite" read_forcing_corrections(
+                bad(r -> merge(r, (; ΔT = NaN))))
+            @test_throws "appears twice" read_forcing_corrections(corrections_file(
+                [good[1], merge(good[1], (; ΔT = 3.0))]))
+            @test_throws "no forcing-correction file" read_forcing_corrections("/nonexistent.arrow")
+        end
+
+        # Three cells sharing the 1550 m band, at different reanalysis surfaces and glm, so the per-cell
+        # adjustments differ and the band mean is a real average.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0), (1550, 2.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5, bins = [(1550, 5.0)]),
+                 (lon = 10.2, lat = 46.0, z = 2000.0, glm = 1.0, bins = [(1550, 3.0), (2050, 6.0)]),
+                 (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.25, bins = [(2550, 1.0)])]
+        table = _cp_table(cells)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+        hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
+        loader = _cp_loader(cells, hot)
+        applied0 = derive_downscaling_parameters(:synthetic, time_range, table; token = nothing,
+                                                 cache_path = nothing, min_cells = 4,
+                                                 forcing_loader = loader).applied
+        # A decoupling factor that is not the identity, so glm moves the adjusted temperature.
+        applied = GEMB_GlacierSims.AppliedDownscaling(
+            applied0.time, applied0.lapse_rate, applied0.lapse_rate_source,
+            [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
+             for b in applied0.bands],
+            applied0.basis, applied0.settings)
+        tile = only(downscaling_tiles(table; tile_size = 2, buffer = 1))
+
+        @testset "native_cells splits a tile into one-cell tiles" begin
+            nc = native_cells(tile)
+            @test length(nc) == nrow(tile.core)
+            @test all(nrow(c.core) == 1 for c in nc)
+            # The tile's own bounds, so each cell reports the geotile it lies in.
+            @test all(geotile_id(c.bounds) == geotile_id(tile.bounds) for c in nc)
+            @test [c.name for c in nc] == [cell_output_name(r.latitude, r.longitude)
+                                           for r in eachrow(tile.core)]
+            @test all(c.buffered === tile.buffered for c in nc)
+        end
+
+        @testset "the tile band forcing is the area-weighted mean of the native cell forcing" begin
+            band_forcing(cells_table) = collect(elevation_interval_forcing(
+                cells_table, applied; climate_model = :synthetic, time_range, token = nothing,
+                cache_path = nothing, elevation_interval_batch = 0, forcing_loader = loader,
+                donor_cells = tile.buffered))
+            tile_bands = band_forcing(tile.core)
+            native = [band_forcing(c.core) for c in native_cells(tile)]
+            @test sum(b.area for b in tile_bands) ≈ sum(b.area for n in native for b in n)
+            for tb in tile_bands
+                parts = [b for n in native for b in n if b.center == tb.center]
+                @test sum(b.area for b in parts) ≈ tb.area
+                for v in GEMB_GlacierSims._FORCING_VARIABLES
+                    mean_v = sum(b.area .* collect(b.forcing[v]) for b in parts) ./ tb.area
+                    @test mean_v ≈ collect(tb.forcing[v]) rtol = 1e-12
+                end
+            end
+            # The shared band is where the per-cell forcing actually differs, so the parity above is
+            # an average of distinct series and not three copies of one.
+            shared = [only(filter(b -> b.center == 1550.0, n)) for n in native if
+                      any(b -> b.center == 1550.0, n)]
+            @test length(shared) == 3
+            @test length(unique(collect(b.forcing.temperature_air) for b in shared)) == 3
+        end
+
+        @testset "gemb_native_cell refuses what it cannot run" begin
+            mp = initialize_parameters()
+            correction = (; pscale = 1.0, ΔT = 0.0, group = 1, donor = "x", distance_km = 0.0)
+            @test_throws "exactly one grid cell" gemb_native_cell(tile, applied, mp; correction,
+                                                                  climate_model = :synthetic,
+                                                                  time_range)
+            empty_cell = merge(first(native_cells(tile)),
+                               (; core = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0,
+                                                     bins = [(4050, 1.0)])])))
+            @test_throws "holds no ice in any elevation band" gemb_native_cell(
+                empty_cell, applied, mp; correction, climate_model = :synthetic, time_range)
         end
     end
 
