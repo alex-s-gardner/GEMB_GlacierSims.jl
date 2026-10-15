@@ -53,9 +53,21 @@ the downscaling, as they are in the tile runs the correction was fitted against.
 Keywords other than `correction` are those of [`elevation_interval_forcing`](@ref) (`climate_model`,
 `time_range`, `token`, `cache_path`, `forcing_loader`, `donor_max_distance_km`) and
 [`gemb_glacier_tile`](@ref) (`spinup_window`, `simulation_years_maximum`, `convergence_drift_fac`,
-`drift_window`, `threaded`, `restart`, `force_restart`, `spinup_seed`, `validation_grid`). The cell's
-coordinates, its `glm` and the correction are added to the run's provenance. Pass the tile sweep's
-grid as `validation_grid` so the cell keeps exactly the bands a run over that grid keeps.
+`drift_window`, `threaded`, `restart`, `force_restart`, `spinup_seed`, `validation_grid`,
+`modelled_intervals`, `lost_area_fraction_maximum`). The cell's coordinates, its `glm` and the
+correction are added to the run's provenance.
+
+**Which bands a cell runs.** Pass the bands the tile's reference run modelled as
+`modelled_intervals` (the `band_edges` [`read_glacier_tile_status`](@ref) returns): an interval the
+tile run dropped is then dropped from every one of its cells, so the native and tile runs drop the
+same intervals, and the cell keeps every other band. A cell band the tile run modelled can still fail
+on its own at the cell's correction point, since a cell's forcing is more extreme than the band mean;
+that ice is dropped (cause `:failed_validation`) and counted.
+
+**The lost-ice rule is applied per tile, not per cell.** `lost_area_fraction_maximum` defaults to 1
+here, so a cell with part of its ice in a dropped interval runs the rest; a caller aggregates the
+cells' `lost_area_km2` and `hypsometry_area_km2` over the tile and applies
+[`LOST_AREA_FRACTION_MAXIMUM`](@ref) to the tile total ([`native_tile_lost_area`](@ref)).
 
 [`native_cell_spinup_seed`](@ref) builds a `spinup_seed` from this cell's own file at a different
 correction, to shorten the spinup of a perturbation probe around an already-run point.
@@ -79,7 +91,9 @@ function gemb_native_cell(cell, applied::AppliedDownscaling, mp::ModelParameters
                           restart = nothing,
                           force_restart::Bool = false,
                           spinup_seed = nothing,
-                          validation_grid = nothing)
+                          validation_grid = nothing,
+                          modelled_intervals = nothing,
+                          lost_area_fraction_maximum::Real = 1.0)
     nrow(cell.core) == 1 || throw(ArgumentError(
         "a native cell carries exactly one grid cell; got $(nrow(cell.core)) (use `native_cells`)"))
     any(>(0), _interval_areas(first(eachrow(cell.core)), applied.bands)) || throw(ForcingUnavailable(
@@ -105,7 +119,8 @@ function gemb_native_cell(cell, applied::AppliedDownscaling, mp::ModelParameters
                             precipitation_scalings = [correction.pscale],
                             spinup_window, simulation_years_maximum, convergence_drift_fac,
                             drift_window, threaded, restart, force_restart, spinup_seed,
-                            donor_max_distance_km, validation_grid)
+                            donor_max_distance_km, validation_grid, modelled_intervals,
+                            lost_area_fraction_maximum)
 
     # Where the cell is and which correction it ran under, beside the tile identifiers the run already
     # carries. The correction's values are the run's perturbation axes; what is recorded here is where
@@ -141,4 +156,31 @@ function native_cell_spinup_seed(path::AbstractString)
     profiles = Dict(k[1] => v for (k, v) in restart.profiles if k[2] == 1 && k[3] == 1)
     isempty(profiles) && return nothing
     return i_band -> get(profiles, i_band, nothing)
+end
+
+"""
+    native_tile_lost_area(units) -> (; hypsometry_area_km2, lost_area_km2, fraction)
+
+The lost-ice accounting of one tile's native run, from the accounting of each of its work units:
+`units` iterates `(; hypsometry_area_km2, lost_area_km2)`, one per unit, each the sum over that unit's
+cells. A cell with no forcing of its own and no donor in reach, or whose every band the tile run
+dropped, counts its whole ice as lost.
+
+The [`LOST_AREA_FRACTION_MAXIMUM`](@ref) rule applies to `fraction`, the tile total, exactly as
+[`gemb_glacier_tile`](@ref) applies it to a tile run. Applying it per cell instead would refuse a whole
+cell for the part of its ice in an unreachable interval.
+"""
+function native_tile_lost_area(units)
+    hypsometry = 0.0
+    lost = 0.0
+    for u in units
+        (u.hypsometry_area_km2 >= 0 && u.lost_area_km2 >= 0) || throw(ArgumentError(
+            "a unit's accounting must be non-negative, got $u"))
+        u.lost_area_km2 <= u.hypsometry_area_km2 * (1 + 1e-12) || throw(ArgumentError(
+            "a unit cannot lose more ice than it holds, got $u"))
+        hypsometry += u.hypsometry_area_km2
+        lost += u.lost_area_km2
+    end
+    return (; hypsometry_area_km2 = hypsometry, lost_area_km2 = lost,
+            fraction = hypsometry > 0 ? lost / hypsometry : 0.0)
 end

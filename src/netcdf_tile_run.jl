@@ -190,8 +190,12 @@ end
 What an existing tile file already covers, read from its coordinates and attributes only — **no series
 and no firn state**. `nothing` when the file does not exist.
 
-Returns `(; time, band_centers, delta_temperatures, precipitation_scalings, geotile_id, parameters)`.
-`time` is the last output time in the file, i.e. the point a continuation must start after.
+Returns `(; time, n_timesteps, band_centers, band_edges, delta_temperatures, precipitation_scalings,
+geotile_id, parameters, dropped_band_centers, hypsometry_area_km2, lost_area_km2)`. `time` is the last
+output time in the file, i.e. the point a continuation must start after. `band_edges` holds each
+stored band's `(lo, hi)`. `dropped_band_centers` lists the intervals holding ice that the run did not
+model (empty when it dropped none), and the two areas are the run's lost-ice accounting in km²
+(`missing` in a file that does not record them; see [`gemb_glacier_tile`](@ref)).
 
 This exists to be cheap, for the same reason [`read_downscaling_tile_status`](@ref) does: a sweep over
 819 tiles decides "is this tile already done" before touching forcing, and that decision is what makes
@@ -201,15 +205,26 @@ function read_glacier_tile_status(path::AbstractString)
     isfile(path) || return nothing
     return NCDatasets.NCDataset(path, "r") do ds
         n = length(ds["time"])
+        area(key) = haskey(ds.attrib, key) ? Float64(ds.attrib[key]) : missing
         (; time = n == 0 ? nothing : _nc_decode_time(ds["time"][n]),
          n_timesteps = n,
          band_centers = collect(Float64, ds["band_center"][:]),
+         band_edges = collect(zip(collect(Float64, ds["band_lower"][:]),
+                                  collect(Float64, ds["band_upper"][:]))),
          delta_temperatures = collect(Float64, ds["delta_temperature"][:]),
          precipitation_scalings = collect(Float64, ds["precipitation_scaling"][:]),
          geotile_id = get(ds.attrib, "geotile_id", ""),
-         parameters = _read_run_parameters(ds))
+         parameters = _read_run_parameters(ds),
+         dropped_band_centers = _attribute_vector(ds, "dropped_band_centers"),
+         hypsometry_area_km2 = area("hypsometry_area_km2"),
+         lost_area_km2 = area("lost_area_km2"))
     end
 end
+
+# A numeric vector attribute, or an empty vector when it is absent. NetCDF hands a one-element vector
+# attribute back as a scalar.
+_attribute_vector(ds, key) =
+    haskey(ds.attrib, key) ? collect(Float64, vcat(ds.attrib[key])) : Float64[]
 
 """
     read_glacier_tile_restart(path) -> NamedTuple or nothing

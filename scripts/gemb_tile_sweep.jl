@@ -564,6 +564,8 @@ function summary_row(tile, name, status, seconds; run = nothing,
                                    run.provenance["substituted_area_km2"],
             unrecovered_area_km2 = run === nothing ? 0.0 :
                                    run.provenance["unrecovered_area_km2"],
+            # Every loss the 1 % rule counts: dropped intervals and unrecovered ice.
+            lost_area_km2 = run === nothing ? missing : run.provenance["lost_area_km2"],
             max_donor_distance_km = run === nothing ? 0.0 :
                                     run.provenance["max_donor_distance_km"],
             n_timesteps = run === nothing ? 0 : length(run.time),

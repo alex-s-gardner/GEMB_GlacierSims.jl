@@ -11,7 +11,14 @@
 # One tile-format netCDF per cell, `OUTPUT_DIR/<tile>/<cell>.nc`, whose one-element `delta_temperature`
 # and `precipitation_scaling` axes hold the correction. The unit of work is a run of consecutive cells of
 # one tile holding at most UNIT_COLUMNS columns, claimed by an atomic mkdir; a unit gains a
-# `<unit>.complete` marker in its tile's directory once every cell is written or accounted for.
+# `<unit>.complete` marker in its tile's directory once every cell is written or accounted for. The
+# marker records the unit's ice and the part of it left unmodelled.
+#
+# Each cell runs the bands its tile's reference run modelled, so the native and tile runs drop the same
+# intervals. The 1 % lost-ice rule is applied to the tile, not to each cell: once every unit of a tile
+# has its marker, the unit that completes it sums the markers, and a tile above the rule is reported as
+# failed and gains a `<tile>.lost_ice_exceeded` file beside the markers, which `run_native_sweep.sh`
+# counts as a failure on every launch until the tile's markers are removed and it passes.
 #
 # Resumable and extendable as the tile sweep is: a cell file that already covers the request under the
 # same settings and correction is skipped from its metadata, one whose record has since grown is appended
@@ -36,6 +43,7 @@ using DimensionalData
 using Statistics
 import GEMB
 import GeoDataFrames
+import TOML
 
 include(joinpath(@__DIR__, "run_settings.jl"))
 
@@ -165,7 +173,7 @@ function main()
     summary = DataFrame(rows)
     suffix = NATIVE_BLOCKS == 1 ? "" : "_block$(lpad(NATIVE_BLOCK, 3, '0'))of$(NATIVE_BLOCKS)"
     GEMB_GlacierSims.Parquet2.writefile(joinpath(OUTPUT_DIR, "native_runs_summary$suffix.parquet"), summary)
-    @info "Native run finished" minutes=round((time() - t_start) / 60; digits = 1) cells=nrow(summary) written=count(==("written"), summary.status) extended=count(==("extended"), summary.status) skipped=count(==("skipped"), summary.status) no_reference=count(==("no_reference"), summary.status) no_correction=count(==("no_correction"), summary.status) no_forcing=count(==("no_forcing"), summary.status) empty=count(==("empty"), summary.status) failed=count(==("failed"), summary.status)
+    @info "Native run finished" minutes=round((time() - t_start) / 60; digits = 1) cells=nrow(summary) written=count(==("written"), summary.status) extended=count(==("extended"), summary.status) skipped=count(==("skipped"), summary.status) no_reference=count(==("no_reference"), summary.status) no_correction=count(==("no_correction"), summary.status) no_forcing=count(==("no_forcing"), summary.status) dropped=count(==("dropped"), summary.status) empty=count(==("empty"), summary.status) failed=count(==("failed"), summary.status)
     return summary
 end
 
@@ -247,9 +255,9 @@ function run_native_unit(unit, mp, corrections; token, cache)
         return [summary_row(c, tile_name, :no_reference, 0.0; correction) for c in cells]
     end
     assert_matches_reference(reference, tile.name, requested)
-    # The reference sweep's perturbation grid: a cell keeps exactly the bands a run over that grid keeps.
-    ref_status = read_glacier_tile_status(reference)
-    validation_grid = (ref_status.delta_temperatures, ref_status.precipitation_scalings)
+    # The bands the reference tile run modelled: an interval it dropped is dropped from every cell, so
+    # the two runs drop the same intervals.
+    modelled_intervals = read_glacier_tile_status(reference).band_edges
     prior = decoupling_factor_prior(tile.core)
 
     mkpath(tile_dir)
@@ -258,23 +266,75 @@ function run_native_unit(unit, mp, corrections; token, cache)
         t0 = time()
         try
             push!(rows, run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
-                                 token, cache, fit, intervals, basis, prior, validation_grid))
+                                 token, cache, fit, intervals, basis, prior, modelled_intervals))
         catch e
             e isa InterruptException && rethrow()
             GEMB_GlacierSims.is_caller_error(e) && rethrow()
             e isa RestartParameterMismatch && rethrow()
             @error "Cell failed; continuing" tile=tile_name cell=cell.name exception=(e, catch_backtrace())
             push!(rows, summary_row(cell, tile_name, :failed, time() - t0; correction,
+                                    hypsometry_area_km2 = cell_ice(cell, intervals),
                                     error = sprint(showerror, e)))
         end
     end
 
     # Marked complete only when no cell failed, so a stale claim on a unit with a failure is reclaimed
     # and the failed cells retried, while the finished ones skip from their metadata.
-    if !any(r -> r.status == "failed", rows)
-        open(io -> println(io, now()), unit.marker, "w")
-    end
+    any(r -> r.status == "failed", rows) && return rows
+    write_unit_marker(unit.marker, (; hypsometry_area_km2 = sum(r.hypsometry_area_km2 for r in rows),
+                                    lost_area_km2 = sum(r.lost_area_km2 for r in rows)))
+    exceeded = check_tile_lost_area(tile, tile_name, intervals)
+    exceeded === nothing || push!(rows, exceeded)
     return rows
+end
+
+# A cell's ice over its tile's elevation intervals, in km².
+cell_ice(cell, intervals) =
+    sum(GEMB_GlacierSims._interval_areas(first(eachrow(cell.core)), intervals); init = 0.0)
+
+# The unit's lost-ice accounting, written to a temporary file and renamed into place, so a marker that
+# exists is a whole one.
+function write_unit_marker(path, accounting)
+    tmp = path * ".part"
+    open(tmp, "w") do io
+        println(io, "completed = \"", now(), "\"")
+        println(io, "hypsometry_area_km2 = ", repr(Float64(accounting.hypsometry_area_km2)))
+        println(io, "lost_area_km2 = ", repr(Float64(accounting.lost_area_km2)))
+    end
+    Base.Filesystem.rename(tmp, path)
+    return path
+end
+
+function read_unit_marker(path)
+    d = TOML.parsefile(path)
+    (haskey(d, "hypsometry_area_km2") && haskey(d, "lost_area_km2")) || error(
+        "unit marker $path records no lost-ice accounting; delete it so the unit is run again")
+    return (; hypsometry_area_km2 = Float64(d["hypsometry_area_km2"]),
+            lost_area_km2 = Float64(d["lost_area_km2"]))
+end
+
+# The 1 % rule on the tile's total, once every unit of the tile is complete; `nothing` until then and
+# when the tile is within the rule. A tile above it is recorded in its `.lost_ice_exceeded` file, which
+# stays until the rule passes, and is returned as a failed summary row.
+function check_tile_lost_area(tile, tile_name, intervals)
+    markers = [u.marker for u in work_units(tile)]
+    all(isfile, markers) || return nothing
+    failure = joinpath(OUTPUT_DIR, tile_name, tile_name * ".lost_ice_exceeded")
+    total = native_tile_lost_area(read_unit_marker.(markers))
+    hypsometry = sum(c -> cell_ice(c, intervals), native_cells(tile); init = 0.0)
+    isapprox(total.hypsometry_area_km2, hypsometry; rtol = 1e-9) || error(
+        "the unit markers of $tile_name account for $(total.hypsometry_area_km2) km² of ice, but " *
+        "the tile holds $hypsometry km²; a marker is from a different hypsometry, so delete them")
+    total.fraction <= LOST_AREA_FRACTION_MAXIMUM && (rm(failure; force = true); return nothing)
+    message = "native run of tile $tile_name leaves $(round(total.lost_area_km2; digits = 2)) km² of " *
+              "its $(round(hypsometry; digits = 2)) km² of ice unmodelled " *
+              "($(round(100 * total.fraction; digits = 2)) %), above the " *
+              "$(100 * LOST_AREA_FRACTION_MAXIMUM) % allowed; the per-cell summary rows give the " *
+              "cells and bands"
+    @error message tile=tile_name
+    write(failure, message, "\n")
+    return summary_row(nothing, tile_name, :failed, 0.0; tile, hypsometry_area_km2 = hypsometry,
+                       lost_area_km2 = total.lost_area_km2, error = message)
 end
 
 # The settings this tile is about to run under, against those stored in the tile sweep the correction
@@ -291,18 +351,31 @@ function assert_matches_reference(reference, name, requested)
 end
 
 function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache,
-                  fit, intervals, basis, prior, validation_grid)
+                  fit, intervals, basis, prior, modelled_intervals)
     t0 = time()
     path = joinpath(tile_dir, cell.name)
     row = first(eachrow(cell.core))
-    centers = [iv.center for (iv, a) in
-               zip(applied.bands, GEMB_GlacierSims._interval_areas(row, applied.bands)) if a > 0]
-    isempty(centers) && return summary_row(cell, tile_name, :empty, time() - t0; correction)
+    ice = cell_ice(cell, intervals)
+    populated = [iv for (iv, a) in
+                 zip(applied.bands, GEMB_GlacierSims._interval_areas(row, applied.bands)) if a > 0]
+    isempty(populated) && return summary_row(cell, tile_name, :empty, time() - t0; correction)
+    centers = [iv.center for iv in populated]
+    # Every band of this cell lies in an interval the reference tile run dropped: the whole cell's ice
+    # is dropped with them, and counted against the tile.
+    modelled = Set(modelled_intervals)
+    if !any(iv -> (Float64(iv.lo), Float64(iv.hi)) in modelled, populated)
+        @warn "Every band of this cell was dropped by the reference tile run; its ice is unmodelled" tile=tile_name cell=cell.name area_km2=ice
+        return summary_row(cell, tile_name, :dropped, time() - t0; correction,
+                           hypsometry_area_km2 = ice, lost_area_km2 = ice)
+    end
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :
                   cell_run_disposition(status, requested, applied.time, centers, correction, mp)
-    disposition === :current && return summary_row(cell, tile_name, :skipped, time() - t0; correction)
+    disposition === :current &&
+        return summary_row(cell, tile_name, :skipped, time() - t0; correction,
+                           hypsometry_area_km2 = status.hypsometry_area_km2,
+                           lost_area_km2 = status.lost_area_km2)
 
     # Per-timestep fits cover the whole record and cannot be resolved onto an appended segment.
     disposition === :extendable && basis === :fitted && (disposition = :rebuild)
@@ -326,15 +399,20 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                                spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                convergence_drift_fac = SPINUP_DRIFT_FAC,
-                               validation_grid,
+                               modelled_intervals,
                                restart = appending ? restart : nothing)
     catch err
-        err isa ForcingUpToDate && return summary_row(cell, tile_name, :skipped, time() - t0; correction)
+        err isa ForcingUpToDate &&
+            return summary_row(cell, tile_name, :skipped, time() - t0; correction,
+                               hypsometry_area_km2 = status.hypsometry_area_km2,
+                               lost_area_km2 = status.lost_area_km2)
         # Ice with no forcing of its own and no donor in reach, which the tile run counts as
-        # unrecovered: recorded with its area in the summary, and not retried.
+        # unrecovered: recorded with its area in the summary, counted against the tile, and not
+        # retried.
         err isa ForcingUnavailable || rethrow()
-        @warn "Cell has no usable forcing; its ice is unrecovered" tile=tile_name cell=cell.name area_km2=sum(glacier_area_column(cell.core))
-        return summary_row(cell, tile_name, :no_forcing, time() - t0; correction)
+        @warn "Cell has no usable forcing; its ice is unrecovered" tile=tile_name cell=cell.name area_km2=ice
+        return summary_row(cell, tile_name, :no_forcing, time() - t0; correction,
+                           hypsometry_area_km2 = ice, lost_area_km2 = ice)
     end
     t_run = time() - t0
 
@@ -360,6 +438,8 @@ function cell_run_disposition(status, requested, run_time, centers, correction, 
     issubset(status.band_centers, centers) || return :rebuild
     status.delta_temperatures == [correction.ΔT] || return :rebuild
     status.precipitation_scalings == [correction.pscale] || return :rebuild
+    # The tile-level lost-ice rule needs every cell's accounting.
+    (status.hypsometry_area_km2 === missing || status.lost_area_km2 === missing) && return :rebuild
     isempty(status.parameters) && return :rebuild
     isempty(run_parameter_differences(status.parameters, requested)) || return :rebuild
     covered = status.time + output_period_bound(mp) >= last(run_time)
@@ -381,14 +461,21 @@ function output_period_bound(mp)
     error("output_period_bound: no period known for output_frequency = :$f")
 end
 
+# One row per cell, or with `cell = nothing` one row for the tile (its `tile` is then required).
+# `hypsometry_area_km2` is the ice over the tile's elevation intervals and `lost_area_km2` the part of
+# it left unmodelled; a run's own accounting replaces both.
 function summary_row(cell, tile_name, status, seconds; run = nothing, correction = nothing,
-                     t_run = missing, error = "")
+                     t_run = missing, error = "", tile = nothing, hypsometry_area_km2 = 0.0,
+                     lost_area_km2 = 0.0)
     years = run === nothing ? missing : GEMB_GlacierSims.record_years(run)
     p = run === nothing ? Dict{String,Any}() : run.provenance
-    return (; tile = tile_name, cell = replace(cell.name, ".nc" => ""),
-            geotile_id = geotile_id(cell.bounds),
-            latitude = cell.latitude, longitude = Float64(wrap_lon(cell.longitude)),
-            hypsometry_area_km2 = sum(glacier_area_column(cell.core)),
+    where = cell === nothing ? tile : cell
+    return (; tile = tile_name, cell = cell === nothing ? "" : replace(cell.name, ".nc" => ""),
+            geotile_id = geotile_id(where.bounds),
+            latitude = cell === nothing ? missing : cell.latitude,
+            longitude = cell === nothing ? missing : Float64(wrap_lon(cell.longitude)),
+            hypsometry_area_km2 = Float64(get(p, "hypsometry_area_km2", hypsometry_area_km2)),
+            lost_area_km2 = Float64(get(p, "lost_area_km2", lost_area_km2)),
             glacier_area_km2 = get(p, "glacier_area_km2", 0.0),
             n_bands = run === nothing ? 0 : length(run.bands),
             pscale = correction === nothing ? missing : correction.pscale,

@@ -113,6 +113,7 @@ export downscaling_tiles, tile_index, tile_bounds, derive_downscaling_parameter_
 include("glacier_tile_run.jl")
 export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id
 export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
+export LOST_AREA_FRACTION_MAXIMUM, DROPPED_BAND_CAUSES, dropped_band_cause_code
 
 include("netcdf_tile_run.jl")
 include("netcdf_tile_merge.jl")
@@ -125,6 +126,6 @@ export read_glacier_tile_status, read_glacier_tile_restart
 include("forcing_corrections.jl")
 include("glacier_native_run.jl")
 export read_forcing_corrections, forcing_correction, native_cells, gemb_native_cell,
-       native_cell_spinup_seed
+       native_cell_spinup_seed, native_tile_lost_area
 
 end # module
