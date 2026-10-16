@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-run_args=("${1:-1950}")
+run_args=("${1:-record-start}")
 [ -n "${2:-}" ] && run_args+=("$2")
 BLOCKS="${NATIVE_BLOCKS:-96}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"

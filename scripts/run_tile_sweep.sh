@@ -5,8 +5,8 @@
 #
 #   scripts/run_tile_sweep.sh [start] [end]
 #
-# `start` and `end` are each a year or an ISO date-time; without `end` the sweep ends at the last step of
-# the cached ERA5-Land record (see gemb_tile_sweep.jl). Exits non-zero when any worker exits non-zero,
+# `start` and `end` are each a year, an ISO date-time, or `record-start` / `record-end`; without them the
+# sweep runs from the first to the last step of the cached ERA5-Land record (see gemb_tile_sweep.jl). Exits non-zero when any worker exits non-zero,
 # which a worker does when any tile it claimed failed, and reports how many tiles failed.
 #
 # One thread per process, one process per physical core. A GEMB spinup cycle allocates about 100 MiB and
@@ -43,9 +43,9 @@
 
 set -uo pipefail
 
-# The run's ends, passed through to every worker; the end is left to the workers, which default it to
-# the end of the cached record.
-run_args=("${1:-1950}")
+# The run's ends, passed through to every worker; the workers read the cached record and resolve
+# `record-start` and an absent end from it.
+run_args=("${1:-record-start}")
 [ -n "${2:-}" ] && run_args+=("$2")
 # One process per core, less headroom. 96 of 128 leaves room for other work on the machine and for the
 # page cache the Zarr reads live in; raise it when the machine is otherwise idle.

@@ -53,19 +53,26 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     @test span == (; start = DateTime(1950, 1, 2), stop = DateTime(1951, 1, 1, 5))
     @test _tree_state(cache) == before                           # nothing written to the cache
 
-    # The end defaults to the last cached step; a year means its 1 January; ISO date-times pass.
-    r = run_time_range(["1950-01-02T00:00:00"], span)
+    # Each end defaults to the cached record's; a year means its 1 January; ISO date-times pass;
+    # `record-start` and `record-end` name the record's own ends.
+    r = run_time_range(String[], span)
     @test r.time_range == (DateTime(1950, 1, 2), DateTime(1951, 1, 1, 5))
-    @test r.source == "start from ARGS, end of the cached record"
+    @test r.source == "start of the cached record, end of the cached record"
     @test run_time_range(["1951"], span).time_range ==
           (DateTime(1951, 1, 1), DateTime(1951, 1, 1, 5))
-    @test run_time_range(["1950-06-01T02:00:00", "1951"], span).time_range ==
-          (DateTime(1950, 6, 1, 2), DateTime(1951, 1, 1))
+    @test run_time_range(["record-start", "1951"], span).time_range ==
+          (DateTime(1950, 1, 2), DateTime(1951, 1, 1))
+    @test run_time_range(["record-start", "1951"], span).source == "start of the cached record, end from ARGS"
+    @test run_time_range(["1950-06-01T02:00:00", "record-end"], span).time_range ==
+          (DateTime(1950, 6, 1, 2), DateTime(1951, 1, 1, 5))
+    # A year whose 1 January precedes the record start is refused, naming the record start.
+    @test_throws "the run starts at 1950-01-01T00:00:00, before the cached ERA5-Land record, which starts at 1950-01-02T00:00:00; start at or after it, or pass `record-start`" run_time_range(["1950"], span)
+    @test_throws "before the cached ERA5-Land record" run_time_range(["1949", "1951"], span)
     # A run past the record is refused, naming the record, before any tile is claimed.
-    @test_throws "reaches outside the cached ERA5-Land record, which runs from 1950-01-02T00:00:00 to 1951-01-01T05:00:00" run_time_range(["1951", "2027"], span)
-    @test_throws "reaches outside" run_time_range(["1949"], span)
+    @test_throws "reaches outside the cached ERA5-Land record, which runs from 1950-01-02T00:00:00 to 1951-01-01T05:00:00" run_time_range(["record-start", "2027"], span)
     @test_throws "not before its end" run_time_range(["1951-01-01T05:00:00"], span)
-    @test_throws "neither a year nor an ISO date-time" run_time_range(["1951", "soon"], span)
+    @test_throws "neither a year, an ISO date-time nor `record-start`" run_time_range(["soon"], span)
+    @test_throws "neither a year, an ISO date-time nor `record-end`" run_time_range(["1951", "record-start"], span)
 
     # A cache the loader would refuse is refused here too.
     @test_throws "no ERA5-Land disk cache" era5_land_record_span(joinpath(cache, "absent"))
@@ -80,25 +87,30 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     unordered = _fixture_era5_cache([t0, t0 + Hour(1), t0 + Hour(3), t0 + Hour(2)])
     @test_throws "not strictly increasing in whole hours" era5_land_record_span(unordered)
 
-    # The sweep script itself, in a process of its own: its settings pass reads the record, and a
-    # request past it stops the script before anything is claimed.
+    # The sweep script itself, in a process of its own: its settings pass reads the record, defaults
+    # to the whole of it, and refuses a start before it or an end after it before anything is claimed.
     climate = mktempdir()
     mv(_fixture_era5_cache(record), joinpath(climate, "cache"))
     script = joinpath(_REPO, "scripts", "gemb_tile_sweep.jl")
     sweep(args...) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no $script $args`,
                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1")
-    out = String(read(sweep("1951"), String))
-    @test occursin("1951-01-01 .. 1951-01-01T05:00", out)
-    @test occursin("end of the cached record", out)
-    err = IOBuffer()
-    @test !success(pipeline(sweep("1951", "2027"); stdout = devnull, stderr = err))
-    @test occursin("reaches outside the cached ERA5-Land record", String(take!(err)))
+    out = String(read(sweep(), String))
+    @test occursin("1950-01-02 .. 1951-01-01T05:00", out)
+    @test occursin("start of the cached record, end of the cached record", out)
+    @test occursin("1951-01-01 .. 1951-01-01T05:00", String(read(sweep("1951"), String)))
+    for (args, message) in ((("1950",), "before the cached ERA5-Land record"),
+                            (("record-start", "2027"), "reaches outside the cached ERA5-Land record"))
+        err = IOBuffer()
+        @test !success(pipeline(sweep(args...); stdout = devnull, stderr = err))
+        @test occursin(message, String(take!(err)))
+    end
 end
 
 # A stand-in for `julia` that a launcher can drive without loading anything: the settings pass
 # succeeds, `-e` prints `STUB_INVARIANT_TARGET` (the invariant path a launcher asks for), and each
 # worker writes the log line its block is told to (`STUB_FAIL_BLOCK` writes a tile failure) and exits
-# with `STUB_EXIT_<block>`, default 0.
+# with `STUB_EXIT_<block>`, default 0. Every call other than `-e` appends its arguments as one line to
+# `STUB_ARGS_LOG` when that is set.
 function _stub_julia(dir)
     path = joinpath(dir, "julia")
     write(path, """
@@ -106,6 +118,7 @@ function _stub_julia(dir)
         for a in "\$@"; do
             [ "\$a" = "-e" ] && { printf '%s' "\$STUB_INVARIANT_TARGET"; exit 0; }
         done
+        [ -n "\${STUB_ARGS_LOG:-}" ] && echo "\$*" >> "\$STUB_ARGS_LOG"
         [ "\${SHOW_SETTINGS:-0}" = "1" ] && exit 0
         block="\${TILE_BLOCK:-\${NATIVE_BLOCK:-1}}"
         if [ "\$block" = "\${STUB_FAIL_BLOCK:-0}" ]; then
@@ -309,14 +322,18 @@ end
             mkpath(joinpath(climate, "invariant", "era5_land"))
             write(joinpath(climate, "invariant", "era5_land", file), "preserved")
             target = joinpath(mktempdir(), "data", "invariant", "era5_land", file)
+            calls = joinpath(mktempdir(), "calls")
             env = ("JULIA" => _stub_julia(mktempdir()), "CLIMATE_CACHE" => climate,
                    "TILE_BLOCKS" => "1", "NATIVE_BLOCKS" => "1", "STUB_INVARIANT_TARGET" => target,
-                   "OUTPUT_DIR" => joinpath(climate, "out"))
+                   "OUTPUT_DIR" => joinpath(climate, "out"), "STUB_ARGS_LOG" => calls)
             launch() = addenv(`bash $(joinpath(_REPO, "scripts", launcher))`, env...)
             # The preserved copy is put in place, once, before any worker starts.
             @test success(pipeline(launch(); stdout = devnull, stderr = devnull))
             @test read(target, String) == "preserved"
             @test !isfile(target * ".part")
+            # Without arguments the settings pass and the worker start at the cached record's start.
+            @test length(readlines(calls)) == 2
+            @test all(endswith(" record-start"), readlines(calls))
             # With no preserved copy and a download that produces nothing, nothing is launched.
             rm(target)
             rm(joinpath(climate, "invariant"); recursive = true)
@@ -398,12 +415,13 @@ end
     # the member's GlobalGlacierAnalysis.jl checkout cannot be found.
     write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = \"$member\"\n")
     climate = mktempdir()
-    mv(_fixture_era5_cache(collect(DateTime(1950, 1, 1):Hour(1):DateTime(1950, 1, 1, 9))),
+    mv(_fixture_era5_cache(collect(DateTime(1950, 1, 2):Hour(1):DateTime(1950, 1, 2, 9))),
        joinpath(climate, "cache"))
     native(gga_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
                               $(joinpath(_REPO, "scripts", "gemb_native_run.jl"))`,
                              "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)
     out = read(native(gga), String)
+    @test occursin("1950-01-02 .. 1950-01-02T09:00", out)       # the whole cached record
     @test occursin(fit, out)
     @test occursin(joinpath(climate, "tile_runs_v2"), out)
     err = IOBuffer()

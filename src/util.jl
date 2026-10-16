@@ -604,32 +604,41 @@ function _open_cached_group(dir)
 end
 
 """
-    run_time_range(args, record; start_default = DateTime(1950, 1, 1)) -> (; time_range, source)
+    run_time_range(args, record) -> (; time_range, source)
 
 The `(start, stop)` a run script covers, from its command-line `args` and the forcing `record`
 (`(; start, stop)`, as [`era5_land_record_span`](@ref) returns). `args[1]` is the start and `args[2]`
-the end, each a year (that year's 1 January, 00:00) or an ISO date-time such as
-`2026-08-14T23:00:00`. Without `args[2]` the run ends at the end of the record. Throws when the range
-is empty or reaches outside the record, naming the record, so a run refuses at start-up rather than
-in every tile. `source` says where each end came from, for the settings table.
+the end, each a year (that year's 1 January, 00:00), an ISO date-time such as `2026-08-14T23:00:00`,
+or `record-start` / `record-end` for the record's own first / last step. A missing start or end is
+the record's. Throws when the range is empty, starts before the record or ends after it, naming the
+record, so a run refuses at start-up rather than in every tile: the cached ERA5-Land record starts at
+1950-01-02T00:00, so the year 1950 is refused. `source` says where each end came from, for the
+settings table.
 """
-function run_time_range(args, record; start_default::DateTime = DateTime(1950, 1, 1))
-    start = length(args) >= 1 ? _parse_run_time(args[1]) : start_default
-    stop = length(args) >= 2 ? _parse_run_time(args[2]) : record.stop
+function run_time_range(args, record)
+    start = length(args) >= 1 ? _parse_run_time(args[1], "record-start", record.start) : record.start
+    stop = length(args) >= 2 ? _parse_run_time(args[2], "record-end", record.stop) : record.stop
     start < stop || throw(ArgumentError("the run starts at $start, not before its end $stop"))
-    (record.start <= start && stop <= record.stop) || throw(ArgumentError(
+    record.start <= start || throw(ArgumentError(
+        "the run starts at $start, before the cached ERA5-Land record, which starts at " *
+        "$(record.start); start at or after it, or pass `record-start`"))
+    stop <= record.stop || throw(ArgumentError(
         "the run $start to $stop reaches outside the cached ERA5-Land record, which runs from " *
         "$(record.start) to $(record.stop); end the run at or before $(record.stop), or refresh " *
         "the cache"))
-    source = (length(args) >= 1 ? "start from ARGS" : "start default") * ", " *
-             (length(args) >= 2 ? "end from ARGS" : "end of the cached record")
+    from_record(i, token) = length(args) < i || args[i] == token
+    source = (from_record(1, "record-start") ? "start of the cached record" : "start from ARGS") *
+             ", " * (from_record(2, "record-end") ? "end of the cached record" : "end from ARGS")
     return (; time_range = (start, stop), source)
 end
 
-function _parse_run_time(s::AbstractString)
+# `s` as a year, an ISO date-time, or `token`, which stands for `record_time`.
+function _parse_run_time(s::AbstractString, token, record_time)
+    s == token && return record_time
     occursin(r"^\d{4}$", s) && return DateTime(parse(Int, s), 1, 1)
     t = tryparse(DateTime, s)
     t === nothing && throw(ArgumentError(
-        "\"$s\" is neither a year nor an ISO date-time such as 2026-08-14T23:00:00"))
+        "\"$s\" is neither a year, an ISO date-time nor `$token` (examples: 1951, " *
+        "2026-08-14T23:00:00, $token)"))
     return t
 end

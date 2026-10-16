@@ -5,9 +5,9 @@
 #
 #   scripts/run_derive_parameters.sh [start] [end]
 #
-# `start` and `end` are read as run_tile_sweep.sh reads them: without `end` the fit window ends at the
-# last step of the cached ERA5-Land record, which is the window the tile sweep runs by default. Exits
-# non-zero when any worker exits non-zero, which a worker does when any tile it claimed failed.
+# `start` and `end` are read as run_tile_sweep.sh reads them: without them the fit window is the whole
+# cached ERA5-Land record, which is the window the tile sweep runs by default. Exits non-zero when any
+# worker exits non-zero, which a worker does when any tile it claimed failed.
 #
 # The fit window must match the window the tile runs will use, or `gemb_tile_sweep.jl` resolves the
 # parameters on the climatology path rather than the fitted one: it compares the parameter file's own time
@@ -35,7 +35,7 @@
 
 set -uo pipefail
 
-run_args=("${1:-1950}")
+run_args=("${1:-record-start}")
 [ -n "${2:-}" ] && run_args+=("$2")
 BLOCKS="${TILE_BLOCKS:-96}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"

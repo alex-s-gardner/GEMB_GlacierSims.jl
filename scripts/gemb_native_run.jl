@@ -34,9 +34,9 @@
 # Run one block:  julia --project=. -t 1 scripts/gemb_native_run.jl [start] [end]
 # Run them all:   scripts/run_native_sweep.sh [start] [end]
 #
-# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year or an ISO
-# date-time, defaulting to 1950 and the end of the cached ERA5-Land record. The process exits with
-# status 1 when any cell or tile it ran failed.
+# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year, an ISO
+# date-time, or `record-start` / `record-end`, defaulting to the first and last steps of the cached
+# ERA5-Land record. The process exits with status 1 when any cell or tile it ran failed.
 #
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,

@@ -19,10 +19,11 @@
 # Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start] [end]
 # Run the sweep:  scripts/run_tile_sweep.sh [start] [end]
 #
-# `start` and `end` are each a year (its 1 January, 00:00) or an ISO date-time. `start` defaults to
-# 1950 and `end` to the last step of the cached ERA5-Land record, which is read at start-up; a range
-# reaching outside the cached record is refused then, before any tile is claimed. The process exits with
-# status 1 when any tile it claimed failed.
+# `start` and `end` are each a year (its 1 January, 00:00), an ISO date-time, or `record-start` /
+# `record-end`. They default to the first and last steps of the cached ERA5-Land record, which is read
+# at start-up; a range reaching outside the cached record is refused then, before any tile is claimed.
+# The record starts at 1950-01-02T00:00, so `1950` is refused. The process exits with status 1 when any
+# tile it claimed failed.
 #
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
@@ -65,8 +66,8 @@ const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, TILE_RUN_DIR))
 const TILE_SIZE = 2
 const BUFFER = 1
 
-# `climate_forcing` refuses a request past the end of the cached record, so the run ends at that end
-# unless told otherwise, and a range the cache cannot serve fails here rather than in every tile.
+# `climate_forcing` refuses a request outside the cached record, so the run spans that record unless
+# told otherwise, and a range the cache cannot serve fails here rather than in every tile.
 const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
 const TIME_RANGE = RUN_TIME.time_range
 

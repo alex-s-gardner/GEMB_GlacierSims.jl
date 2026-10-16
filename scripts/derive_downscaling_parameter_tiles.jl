@@ -14,9 +14,10 @@
 #
 # Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start] [end]
 #
-# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year or an ISO
-# date-time, defaulting to 1950 and the end of the cached ERA5-Land record, so a derivation with no
-# arguments fits the window the sweep runs. The process exits with status 1 when any tile failed.
+# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year, an ISO
+# date-time, or `record-start` / `record-end`, defaulting to the first and last steps of the cached
+# ERA5-Land record, so a derivation with no arguments fits the window the sweep runs. The process
+# exits with status 1 when any tile failed.
 #
 # Sizing, measured on the 47,121-cell global table at the 2°/1° default: 819 non-empty tiles,
 # ~170,000 cell forcing loads, ~60 MB per tile of fits before compression at the full 1950-2026
