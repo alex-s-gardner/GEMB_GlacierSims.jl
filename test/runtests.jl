@@ -862,17 +862,24 @@ end
     end
 
     @testset "spinup window inheritance" begin
-        # A cold start derives the window from the record: the first 30 complete years.
+        # A cold start derives the window from the record: its first 30 whole calendar years, from
+        # 1 January 00:00 to the last step of a 31 December (here daily).
         t = collect(DateTime(1960, 1, 1):Day(1):DateTime(1994, 12, 31))
         cold = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
         @test GEMB_GlacierSims._default_spinup_window(cold) ==
               (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
-        # An hourly ERA5-Land record starts at 1950-01-02T00: the window starts there, not on
-        # 1 January, which `_spinup_climatology` would refuse.
-        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1950, 2, 1))
+        # An hourly ERA5-Land record starts at 1950-01-02T00, so its first whole year is 1951, and a
+        # record of fewer than 30 whole years gives all of them.
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1953, 12, 31, 23))
         era5 = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
         @test GEMB_GlacierSims._default_spinup_window(era5) ==
-              (DateTime(1950, 1, 2), DateTime(1979, 12, 31))
+              (DateTime(1951, 1, 1), DateTime(1953, 12, 31, 23))
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1951, 12, 31, 22))
+        short = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test_throws "the forcing 1950-01-02T00:00:00 .. 1951-12-31T22:00:00 holds no whole calendar year" GEMB_GlacierSims._default_spinup_window(short)
+        t = [DateTime(1951, 1, 1), DateTime(1951, 1, 1, 1), DateTime(1951, 1, 1, 3)]
+        uneven = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test_throws "time steps are not uniform" GEMB_GlacierSims._default_spinup_window(uneven)
 
         # A continuation inherits the window its record was spun up on, parsed back from the
         # strings NetCDF stored (it has no date attribute type). This is the whole point: a
@@ -921,12 +928,22 @@ end
         # The message names the window to fetch, since that is the remedy.
         @test occursin("1960-01-01T00:00:00", sprint(showerror, err))
 
-        # A partial year is refused too, and this is why the test is a span rather than a count:
-        # `forcing_climatology` calls whichever years hold the most steps "complete", so six
-        # months of daily data would average into a 182-step "climatological year" without
-        # complaint.
+        # A window that is not whole calendar years is refused: `forcing_climatology` keeps only the
+        # complete years of what it selects, so six months of daily data would leave nothing, and a
+        # window ending at 00:00 on 31 December of an hourly record would lose that year.
         partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
-        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
+        @test_throws "the spinup window 1995-01-01T00:00:00 .. 1995-06-30T00:00:00 is not whole calendar years on this forcing's 1 day grid" GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
+        th = collect(DateTime(1951, 1, 1):Hour(1):DateTime(1954, 12, 31, 23))
+        hourly = DimStack((x = DimArray(zeros(length(th)), (Ti(th),)),))
+        @test_throws "(such as 1953-12-31T23:00:00)" GEMB_GlacierSims._spinup_climatology(
+            hourly, (DateTime(1951, 1, 1), DateTime(1953, 12, 31)), mp)
+        # Whole years, but fewer than the `:representative` block needs: `n_years` would otherwise be
+        # clamped to the two years found.
+        @test_throws "the spinup window 1995-01-01T00:00:00 .. 1996-12-31T00:00:00 holds 2 whole calendar year(s); the :representative climatology needs 3" GEMB_GlacierSims._spinup_climatology(
+            cf, (DateTime(1995, 1, 1), DateTime(1996, 12, 31)), mp)
+        # Whole years ending after the forcing: the last year would be dropped.
+        late = (DateTime(1995, 1, 1), DateTime(2000, 12, 31))
+        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, late, mp)
 
         # A window starting before the forcing is refused even though the rest of it is supplied:
         # the climatology keeps complete years only, so it would drop the partial first year and
@@ -942,8 +959,58 @@ end
         end
         @test err isa SpinupWindowUnavailable
         @test err.extent == (first(t), last(t))
-        @test occursin("the spinup window 1950-01-01T00:00:00 .. 1953-12-31T00:00:00 starts before " *
-                       "the forcing supplied (1950-01-02T00:00:00", sprint(showerror, err))
+        @test occursin("the spinup window 1950-01-01T00:00:00 .. 1953-12-31T00:00:00 is not inside " *
+                       "the forcing supplied (1950-01-02T00:00:00 .. 1955-12-31T00:00:00)",
+                       sprint(showerror, err))
+    end
+
+    @testset "the whole-year spinup window gives the same climatology" begin
+        # The production record starts 1950-01-02T00. The window that named the record start,
+        # 1950-01-02T00 .. 31 December 00:00 of a leap year, and the whole-year window from the next
+        # 1 January select the same complete years (the partial first year and the leap day are
+        # dropped either way), so the climatology is bit-identical and only the recorded window
+        # changes. Hourly synthetic forcing whose years differ, so the representative block is chosen
+        # among distinct candidates.
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1956, 12, 31, 23))
+        n = length(t)
+        doy = Dates.dayofyear.(t)
+        hod = Dates.hour.(t)
+        yr = Dates.year.(t)
+        temperature = @. 262.0 + 12.0 * sin(2π * (doy - 110) / 365) + 3.0 * sin(2π * hod / 24) +
+                         1.5 * sin(1.7 * yr)
+        shortwave = @. max(0.0, 600.0 * sin(2π * (hod - 6) / 24))
+        layer(x) = DimArray(x isa AbstractVector ? x : fill(Float64(x), n), (Ti(t),))
+        stack = DimStack((temperature_air = layer(temperature), pressure_air = layer(8e4),
+                          vapor_pressure = layer(@. 200.0 + 2.0 * (temperature - 262.0)),
+                          wind_speed = layer(3.0),
+                          precipitation = layer(@. 1e-4 * (1 + sin(0.37 * doy + yr))),
+                          shortwave_downward = layer(shortwave),
+                          longwave_downward = layer(@. 0.8 * 5.670374419e-8 * temperature^4),
+                          solar_zenith_angle = layer(60.0),
+                          shortwave_downward_diffuse = layer(0.3 .* shortwave),
+                          cloud_optical_thickness = layer(2.0));
+                         metadata = Dict{String,Any}(
+                             "latitude" => 61.0, "longitude" => -140.0, "elevation" => 1500.0,
+                             "dataset" => "synthetic", "temperature_observation_height" => 2.0,
+                             "wind_observation_height" => 10.0,
+                             "temperature_air_mean" => sum(temperature) / n, "wind_speed_mean" => 3.0,
+                             "precipitation_mean" => 1e-4))
+        cf = GEMB.initialize_forcing(stack)
+        mp = GEMB.initialize_parameters()
+        named = (DateTime(1950, 1, 2), DateTime(1956, 12, 31))
+        whole = GEMB_GlacierSims._default_spinup_window(cf)
+        @test whole == (DateTime(1951, 1, 1), DateTime(1956, 12, 31, 23))
+        layers(c) = [getfield(c, f) for f in fieldnames(typeof(c)) if getfield(c, f) isa AbstractDimArray]
+        for method in (:average, :representative)
+            before = GEMB.forcing_climatology(cf, named; method, model_parameters = mp, n_years = 3,
+                                              verbose = false)
+            after = GEMB_GlacierSims._spinup_climatology(cf, whole, mp; method)
+            @test lookup(before.temperature_air, Ti) == lookup(after.temperature_air, Ti)
+            @test all(isequal.(parent.(layers(before)), parent.(layers(after))))
+            @test before.climatology_n_years == after.climatology_n_years
+            @test after.climatology_window_start == DateTime(1951, 1, 1)
+            @test after.climatology_window_stop == DateTime(1956, 12, 31, 23)
+        end
     end
 
     @testset "NetCDF append" begin

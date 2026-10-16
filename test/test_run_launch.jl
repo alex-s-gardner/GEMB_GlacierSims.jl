@@ -11,11 +11,12 @@ const _REPO = normpath(joinpath(@__DIR__, ".."))
 # chunks read, and no `.zgroup`, `.zarray` or `.zattrs` files. `climate_forcing` reads the time axis
 # from `sfc-2m-temperature` only, so only that group holds time chunks. Time is Int64 hours since
 # 1970-01-01 with no fill value, as in the ARCO stores; each group carries its two (lon, lat, time)
-# variables. `steps[group]` gives one group other than the temperature group another record length.
+# variables. `steps[group]` gives one group other than the temperature group another record length;
+# `time_chunk` is the time axis's chunk length.
 const _FIXTURE_VARIABLES = Dict("sfc-2m-temperature" => ("t2m", "d2m"),
                                 "sfc-pressure-precipitation" => ("sp", "tp"),
                                 "sfc-wind" => ("u10", "v10"), "sfc-radiation-heat" => ("ssrd", "strd"))
-function _fixture_era5_cache(times; steps = Dict{String,Int}())
+function _fixture_era5_cache(times; steps = Dict{String,Int}(), time_chunk = 1000)
     hours = [Dates.value(t - DateTime(1970, 1, 1)) ÷ 3_600_000 for t in times]
     cache = mktempdir()
     for (group, variables) in _FIXTURE_VARIABLES
@@ -23,11 +24,11 @@ function _fixture_era5_cache(times; steps = Dict{String,Int}())
         store = Zarr.DirectoryStore(dir)
         g = Zarr.zgroup(store, "")
         n = group == "sfc-2m-temperature" ? length(hours) : get(steps, group, length(hours))
-        t = Zarr.zcreate(Int64, g, "time", n; chunks = (1000,), fill_value = nothing,
+        t = Zarr.zcreate(Int64, g, "time", n; chunks = (time_chunk,), fill_value = nothing,
                          attrs = Dict("units" => "hours since 1970-01-01"))
         group == "sfc-2m-temperature" && (t[:] = hours)
         for v in variables
-            Zarr.zcreate(Float32, g, v, 3, 2, n; chunks = (3, 2, 1000), fill_value = NaN32)
+            Zarr.zcreate(Float32, g, v, 3, 2, n; chunks = (3, 2, time_chunk), fill_value = NaN32)
         end
         Zarr.consolidate_metadata(store)
         for (root, _, files) in walkdir(dir; topdown = false)
@@ -37,6 +38,11 @@ function _fixture_era5_cache(times; steps = Dict{String,Int}())
     end
     return cache
 end
+
+# The production record: hourly from 1950-01-02T00, where ERA5-Land starts, to 2026-08-14T23, where the
+# cache on bylot ends.
+const _PRODUCTION_RECORD = collect(DateTime(1950, 1, 2):Hour(1):DateTime(2026, 8, 14, 23))
+_production_fixture() = _fixture_era5_cache(_PRODUCTION_RECORD; time_chunk = 100_000)
 
 # Every file under `dir` with its size and modification time.
 _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime(joinpath(root, f)))
@@ -74,21 +80,6 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     @test_throws "neither a year, an ISO date-time nor `record-start`" run_time_range(["soon"], span)
     @test_throws "neither a year, an ISO date-time nor `record-end`" run_time_range(["1951", "record-start"], span)
 
-    # The spinup climatology window starts at the record's first step by default. A start before the
-    # record or before the run is refused: the climatology keeps complete years only, so it would
-    # silently lose the forcing's partial first year.
-    @test spinup_window_range(nothing, "1980", span, r.time_range) ==
-          (DateTime(1950, 1, 2), DateTime(1980, 12, 31))
-    @test spinup_window_range("record-start", "1950-12-31T23:00:00", span, r.time_range) ==
-          (DateTime(1950, 1, 2), DateTime(1950, 12, 31, 23))
-    @test spinup_window_range("1951", "1980", span, r.time_range) ==
-          (DateTime(1951, 1, 1), DateTime(1980, 12, 31))
-    @test_throws "the spinup climatology window starts at 1950-01-01T00:00:00, before the cached ERA5-Land record, which starts at 1950-01-02T00:00:00; start it at or after the record start, or pass `record-start`" spinup_window_range("1950", "1980", span, r.time_range)
-    @test_throws "before the run, which starts at 1951-01-01T00:00:00" spinup_window_range(
-        nothing, "1980", span, run_time_range(["1951"], span).time_range)
-    @test_throws "not before its end" spinup_window_range("1951", "1950", span, r.time_range)
-    @test_throws "neither a year nor an ISO date-time" spinup_window_range(nothing, "soon", span, r.time_range)
-
     # A cache the loader would refuse is refused here too.
     @test_throws "no ERA5-Land disk cache" era5_land_record_span(joinpath(cache, "absent"))
     rm(joinpath(cache, "sfc-wind"); recursive = true)
@@ -102,33 +93,147 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     unordered = _fixture_era5_cache([t0, t0 + Hour(1), t0 + Hour(3), t0 + Hour(2)])
     @test_throws "not strictly increasing in whole hours" era5_land_record_span(unordered)
 
-    # The sweep script itself, in a process of its own: its settings pass reads the record, defaults
-    # to the whole of it, and refuses a start before it or an end after it before anything is claimed.
+    # The sweep script itself, in a process of its own, on the production record: its settings pass
+    # reads the record, defaults to the whole of it, and refuses a start before it or an end after it
+    # before anything is claimed.
     climate = mktempdir()
-    mv(_fixture_era5_cache(record), joinpath(climate, "cache"))
+    mv(_production_fixture(), joinpath(climate, "cache"))
     script = joinpath(_REPO, "scripts", "gemb_tile_sweep.jl")
     sweep(args...) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no $script $args`,
                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1")
     out = String(read(sweep(), String))
-    @test occursin("1950-01-02 .. 1951-01-01T05:00", out)
+    @test occursin("1950-01-02 .. 2026-08-14T23:00", out)
     @test occursin("start of the cached record, end of the cached record", out)
-    @test occursin(r"spinup climatology +1950-01-02 \.\. 1980-12-31", out)
-    err = IOBuffer()
-    @test !success(pipeline(addenv(sweep(), "SPINUP_CLIMATOLOGY_START" => "1950"); stdout = devnull,
-                            stderr = err))
-    @test occursin("the spinup climatology window starts at 1950-01-01T00:00:00, before the cached " *
-                   "ERA5-Land record", String(take!(err)))
-    # A run starting after the record start fetches no forcing before it, so it needs a spinup window
-    # that starts with it.
-    @test occursin("1951-01-01 .. 1951-01-01T05:00",
-                   String(read(addenv(sweep("1951"), "SPINUP_CLIMATOLOGY_START" => "1951"), String)))
-    for (args, message) in ((("1950",), "before the cached ERA5-Land record"),
-                            (("record-start", "2027"), "reaches outside the cached ERA5-Land record"),
-                            (("1951",), "the spinup climatology window starts at 1950-01-02T00:00:00, " *
-                                        "before the run, which starts at 1951-01-01T00:00:00"))
+    @test occursin(r"spinup climatology +1951-01-01 \.\. 1980-12-31T23:00", out)
+    # A later start moves the default spinup window to the whole years the run fetches.
+    out = String(read(sweep("1960"), String))
+    @test occursin("1960-01-01 .. 2026-08-14T23:00", out)
+    @test occursin(r"spinup climatology +1960-01-01 \.\. 1980-12-31T23:00", out)
+    for (cmd, message) in ((sweep("1950"), "before the cached ERA5-Land record"),
+                           (sweep("record-start", "2027"), "reaches outside the cached ERA5-Land record"),
+                           (addenv(sweep(), "SPINUP_CLIMATOLOGY_START" => "1950"),
+                            "the spinup climatology window starts at 1950-01-01T00:00:00, before the " *
+                            "cached ERA5-Land record, which starts at 1950-01-02T00:00:00"),
+                           (addenv(sweep(), "SPINUP_CLIMATOLOGY_STOP" => "1980-12-31T00:00:00"),
+                            "must end at the last step of 31 December of a year (1980-12-31T23:00:00"),
+                           (addenv(sweep("1960"), "SPINUP_CLIMATOLOGY_START" => "1955"),
+                            "before the run, which starts at 1960-01-01T00:00:00"),
+                           (sweep("2000"), "the spinup climatology window defaults to the whole " *
+                            "calendar years inside 2000-01-01T00:00:00 .. 1980-12-31T23:00:00"))
         err = IOBuffer()
-        @test !success(pipeline(sweep(args...); stdout = devnull, stderr = err))
+        @test !success(pipeline(cmd; stdout = devnull, stderr = err))
         @test occursin(message, String(take!(err)))
+    end
+end
+
+@testset "run launch: the spinup window is the whole calendar years it uses" begin
+    # GEMB's climatology keeps only complete calendar years, so the window a run records must name
+    # whole years: the production record starts 1950-01-02T00, so its first whole year is 1951.
+    record = (; start = DateTime(1950, 1, 2), stop = DateTime(2026, 8, 14, 23))
+    full = (record.start, record.stop)
+    window(start = nothing, stop = nothing, time_range = full; minimum_years = 3) =
+        spinup_window_range(start, stop, record, time_range; last_year = 1980, minimum_years)
+    @test window() == (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
+    # The default follows the run: its own whole years inside the record and through 1980.
+    @test window(nothing, nothing, (DateTime(1960, 1, 1), record.stop)) ==
+          (DateTime(1960, 1, 1), DateTime(1980, 12, 31, 23))
+    @test window(nothing, nothing, (DateTime(1960, 6, 1), record.stop)) ==
+          (DateTime(1961, 1, 1), DateTime(1980, 12, 31, 23))
+    @test window(nothing, nothing, (record.start, DateTime(1970, 6, 30))) ==
+          (DateTime(1951, 1, 1), DateTime(1969, 12, 31, 23))
+    @test window(nothing, nothing, (DateTime(1960, 1, 1), DateTime(1964, 6, 30))) ==
+          (DateTime(1960, 1, 1), DateTime(1963, 12, 31, 23))
+    @test_throws "the spinup climatology window defaults to the whole calendar years inside 2000-01-01T00:00:00 .. 1980-12-31T23:00:00 (the cached ERA5-Land record and the run, through 31 December 1980), and that interval holds none" window(
+        nothing, nothing, (DateTime(2000, 1, 1), record.stop))
+    @test_throws "inside 1950-01-02T00:00:00 .. 1950-12-31T00:00:00" window(
+        nothing, nothing, (record.start, DateTime(1950, 12, 31)))
+    # Explicit ends: years, or ISO date-times on a calendar-year boundary.
+    @test window("1960", "1970") == (DateTime(1960, 1, 1), DateTime(1970, 12, 31, 23))
+    @test window("1951-01-01T00:00:00", "1980-12-31T23:00:00") ==
+          (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
+    @test window("1960") == (DateTime(1960, 1, 1), DateTime(1980, 12, 31, 23))
+    @test_throws "must start on 1 January, 00:00 of a year, not at 1950-01-02T00:00:00" window(
+        "1950-01-02T00:00:00")
+    @test_throws "must end at the last step of 31 December of a year (1980-12-31T23:00:00 for this 1 hour forcing), not at 1980-12-31T00:00:00" window(
+        nothing, "1980-12-31T00:00:00")
+    # Outside the record or the run, naming the bound.
+    @test_throws "the spinup climatology window starts at 1950-01-01T00:00:00, before the cached ERA5-Land record, which starts at 1950-01-02T00:00:00" window("1950")
+    @test_throws "ends at 2026-12-31T23:00:00, after the cached ERA5-Land record, which ends at 2026-08-14T23:00:00" window(
+        "2000", "2026")
+    @test_throws "starts at 1955-01-01T00:00:00, before the run, which starts at 1960-01-01T00:00:00" window(
+        "1955", nothing, (DateTime(1960, 1, 1), record.stop))
+    @test_throws "ends at 1975-12-31T23:00:00, after the run, which ends at 1970-06-30T00:00:00" window(
+        nothing, "1975", (record.start, DateTime(1970, 6, 30)))
+    @test_throws "holds 2 whole calendar year(s); the spinup climatology needs at least 3" window(
+        "1951", "1952")
+    @test_throws "not before its end" window("1960", "1959")
+    @test_throws "neither a year nor an ISO date-time" window(nothing, "soon")
+
+    # The native run's window is computed by the same call as the sweep's, and its reference check
+    # accepts the pair through a tile file the sweep wrote. The previous default window does not match.
+    settings = Module()
+    Base.eval(settings, :(using Dates))
+    Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
+    for script in ("gemb_tile_sweep.jl", "gemb_native_run.jl")
+        @test occursin("last_year = SPINUP_CLIMATOLOGY_LAST_YEAR",
+                       read(joinpath(_REPO, "scripts", script), String))
+    end
+    sweep_window = spinup_window_range(nothing, nothing, record, full;
+                                       last_year = settings.SPINUP_CLIMATOLOGY_LAST_YEAR)
+    native_window = spinup_window_range(nothing, nothing, record, full;
+                                        last_year = settings.SPINUP_CLIMATOLOGY_LAST_YEAR)
+    as_parameters(w) = Dict{String,Any}("spinup_window_start" => string(w[1]),
+                                        "spinup_window_stop" => string(w[2]))
+    run = _fake_tile_run()
+    merge!(run.parameters, as_parameters(sweep_window))
+    reference = read_glacier_tile_status(write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), run))
+    @test reference.parameters["spinup_window_start"] == "1951-01-01T00:00:00"
+    @test reference.parameters["spinup_window_stop"] == "1980-12-31T23:00:00"
+    @test isempty(run_parameter_differences(reference.parameters,
+                                            merge(run.parameters, as_parameters(native_window))))
+    @test !isempty(run_parameter_differences(reference.parameters, merge(run.parameters,
+        as_parameters((DateTime(1950, 1, 2), DateTime(1980, 12, 31))))))
+end
+
+# Whether parsing produced an error or an incomplete expression anywhere.
+_parse_failed(ex) = ex isa Expr && (ex.head in (:error, :incomplete) || any(_parse_failed, ex.args))
+
+# The right-hand side of the first assignment to `name` (`const` or not) anywhere in `ex`.
+function _assigned(ex, name)
+    ex isa Expr || return nothing
+    ex.head === :(=) && ex.args[1] === name && return ex.args[2]
+    for a in ex.args
+        found = _assigned(a, name)
+        found === nothing || return found
+    end
+    return nothing
+end
+
+@testset "run launch: example scripts request forcing from the cached record's start" begin
+    # Each script computes its forcing request from the cached record, as the run scripts do. The
+    # expression it assigns is evaluated against the production-shaped fixture and must pass the
+    # loader's own checks of a request against a cached record.
+    cache = _production_fixture()
+    epoch = DateTime(1970, 1, 1)
+    hours = [Dates.value(t - epoch) ÷ 3_600_000 for t in _PRODUCTION_RECORD]
+    for (file, cache_name, range_name, stop) in
+            (("scripts/alaska_sweep_timing.jl", :FORCING_CACHE, :FORCING_TIME_RANGE, DateTime(2026, 8, 1)),
+             ("scripts/check_threaded_equivalence.jl", :FORCING_CACHE, :FORCING_TIME_RANGE, DateTime(1985, 1, 1)),
+             ("src/era5_example.jl", :forcing_cache, :forcing_time_range, DateTime(2026, 8, 1)))
+        source = read(joinpath(_REPO, file), String)
+        ast = Meta.parseall(source; filename = file)
+        @test !_parse_failed(ast)
+        @test !occursin("DateTime(1950, 1, 1)", source)
+        rhs = _assigned(ast, range_name)
+        @test rhs !== nothing
+        sandbox = Module()
+        Base.eval(sandbox, :(using GEMB_GlacierSims, Dates))
+        Base.eval(sandbox, :(const $cache_name = $cache))
+        request = Base.eval(sandbox, rhs)
+        @test request == (DateTime(1950, 1, 2), stop)
+        @test GEMB_ClimateForcing._record_slice(hours, epoch, request) ==
+              1:findlast(<=(Dates.value(stop - epoch) ÷ 3_600_000), hours)
+        @test GEMB_ClimateForcing._check_cached_record(cache, hours, epoch, request, ()) === nothing
     end
 end
 
@@ -441,14 +546,13 @@ end
     # the member's GlobalGlacierAnalysis.jl checkout cannot be found.
     write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = \"$member\"\n")
     climate = mktempdir()
-    mv(_fixture_era5_cache(collect(DateTime(1950, 1, 2):Hour(1):DateTime(1950, 1, 2, 9))),
-       joinpath(climate, "cache"))
+    mv(_production_fixture(), joinpath(climate, "cache"))
     native(gga_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
                               $(joinpath(_REPO, "scripts", "gemb_native_run.jl"))`,
                              "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)
     out = read(native(gga), String)
-    @test occursin("1950-01-02 .. 1950-01-02T09:00", out)       # the whole cached record
-    @test occursin(r"spinup climatology +1950-01-02 \.\. 1980-12-31", out)
+    @test occursin("1950-01-02 .. 2026-08-14T23:00", out)       # the whole cached record
+    @test occursin(r"spinup climatology +1951-01-01 \.\. 1980-12-31T23:00", out)
     @test occursin(fit, out)
     @test occursin(joinpath(climate, "tile_runs_v2"), out)
     err = IOBuffer()

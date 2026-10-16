@@ -36,9 +36,12 @@ i = findfirst(i -> -170 <= wrap_lon(rows[i].longitude) <= -129 &&
                    glacier_area_total(rows[i]) >= 1.0, eachindex(rows))
 r = rows[i]
 
-# Short forcing window: this test is about equivalence, not about a realistic record.
+# Short forcing window from the cached record's first step, read as the run scripts read it: this test
+# is about equivalence, not about a realistic record.
+const FORCING_TIME_RANGE = run_time_range(["record-start", "1985-01-01T00:00:00"],
+                                          era5_land_record_span(FORCING_CACHE)).time_range
 forcing = climate_forcing(:era5land, r.latitude, r.longitude;
-                          time_range = (DateTime(1950, 1, 1), DateTime(1985, 1, 1)),
+                          time_range = FORCING_TIME_RANGE,
                           token = GEMB_ClimateForcing.get_cds_api_key(),
                           cache_path = FORCING_CACHE)
 

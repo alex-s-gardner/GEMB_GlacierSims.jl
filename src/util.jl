@@ -633,33 +633,99 @@ function run_time_range(args, record)
 end
 
 """
-    spinup_window_range(start, stop, record, time_range) -> (start, stop)
+    spinup_window_range(start, stop, record, time_range; last_year, minimum_years = 1,
+                        step = Hour(1)) -> (start, stop)
 
-The window a run script's spinup climatology is drawn from, from the cached forcing `record`
-(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns) and the run's `time_range`. `start` is
-`nothing` or `record-start` for the record's first step, a year (its 1 January, 00:00) or an ISO
-date-time; `stop` is a year (its 31 December, 00:00) or an ISO date-time.
+The window a run script's spinup climatology is drawn from, as whole calendar years. GEMB's
+climatology keeps only complete years, so a window of whole years names exactly the years the
+climatology uses, and that is the window a run records. `record` is the cached forcing record
+(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns), `time_range` the run's, and `step` the
+forcing's time step (ERA5-Land is hourly). The window must lie inside both the record and the run:
+a run fetches no forcing outside its own range.
 
-Throws when the window is empty, starts before the cached record, or starts before the run (whose
-forcing is all a run fetches), naming the start it must not precede. `_spinup_climatology` refuses
-such a window too, once per band; this refuses it at start-up. The climatology keeps only complete
-years, so a window starting earlier would silently lose the forcing's partial first year.
+With `start` and `stop` `nothing`, the window is the whole calendar years inside
+[max(record start, run start), min(31 December `last_year`, record end, run end)]. For the cached
+ERA5-Land record, which starts 1950-01-02T00:00, a full-record run and `last_year = 1980`, that is
+1951-01-01T00:00 .. 1980-12-31T23:00. Either end can be given instead: `start` as a year (its
+1 January, 00:00) or an ISO date-time at 1 January, 00:00; `stop` as a year (the last `step` of its
+31 December) or an ISO date-time at that instant.
+
+Throws, naming the bound, when a given end is not a calendar-year boundary, when the window starts
+before the record or the run or ends after them, when the default interval holds no whole year, or
+when the window holds fewer than `minimum_years` years.
 """
-function spinup_window_range(start, stop::AbstractString, record, time_range)
-    t0 = start === nothing ? record.start : _parse_run_time(start, "record-start", record.start)
-    t1 = occursin(r"^\d{4}$", stop) ? DateTime(parse(Int, stop), 12, 31) : tryparse(DateTime, stop)
-    t1 === nothing && throw(ArgumentError(
-        "\"$stop\" is neither a year nor an ISO date-time (examples: 1980, 1980-12-31T23:00:00)"))
+function spinup_window_range(start, stop, record, time_range; last_year::Integer,
+                             minimum_years::Integer = 1, step = Hour(1))
+    lo = max(record.start, first(time_range))
+    hi = min(record.stop, last(time_range))
+    cap = min(hi, DateTime(last_year + 1) - step)
+    default = _whole_year_window(lo, cap, step)
+    default === nothing && (start === nothing || stop === nothing) && throw(ArgumentError(
+        "the spinup climatology window defaults to the whole calendar years inside $lo .. $cap " *
+        "(the cached ERA5-Land record and the run, through 31 December $last_year), and that " *
+        "interval holds none; give the window's start and stop explicitly"))
+    t0 = start === nothing ? default[1] : _spinup_window_start(start)
+    t1 = stop === nothing ? default[2] : _spinup_window_stop(stop, step)
     t0 < t1 || throw(ArgumentError("the spinup climatology window starts at $t0, not before its end $t1"))
     record.start <= t0 || throw(ArgumentError(
         "the spinup climatology window starts at $t0, before the cached ERA5-Land record, which " *
-        "starts at $(record.start); start it at or after the record start, or pass `record-start`"))
+        "starts at $(record.start); start it on 1 January of a later year"))
     first(time_range) <= t0 || throw(ArgumentError(
         "the spinup climatology window starts at $t0, before the run, which starts at " *
         "$(first(time_range)) and fetches no forcing before it; start the run at or before $t0, " *
-        "or start the window at or after $(first(time_range))"))
+        "or start the window on 1 January of a year at or after $(first(time_range))"))
+    t1 <= record.stop || throw(ArgumentError(
+        "the spinup climatology window ends at $t1, after the cached ERA5-Land record, which ends " *
+        "at $(record.stop); end it on 31 December of an earlier year"))
+    t1 <= last(time_range) || throw(ArgumentError(
+        "the spinup climatology window ends at $t1, after the run, which ends at " *
+        "$(last(time_range)) and fetches no forcing after it; end the run at or after $t1, or end " *
+        "the window on 31 December of a year at or before $(last(time_range))"))
+    n = _whole_years((t0, t1))
+    n >= minimum_years || throw(ArgumentError(
+        "the spinup climatology window $t0 .. $t1 holds $n whole calendar year(s); the spinup " *
+        "climatology needs at least $minimum_years"))
     return (t0, t1)
 end
+
+function _spinup_window_start(s::AbstractString)
+    t = occursin(r"^\d{4}$", s) ? DateTime(parse(Int, s)) : tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year nor an ISO date-time (examples: 1951, 1951-01-01T00:00:00)"))
+    t == DateTime(year(t)) || throw(ArgumentError(
+        "the spinup climatology window must start on 1 January, 00:00 of a year, not at $t: " *
+        "the climatology keeps only whole calendar years"))
+    return t
+end
+
+function _spinup_window_stop(s::AbstractString, step)
+    occursin(r"^\d{4}$", s) && return DateTime(parse(Int, s) + 1) - step
+    t = tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year nor an ISO date-time (examples: 1980, 1980-12-31T23:00:00)"))
+    t == DateTime(year(t) + 1) - step || throw(ArgumentError(
+        "the spinup climatology window must end at the last step of 31 December of a year " *
+        "($(DateTime(year(t) + 1) - step) for this $(step) forcing), not at $t: the climatology " *
+        "keeps only whole calendar years"))
+    return t
+end
+
+# The whole calendar years inside `[lo, hi]` on a time grid of `step`: from 1 January 00:00 of the first
+# year starting at or after `lo` to the last step (one `step` before the next 1 January) of the last year
+# ending by `hi`. `nothing` when no whole year fits.
+function _whole_year_window(lo::DateTime, hi::DateTime, step)
+    y0 = lo == DateTime(year(lo)) ? year(lo) : year(lo) + 1
+    y1 = hi >= DateTime(year(hi) + 1) - step ? year(hi) : year(hi) - 1
+    y0 <= y1 || return nothing
+    return (DateTime(y0), DateTime(y1 + 1) - step)
+end
+
+# Whether `window` is whole calendar years on a time grid of `step`.
+_is_whole_year_window(window, step) =
+    window[1] == DateTime(year(window[1])) && window[2] == DateTime(year(window[2]) + 1) - step &&
+    window[1] < window[2]
+
+_whole_years(window) = year(window[2]) - year(window[1]) + 1
 
 # `s` as a year, an ISO date-time, or `token`, which stands for `record_time`.
 function _parse_run_time(s::AbstractString, token, record_time)

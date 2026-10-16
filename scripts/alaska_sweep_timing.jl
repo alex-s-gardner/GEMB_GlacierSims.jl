@@ -62,7 +62,6 @@ const PRECIPITATION_SCALINGS  = [0.5, 1.0, 2.0]     # precipitation multipliers 
 const DELTA_TEMPERATURES      = [-1.0, 0.0, 1.0]    # air temperature offsets (K)
 const HYPSOMETRY_COVERAGE     = 0.95
 const CELL_AREA_MINIMUM       = 1.0                 # km² of glacier ice per cell
-const FORCING_TIME_RANGE      = (DateTime(1950, 1, 1), DateTime(2026, 8, 1))
 
 # Alaska bounding box (deg). Wider than RGI region 01 proper at the eastern edge, so it also
 # picks up the Yukon/NW-British-Columbia cells that share the same icefields.
@@ -81,6 +80,10 @@ const OUTPUT_DIR = get(ENV, "ALASKA_OUTPUT_DIR",
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
                           joinpath("/mnt/bylot-r3/data", string(CLIMATE_MODEL)))
 const FORCING_CACHE = joinpath(CLIMATE_CACHE, "cache")
+# From the cached record's first step (ERA5-Land starts 1950-01-02T00:00), read as the run scripts read
+# it, to 2026-08-01.
+const FORCING_TIME_RANGE = run_time_range(["record-start", "2026-08-01T00:00:00"],
+                                          era5_land_record_span(FORCING_CACHE)).time_range
 
 # Same filename convention as `src/era5_example.jl`, so a cell file is traceable to its cell.
 _degrees_tag(x) = replace(string(round(x, digits = 3)), '.' => 'p', '-' => 'm')

@@ -18,6 +18,11 @@ const SHOW_SETTINGS = get(ENV, "SHOW_SETTINGS", "0") == "1"
 # directory its GEMB run id names.
 const TILE_RUN_DIR = "tile_runs_v2"
 
+# The last calendar year of the default spinup climatology window, shared by the tile sweep and the
+# native run so that their windows, which the native run's reference check compares, agree. See
+# `SPINUP_CLIMATOLOGY_WINDOW` in `gemb_tile_sweep.jl`.
+const SPINUP_CLIMATOLOGY_LAST_YEAR = 1980
+
 """
     setting(label, value, source = "default") -> NamedTuple
 

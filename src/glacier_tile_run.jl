@@ -151,7 +151,7 @@ published 2° products exclude rain from their aggregates.
 - `delta_temperatures = [0.0]`, `precipitation_scalings = [1.0]`: the perturbation grid.
 - `spinup_window`: `(start, stop)` the repeating spinup cycle is built from, by
   `SPINUP_CLIMATOLOGY_METHOD` (`:representative`, a block of `SPINUP_CLIMATOLOGY_N_YEARS` real years).
-  Defaults to the band forcing's first step through 31 December of its 30th calendar year, but a sweep
+  Whole calendar years; defaults to the first 30 whole calendar years of the band forcing, but a sweep
   should fix it: tying it to the record means extending the record changes the spinup, and an appended
   segment then does not continue the record it is appended to.
 - `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to

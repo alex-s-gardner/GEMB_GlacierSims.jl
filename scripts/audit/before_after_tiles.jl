@@ -38,7 +38,7 @@ const PARAMETER_DIR = get(ENV, "BEFORE_AFTER_PARAMETERS", PRODUCTION_PARAMETERS)
 const END_YEAR = parse(Int, get(ENV, "BEFORE_AFTER_END_YEAR", "0"))
 const TIME_RANGE = (DateTime(1950, 1, 2), END_YEAR == 0 ? DateTime(2026, 8, 14, 23) : DateTime(END_YEAR, 1, 1))
 # The production sweep's spinup settings, apart from the ceiling.
-const SPINUP_WINDOW = (DateTime(1950, 1, 2), DateTime(1980, 12, 31))
+const SPINUP_WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
 const SPINUP_DRIFT_FAC = 1e-2
 const DONOR_MAX_DISTANCE_KM = 50.0
 const OUTPUT_FREQUENCY = :weekly

@@ -16,7 +16,7 @@ import GeoDataFrames
 const GS = GEMB_GlacierSims
 const NAME, CEILING, OUT_DIR = ARGS[1], parse(Float64, ARGS[2]), ARGS[3]
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land")
-const WINDOW = (DateTime(1950, 1, 2), DateTime(1980, 12, 31))
+const WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))   # the sweep's default window
 const TIME_RANGE = (DateTime(1950, 1, 2), DateTime(1981, 1, 1))     # ERA5-Land starts 1950-01-02
 
 table = GeoDataFrames.read(joinpath(@__DIR__, "..", "..", "data", "era5land_glacier_elevation_classes.parquet"))
