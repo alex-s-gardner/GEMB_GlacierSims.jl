@@ -206,7 +206,8 @@ published 2° products exclude rain from their aggregates.
 - `background_black_carbon = nothing`: a regional background snow impurity loading as
   [`background_black_carbon`](@ref) returns it, or `nothing` to run at `mp.black_carbon_snow`. When
   given, every run of the tile uses its `black_carbon_snow` [ppmw] in place of `mp`'s, and the run
-  parameters record the region, basis and source beside `model_black_carbon_snow`.
+  parameters record the region shares, basis, optics, measured loading and source beside
+  `model_black_carbon_snow`.
 
 Every glacier area of the tile's hypsometry ends up in exactly one of `glacier_area_km2` (modelled),
 `dropped_area_km2` and `unrecovered_area_km2`, so `hypsometry_area_km2 = glacier_area_km2 +
@@ -831,8 +832,10 @@ resolved their lapse rate differently are different experiments, and a file that
 model parameters could not tell them apart.
 
 `background_black_carbon`, as [`gemb_glacier_tile`](@ref) takes it, replaces `mp.black_carbon_snow`
-before the parameters are recorded and adds `background_black_carbon_*` keys naming the region, basis,
-proxy region, BC and dust BC-equivalent [ng g⁻¹] and source. Without it no such key is written.
+before the parameters are recorded and adds `background_black_carbon_*` keys: the largest region and
+every region's share, the basis and optics, the proxy region, the measured BC, dust and non-BC
+loadings, the reference albedo reduction and its grain radius and zenith angle (converted loadings
+only), and the source. Without it no such key is written.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
                              simulation_years_maximum = nothing, convergence_drift_fac = nothing,

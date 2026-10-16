@@ -36,17 +36,29 @@ const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "off
           join(GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES, " or ") * "; got \"$v\"")
 end
 
+# The reference optics the measured loading is converted to a Gardner & Sharp loading with:
+# `snicar_adv3` (the default), `dang2015`, or `none` for the measured loading unconverted.
+const BACKGROUND_BLACK_CARBON_OPTICS = let v = get(ENV, "BACKGROUND_BLACK_CARBON_OPTICS", "snicar_adv3")
+    Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_OPTICS ? Symbol(v) :
+    error("BACKGROUND_BLACK_CARBON_OPTICS must be " *
+          join(GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_OPTICS, ", ", " or ") * "; got \"$v\"")
+end
+
 """
     tile_background_black_carbon(cells) -> NamedTuple or nothing
 
 The `background_black_carbon` keyword for a tile whose core is `cells`, under
-`BACKGROUND_BLACK_CARBON`: `nothing` when it is `off`.
+`BACKGROUND_BLACK_CARBON` and `BACKGROUND_BLACK_CARBON_OPTICS`: `nothing` when the former is `off`.
 """
 tile_background_black_carbon(cells) = BACKGROUND_BLACK_CARBON === :off ? nothing :
-    GEMB_GlacierSims.background_black_carbon(cells; basis = BACKGROUND_BLACK_CARBON)
+    GEMB_GlacierSims.background_black_carbon(cells; basis = BACKGROUND_BLACK_CARBON,
+                                             optics = BACKGROUND_BLACK_CARBON_OPTICS)
 
 background_black_carbon_setting() =
-    env_setting("background snow black carbon", BACKGROUND_BLACK_CARBON, "BACKGROUND_BLACK_CARBON")
+    env_setting("background snow black carbon",
+                BACKGROUND_BLACK_CARBON === :off ? "off" :
+                "$(BACKGROUND_BLACK_CARBON), $(BACKGROUND_BLACK_CARBON_OPTICS) optics",
+                "BACKGROUND_BLACK_CARBON")
 
 """
     setting(label, value, source = "default") -> NamedTuple

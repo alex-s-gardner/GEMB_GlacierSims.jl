@@ -28,7 +28,8 @@
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
-# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, BACKGROUND_BLACK_CARBON (off, bc, bc_dust)
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, BACKGROUND_BLACK_CARBON (off, bc, bc_dust),
+# BACKGROUND_BLACK_CARBON_OPTICS (snicar_adv3, dang2015, none)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
