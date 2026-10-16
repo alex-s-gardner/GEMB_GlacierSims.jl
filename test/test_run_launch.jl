@@ -6,70 +6,92 @@ import TOML
 
 const _REPO = normpath(joinpath(@__DIR__, ".."))
 
-# A disk cache shaped like the one `climate_forcing` fills: one consolidated Zarr group per ERA5-Land
-# variable group, each with an hourly `time` axis in hours since 1950-01-01 and a (lon, lat, time)
-# variable. `hours[group]` overrides one group's axis.
-function _fixture_era5_cache(hours; overrides = Dict{String,Vector{Float64}}())
+# A disk cache laid out as `climate_forcing` leaves the production cache. `Zarr.CachingStore` stores
+# only the keys that were read, so each variable group holds its consolidated `.zmetadata` and the
+# chunks read, and no `.zgroup`, `.zarray` or `.zattrs` files. `climate_forcing` reads the time axis
+# from `sfc-2m-temperature` only, so only that group holds time chunks. Time is Int64 hours since
+# 1970-01-01 with no fill value, as in the ARCO stores; each group carries its two (lon, lat, time)
+# variables. `steps[group]` gives one group other than the temperature group another record length.
+const _FIXTURE_VARIABLES = Dict("sfc-2m-temperature" => ("t2m", "d2m"),
+                                "sfc-pressure-precipitation" => ("sp", "tp"),
+                                "sfc-wind" => ("u10", "v10"), "sfc-radiation-heat" => ("ssrd", "strd"))
+function _fixture_era5_cache(times; steps = Dict{String,Int}())
+    hours = [Dates.value(t - DateTime(1970, 1, 1)) ÷ 3_600_000 for t in times]
     cache = mktempdir()
-    for group in keys(GEMB_ClimateForcing.ERA5_LAND_STORES)
-        h = get(overrides, group, hours)
-        store = Zarr.DirectoryStore(joinpath(cache, group))
+    for (group, variables) in _FIXTURE_VARIABLES
+        dir = joinpath(cache, group)
+        store = Zarr.DirectoryStore(dir)
         g = Zarr.zgroup(store, "")
-        t = Zarr.zcreate(Float64, g, "time", length(h); chunks = (4,),
-                         attrs = Dict("units" => "hours since 1950-01-01"))
-        t[:] = h
-        Zarr.zcreate(Float32, g, "var", 3, 2, length(h); chunks = (3, 2, 4))
+        n = group == "sfc-2m-temperature" ? length(hours) : get(steps, group, length(hours))
+        t = Zarr.zcreate(Int64, g, "time", n; chunks = (1000,), fill_value = nothing,
+                         attrs = Dict("units" => "hours since 1970-01-01"))
+        group == "sfc-2m-temperature" && (t[:] = hours)
+        for v in variables
+            Zarr.zcreate(Float32, g, v, 3, 2, n; chunks = (3, 2, 1000), fill_value = NaN32)
+        end
         Zarr.consolidate_metadata(store)
+        for (root, _, files) in walkdir(dir; topdown = false)
+            foreach(f -> f in (".zgroup", ".zarray", ".zattrs") && rm(joinpath(root, f)), files)
+            isempty(readdir(root)) && rm(root)
+        end
     end
     return cache
 end
 
+# Every file under `dir` with its size and modification time.
+_tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime(joinpath(root, f)))
+                          for (root, _, files) in walkdir(dir) for f in files])
+
 @testset "run launch: the cached forcing record bounds the run" begin
-    # 0 .. 9 hours after the epoch: the record runs 1950-01-01T00 to 1950-01-01T09.
-    cache = _fixture_era5_cache(collect(0.0:9.0))
+    # The record runs hourly from 1950-01-02T00, where ERA5-Land starts, to 1951-01-01T05.
+    record = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1951, 1, 1, 5))
+    cache = _fixture_era5_cache(record)
+    @test !isfile(joinpath(cache, "sfc-2m-temperature", ".zgroup"))
+    @test !isdir(joinpath(cache, "sfc-wind", "time"))
+    before = _tree_state(cache)
     span = era5_land_record_span(cache)
-    @test span == (; start = DateTime(1950, 1, 1), stop = DateTime(1950, 1, 1, 9))
+    @test span == (; start = DateTime(1950, 1, 2), stop = DateTime(1951, 1, 1, 5))
+    @test _tree_state(cache) == before                           # nothing written to the cache
 
     # The end defaults to the last cached step; a year means its 1 January; ISO date-times pass.
-    r = run_time_range(String[], span)
-    @test r.time_range == (DateTime(1950, 1, 1), DateTime(1950, 1, 1, 9))
-    @test r.source == "start default, end of the cached record"
-    @test run_time_range(["1950", "1950-01-01T05:00:00"], span).time_range ==
-          (DateTime(1950, 1, 1), DateTime(1950, 1, 1, 5))
-    @test run_time_range(["1950-01-01T02:00:00"], span).time_range ==
-          (DateTime(1950, 1, 1, 2), DateTime(1950, 1, 1, 9))
+    r = run_time_range(["1950-01-02T00:00:00"], span)
+    @test r.time_range == (DateTime(1950, 1, 2), DateTime(1951, 1, 1, 5))
+    @test r.source == "start from ARGS, end of the cached record"
+    @test run_time_range(["1951"], span).time_range ==
+          (DateTime(1951, 1, 1), DateTime(1951, 1, 1, 5))
+    @test run_time_range(["1950-06-01T02:00:00", "1951"], span).time_range ==
+          (DateTime(1950, 6, 1, 2), DateTime(1951, 1, 1))
     # A run past the record is refused, naming the record, before any tile is claimed.
-    @test_throws "reaches outside the cached ERA5-Land record, which runs from 1950-01-01T00:00:00 to 1950-01-01T09:00:00" run_time_range(["1950", "2027"], span)
+    @test_throws "reaches outside the cached ERA5-Land record, which runs from 1950-01-02T00:00:00 to 1951-01-01T05:00:00" run_time_range(["1951", "2027"], span)
     @test_throws "reaches outside" run_time_range(["1949"], span)
-    @test_throws "not before its end" run_time_range(["1950-01-01T09:00:00"], span)
-    @test_throws "neither a year nor an ISO date-time" run_time_range(["1950", "soon"], span)
+    @test_throws "not before its end" run_time_range(["1951-01-01T05:00:00"], span)
+    @test_throws "neither a year nor an ISO date-time" run_time_range(["1951", "soon"], span)
 
     # A cache the loader would refuse is refused here too.
     @test_throws "no ERA5-Land disk cache" era5_land_record_span(joinpath(cache, "absent"))
     rm(joinpath(cache, "sfc-wind"); recursive = true)
     @test_throws "has no consolidated metadata" era5_land_record_span(cache)
-    short = _fixture_era5_cache(collect(0.0:9.0);
-                                overrides = Dict("sfc-wind" => collect(0.0:7.0)))
-    @test_throws "disagree on the record" era5_land_record_span(short)
-    holed = _fixture_era5_cache(collect(0.0:9.0))
-    rm(joinpath(holed, "sfc-radiation-heat", "time", "1"))       # the chunk holding hours 4-7
+    short = _fixture_era5_cache(record; steps = Dict("sfc-wind" => length(record) - 2))
+    @test_throws "record different record lengths" era5_land_record_span(short)
+    holed = _fixture_era5_cache(record)
+    rm(joinpath(holed, "sfc-2m-temperature", "time", "1"))      # the chunk holding steps 1001-2000
     @test_throws "cannot be read in full" era5_land_record_span(holed)
-    unordered = _fixture_era5_cache([0.0, 1.0, 3.0, 2.0])
+    t0 = DateTime(1950, 1, 2)
+    unordered = _fixture_era5_cache([t0, t0 + Hour(1), t0 + Hour(3), t0 + Hour(2)])
     @test_throws "not strictly increasing in whole hours" era5_land_record_span(unordered)
 
     # The sweep script itself, in a process of its own: its settings pass reads the record, and a
-    # request past it stops the script before anything is claimed. The record ends at 1950-01-01T09.
+    # request past it stops the script before anything is claimed.
     climate = mktempdir()
-    mv(_fixture_era5_cache(collect(0.0:9.0)), joinpath(climate, "cache"))
+    mv(_fixture_era5_cache(record), joinpath(climate, "cache"))
     script = joinpath(_REPO, "scripts", "gemb_tile_sweep.jl")
     sweep(args...) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no $script $args`,
                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1")
-    out = IOBuffer()
-    @test success(pipeline(sweep("1950"); stdout = out, stderr = devnull))
-    @test occursin("1950-01-01 .. 1950-01-01T09:00", String(take!(out)))
-    @test occursin("end of the cached record", String(read(sweep(), String)))
+    out = String(read(sweep("1951"), String))
+    @test occursin("1951-01-01 .. 1951-01-01T05:00", out)
+    @test occursin("end of the cached record", out)
     err = IOBuffer()
-    @test !success(pipeline(sweep("1950", "2027"); stdout = devnull, stderr = err))
+    @test !success(pipeline(sweep("1951", "2027"); stdout = devnull, stderr = err))
     @test occursin("reaches outside the cached ERA5-Land record", String(take!(err)))
 end
 
@@ -376,7 +398,8 @@ end
     # the member's GlobalGlacierAnalysis.jl checkout cannot be found.
     write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = \"$member\"\n")
     climate = mktempdir()
-    mv(_fixture_era5_cache(collect(0.0:9.0)), joinpath(climate, "cache"))
+    mv(_fixture_era5_cache(collect(DateTime(1950, 1, 1):Hour(1):DateTime(1950, 1, 1, 9))),
+       joinpath(climate, "cache"))
     native(gga_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
                               $(joinpath(_REPO, "scripts", "gemb_native_run.jl"))`,
                              "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)

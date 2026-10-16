@@ -537,36 +537,25 @@ end
     era5_land_record_span(cache_path) -> (; start, stop)
 
 The first and last hourly stamps of the ERA5-Land record held in the disk cache at `cache_path`, the
-`cache_path` passed to `climate_forcing`, read from the cached Zarr metadata and time axes alone.
+`cache_path` passed to `climate_forcing`, read as `climate_forcing` reads it: the time axis of the
+cached `sfc-2m-temperature` group, the only group whose time axis it reads, checked against the
+record length of every (lon, lat, time) variable of every group in the cached consolidated metadata.
 
-`climate_forcing` serves a cached record as it was when the cache was first filled and refuses any
-request past its end, so this is the latest end a run against the cache can ask for. Throws when a
-variable group is missing from the cache, when its time axis cannot be read in full, when it is not
-strictly increasing in whole hours, when its variables are not all as long as its time axis, or when
-the groups disagree on the record: each of those is a cache `climate_forcing` would also refuse.
+The cache is only read: nothing is fetched and nothing is written. `climate_forcing` serves a cached
+record as it was when the cache was first filled and refuses any request past its end, so this is the
+latest end a run against the cache can ask for. Throws when a variable group has no cached
+consolidated metadata, when the time axis cannot be read in full, when it is not strictly increasing
+in whole hours, or when a variable's record length differs from it: each of those is a cache
+`climate_forcing` would also refuse.
 """
 function era5_land_record_span(cache_path::AbstractString)
     isdir(cache_path) || throw(ArgumentError("no ERA5-Land disk cache at $cache_path"))
-    spans = Dict{String,Tuple{DateTime,DateTime,Int}}()
-    for group in sort!(collect(keys(GEMB_ClimateForcing.ERA5_LAND_STORES)))
-        spans[group] = _cached_group_span(joinpath(cache_path, group))
-    end
-    distinct = unique(values(spans))
-    length(distinct) == 1 || throw(ArgumentError(
-        "the ERA5-Land variable groups cached under $cache_path disagree on the record " *
-        "($(join(["$g: $(s[1]) to $(s[2]), $(s[3]) steps" for (g, s) in sort!(collect(spans))], "; ")))" *
-        ", so they were cached at different times; `climate_forcing` refuses such a cache"))
-    start, stop, _ = only(distinct)
-    return (; start, stop)
-end
-
-function _cached_group_span(dir)
-    isfile(joinpath(dir, ".zmetadata")) || throw(ArgumentError(
-        "the ERA5-Land cache has no consolidated metadata at $dir; load forcing through " *
-        "`climate_forcing` with this cache_path once to fill it"))
-    g = Zarr.zopen(Zarr.DirectoryStore(dir); consolidated = true, fill_as_missing = false)
-    haskey(g.arrays, "time") || throw(ArgumentError("the cached group $dir has no time axis"))
-    t = g["time"]
+    groups = Dict(group => _open_cached_group(joinpath(cache_path, group))
+                  for group in keys(GEMB_ClimateForcing.ERA5_LAND_STORES))
+    dir = joinpath(cache_path, "sfc-2m-temperature")
+    temperature = groups["sfc-2m-temperature"]
+    haskey(temperature.arrays, "time") || throw(ArgumentError("the cached group $dir has no time axis"))
+    t = temperature["time"]
     units = get(t.attrs, "units", "")
     m = match(r"hours since (\d{4}-\d{2}-\d{2})", units)
     m === nothing && throw(ArgumentError(
@@ -582,13 +571,36 @@ function _cached_group_span(dir)
     isempty(hours) && throw(ArgumentError("the time axis of $dir is empty"))
     all(isfinite, hours) && all(isinteger, hours) && all(>(0), diff(hours)) || throw(ArgumentError(
         "the time axis of $dir is not strictly increasing in whole hours"))
-    for (name, a) in g.arrays
-        ndims(a) == 3 || continue
-        size(a, 3) == length(hours) || throw(ArgumentError(
-            "variable $name in $dir has $(size(a, 3)) time steps against $(length(hours)) on the " *
-            "time axis"))
-    end
-    return (epoch + Hour(Int(first(hours))), epoch + Hour(Int(last(hours))), length(hours))
+    start = epoch + Hour(Int(first(hours)))
+    stop = epoch + Hour(Int(last(hours)))
+    variables = [a for g in values(groups) for a in values(g.arrays) if ndims(a) == 3]
+    GEMB_ClimateForcing._check_cached_record(cache_path, hours, epoch, (start, stop), variables)
+    return (; start, stop)
+end
+
+# One variable group of the ERA5-Land disk cache, read-only. `climate_forcing` reaches the cache
+# through `Zarr.CachingStore`, which stores only the keys it read: the group's `.zmetadata` and the
+# chunks read, with no `.zgroup` or `.zarray` for Zarr's format detection to find. ClimateForcing
+# declares its own stores Zarr v2 instead of detecting the format, and this store does the same (Zarr
+# detects the format of a consolidated group from the store under it, whatever `zopen` is told). It
+# serves only what is on disk and refuses writes, so reading the record fetches and writes nothing.
+struct _CachedGroupStore <: Zarr.AbstractStore
+    dir::Zarr.DirectoryStore
+end
+Base.getindex(s::_CachedGroupStore, k::String) = s.dir[k]
+Base.setindex!(::_CachedGroupStore, v, k::String) =
+    throw(ArgumentError("the ERA5-Land disk cache is read here, not written; refusing to write $k"))
+Zarr.subdirs(s::_CachedGroupStore, p) = Zarr.subdirs(s.dir, p)
+Zarr.subkeys(s::_CachedGroupStore, p) = Zarr.subkeys(s.dir, p)
+Zarr.storagesize(s::_CachedGroupStore, p) = Zarr.storagesize(s.dir, p)
+Zarr.ZarrFormat(::_CachedGroupStore, path) = Zarr.ZarrFormat(2)
+
+function _open_cached_group(dir)
+    isfile(joinpath(dir, ".zmetadata")) || throw(ArgumentError(
+        "the ERA5-Land cache has no consolidated metadata at $dir; load forcing through " *
+        "`climate_forcing` with this cache_path once to fill it"))
+    return Zarr.zopen(_CachedGroupStore(Zarr.DirectoryStore(dir)); consolidated = true,
+                      fill_as_missing = false)
 end
 
 """
