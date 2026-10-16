@@ -156,6 +156,11 @@ const _SNICAR_TABLE_CACHE = Ref{Any}(nothing)
 
 _parse_optional(s) = (s = strip(String(s)); isempty(s) ? missing : parse(Float64, s))
 
+# Every field as a string, whatever else is loaded: the parsing below expects strings. With CSV.jl
+# loaded, `GeoDataFrames.read(path)` (≥ 0.4.4) returns typed columns (`Float64`, `Int64`, `missing`);
+# GDAL's CSV reader returns strings.
+_read_csv_strings(path) = GeoDataFrames.read(GeoDataFrames.ArchGDALDriver(), path)
+
 # The SNICAR-ADv3 albedo grid as `(; radii, bc, dust, albedo)`, with `albedo[illumination]` an
 # array indexed (radius, bc, dust). Every node of the full outer product must be present.
 function _snicar_table()
@@ -163,7 +168,7 @@ function _snicar_table()
     cached === nothing || return cached
     isfile(SNICAR_ADV3_ALBEDO_TABLE) ||
         throw(ArgumentError("no SNICAR-ADv3 albedo table at $SNICAR_ADV3_ALBEDO_TABLE"))
-    raw = GeoDataFrames.read(SNICAR_ADV3_ALBEDO_TABLE)
+    raw = _read_csv_strings(SNICAR_ADV3_ALBEDO_TABLE)
     ill = Symbol.(strip.(raw.illumination))
     r = parse.(Float64, raw.radius_um)
     bc = parse.(Float64, raw.bc_ng_g)
@@ -260,7 +265,7 @@ function background_black_carbon_table(path::AbstractString = BACKGROUND_BLACK_C
     cached = path == BACKGROUND_BLACK_CARBON_TABLE ? _BACKGROUND_TABLE_CACHE[] : nothing
     cached === nothing || return cached
     isfile(path) || throw(ArgumentError("no background black-carbon table at $path"))
-    raw = GeoDataFrames.read(path)
+    raw = _read_csv_strings(path)
     required = ["rgi_o1region", "region_name", "bc_ng_g", "bc_low_ng_g", "bc_high_ng_g",
                 "bc_method", "bc_season", "bc_source", "dust_ug_g", "dust_low_ug_g",
                 "dust_high_ug_g", "nonbc_bc_equivalent_ng_g", "dust_source", "proxy_region",

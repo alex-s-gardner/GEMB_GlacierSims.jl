@@ -195,6 +195,17 @@ end
         @test background_black_carbon(first(measured.rgi_o1region)).proxy_region == "none"
     end
 
+    @testset "CSV files are read as strings" begin
+        # The reader must not depend on which packages are loaded: the table parsing expects strings.
+        for path in (BACKGROUND_BLACK_CARBON_TABLE, GEMB_GlacierSims.SNICAR_ADV3_ALBEDO_TABLE)
+            raw = GEMB_GlacierSims._read_csv_strings(path)
+            @test all(c -> all(x -> x isa AbstractString, c), eachcol(raw))
+        end
+        raw = GEMB_GlacierSims._read_csv_strings(BACKGROUND_BLACK_CARBON_TABLE)
+        @test "01" in strip.(raw.rgi_o1region)
+        @test background_black_carbon_table().rgi_o1region[1] isa String
+    end
+
     @testset "table validation" begin
         lines = readlines(BACKGROUND_BLACK_CARBON_TABLE)
         header = first(lines)
