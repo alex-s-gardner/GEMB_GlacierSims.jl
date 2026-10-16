@@ -23,6 +23,31 @@ const TILE_RUN_DIR = "tile_runs_v2"
 # `SPINUP_CLIMATOLOGY_WINDOW` in `gemb_tile_sweep.jl`.
 const SPINUP_CLIMATOLOGY_LAST_YEAR = 1980
 
+# The regional background snow impurity loading (`background_black_carbon`), shared by the tile sweep
+# and the native run so that a native cell runs at its reference tile's loading. `off` (the default)
+# runs every tile at `ModelParameters.black_carbon_snow`; `bc` and `bc_dust` set each tile's value
+# from its RGI 7.0 region in `data/background_black_carbon.csv`. A run under a different setting
+# records different run parameters, so its tiles are rebuilt rather than appended to.
+import GEMB_GlacierSims
+const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "off")
+    v == "off" ? :off :
+    Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES ? Symbol(v) :
+    error("BACKGROUND_BLACK_CARBON must be off, " *
+          join(GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES, " or ") * "; got \"$v\"")
+end
+
+"""
+    tile_background_black_carbon(cells) -> NamedTuple or nothing
+
+The `background_black_carbon` keyword for a tile whose core is `cells`, under
+`BACKGROUND_BLACK_CARBON`: `nothing` when it is `off`.
+"""
+tile_background_black_carbon(cells) = BACKGROUND_BLACK_CARBON === :off ? nothing :
+    GEMB_GlacierSims.background_black_carbon(cells; basis = BACKGROUND_BLACK_CARBON)
+
+background_black_carbon_setting() =
+    env_setting("background snow black carbon", BACKGROUND_BLACK_CARBON, "BACKGROUND_BLACK_CARBON")
+
 """
     setting(label, value, source = "default") -> NamedTuple
 

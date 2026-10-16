@@ -136,11 +136,12 @@ Per (band, delta, scaling) the forcing chain is
 
     cf = initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta), scaling))
 
-and nothing else. The band forcing has already been lapsed to the band center and decoupled with the
-band's own `k`, so re-applying either would double-count: lapsing again would move the forcing off the
-band it is defined at, and `climate_adjust_for_glacier` would damp the warm excess a second time. Both
-adjustments act on the raw band stack and are exact identities at `delta = 0` / `scaling = 1`, so the
-unperturbed run is bit-for-bit the plain band forcing.
+with the forcing's `black_carbon_snow` and `black_carbon_ice` set to the run's `ModelParameters`
+values, which `gemb` requires, and nothing else. The band forcing has already been lapsed to the band
+center and decoupled with the band's own `k`, so re-applying either would double-count: lapsing again
+would move the forcing off the band it is defined at, and `climate_adjust_for_glacier` would damp the
+warm excess a second time. Both adjustments act on the raw band stack and are exact identities at
+`delta = 0` / `scaling = 1`, so the unperturbed run is bit-for-bit the plain band forcing.
 
 `precipitation_adjust` scales **total** precipitation, and GEMB partitions phase downstream against
 `mp.rain_temperature_threshold`, so a scaling above 1 raises rain as well as snow. Where the scaling
@@ -202,6 +203,10 @@ published 2° products exclude rain from their aggregates.
   ice (the hypsometry area of `tile.core` over `applied.bands`) that may go unmodelled. Above it the
   tile throws an `ErrorException` before any GEMB run; at or below it the losses are recorded and
   the run proceeds. Every kind of loss counts toward it (see below).
+- `background_black_carbon = nothing`: a regional background snow impurity loading as
+  [`background_black_carbon`](@ref) returns it, or `nothing` to run at `mp.black_carbon_snow`. When
+  given, every run of the tile uses its `black_carbon_snow` [ppmw] in place of `mp`'s, and the run
+  parameters record the region, basis and source beside `model_black_carbon_snow`.
 
 Every glacier area of the tile's hypsometry ends up in exactly one of `glacier_area_km2` (modelled),
 `dropped_area_km2` and `unrecovered_area_km2`, so `hypsometry_area_km2 = glacier_area_km2 +
@@ -239,7 +244,10 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            spinup_seed = nothing,
                            on_output = nothing,
                            modelled_intervals = nothing,
-                           lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM)
+                           lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM,
+                           background_black_carbon = nothing)
+    background_black_carbon === nothing ||
+        (mp = _with_black_carbon_snow(mp, background_black_carbon.black_carbon_snow))
     0 <= lost_area_fraction_maximum <= 1 || throw(ArgumentError(
         "lost_area_fraction_maximum must be in [0, 1], got $(lost_area_fraction_maximum)"))
     delta_temperatures = collect(Float64, delta_temperatures)
@@ -293,7 +301,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     parameters = tile_run_parameters(mp, applied; spinup_window = window, simulation_years_maximum,
                                      convergence_drift_fac, drift_window, donor_max_distance_km,
                                      climatology_method = SPINUP_CLIMATOLOGY_METHOD,
-                                     climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS)
+                                     climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS,
+                                     background_black_carbon)
 
     # Resuming: keep only forcing newer than the saved state, and let each run inherit its saved column
     # instead of spinning up again. The saved time is the last *output* time, and every forcing step up to
@@ -337,8 +346,10 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
 
         # No elevation or glacier adjustment: the band forcing is already at the band center and
         # already decoupled. Rebuilt per task rather than shared across perturbations, so concurrent
-        # tasks never hand each other the same object.
-        cf = initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
+        # tasks never hand each other the same object. The impurity metadata is the run's own, which
+        # `gemb` requires the forcing's impurity layers to equal.
+        cf = initialize_forcing(_with_impurity_metadata(_perturbed_forcing(band.forcing, delta, pscale),
+                                                        mp))
 
         # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
         # task, so concurrent tasks never share it, and used for the spinup as well as the run: a
@@ -818,11 +829,18 @@ and source trees ([`software_provenance`](@ref)) are included too.
 The downscaling settings from `applied` are included for the same reason: two runs of one tile that
 resolved their lapse rate differently are different experiments, and a file that recorded only the
 model parameters could not tell them apart.
+
+`background_black_carbon`, as [`gemb_glacier_tile`](@ref) takes it, replaces `mp.black_carbon_snow`
+before the parameters are recorded and adds `background_black_carbon_*` keys naming the region, basis,
+proxy region, BC and dust BC-equivalent [ng g⁻¹] and source. Without it no such key is written.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
                              simulation_years_maximum = nothing, convergence_drift_fac = nothing,
                              drift_window = nothing, donor_max_distance_km = nothing,
-                             climatology_method = nothing, climatology_n_years = nothing)
+                             climatology_method = nothing, climatology_n_years = nothing,
+                             background_black_carbon = nothing)
+    background_black_carbon === nothing ||
+        (mp = _with_black_carbon_snow(mp, background_black_carbon.black_carbon_snow))
     params = Dict{String,Any}("spinup_window_start" => string(spinup_window[1]),
                               "spinup_window_stop" => string(spinup_window[2]))
     # How the columns were settled. Two runs that spun up to different tolerances, or under different
@@ -847,6 +865,10 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
         (params["forcing_donor_max_distance_km"] = Float64(donor_max_distance_km))
     merge!(params, applied.settings)
     merge!(params, software_provenance())
+    # Only when a background loading was applied, so a tile written without one still compares as
+    # current; the loading itself is `model_black_carbon_snow` below either way.
+    background_black_carbon === nothing ||
+        _record_background_black_carbon!(params, background_black_carbon)
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)

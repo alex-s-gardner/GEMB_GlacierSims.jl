@@ -72,6 +72,9 @@ cells' `lost_area_km2` and `hypsometry_area_km2` over the tile and applies
 [`native_cell_spinup_seed`](@ref) builds a `spinup_seed` from this cell's own file at a different
 correction, to shorten the spinup of a perturbation probe around an already-run point.
 
+`background_black_carbon` is passed to [`gemb_glacier_tile`](@ref). Pass the reference tile's
+loading, so a cell runs at the loading its tile run was calibrated with.
+
 Throws `ForcingUnavailable` when the cell has ice in no band of `applied`, or when neither it nor any
 donor within `donor_max_distance_km` has usable forcing.
 """
@@ -93,7 +96,8 @@ function gemb_native_cell(cell, applied::AppliedDownscaling, mp::ModelParameters
                           spinup_seed = nothing,
                           validation_grid = nothing,
                           modelled_intervals = nothing,
-                          lost_area_fraction_maximum::Real = 1.0)
+                          lost_area_fraction_maximum::Real = 1.0,
+                          background_black_carbon = nothing)
     nrow(cell.core) == 1 || throw(ArgumentError(
         "a native cell carries exactly one grid cell; got $(nrow(cell.core)) (use `native_cells`)"))
     any(>(0), _interval_areas(first(eachrow(cell.core)), applied.bands)) || throw(ForcingUnavailable(
@@ -120,7 +124,7 @@ function gemb_native_cell(cell, applied::AppliedDownscaling, mp::ModelParameters
                             spinup_window, simulation_years_maximum, convergence_drift_fac,
                             drift_window, threaded, restart, force_restart, spinup_seed,
                             donor_max_distance_km, validation_grid, modelled_intervals,
-                            lost_area_fraction_maximum)
+                            lost_area_fraction_maximum, background_black_carbon)
 
     # Where the cell is and which correction it ran under, beside the tile identifiers the run already
     # carries. The correction's values are the run's perturbation axes; what is recorded here is where

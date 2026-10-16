@@ -40,7 +40,8 @@
 #
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
-# CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM
+# CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM,
+# BACKGROUND_BLACK_CARBON (off, bc, bc_dust; must match the reference tile sweep's)
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
@@ -126,6 +127,7 @@ function settings_rows()
         setting("spinup ceiling", "$(SPINUP_SIMULATION_YEARS_MAXIMUM) simulated years"),
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
+        background_black_carbon_setting(),
         env_setting("columns per work unit", UNIT_COLUMNS, "UNIT_COLUMNS"),
         env_setting("worker blocks", NATIVE_BLOCKS, "NATIVE_BLOCKS"),
         let hint = Base.JLOptions().heap_size_hint
@@ -267,6 +269,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
             :fitted : :climatology
     applied = resolve_downscaling(fit, intervals, probe_time; basis,
                                   decoupling_factor_prior = decoupling_factor_prior(tile.core))
+    # The reference tile's loading, so every cell runs at the value its tile run was calibrated with.
+    black_carbon = tile_background_black_carbon(tile.core)
     requested = tile_run_parameters(mp, applied;
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
@@ -274,7 +278,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
                                    drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
-                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
+                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
+                                   background_black_carbon = black_carbon)
     # A tile the reference sweep never wrote has no settings to check against, and no calibrated tile
     # behind its correction: skipped and counted rather than run unverified.
     reference = joinpath(REFERENCE_TILE_DIR, tile.name)
@@ -296,7 +301,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
         t0 = time()
         try
             push!(rows, run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
-                                 token, cache, fit, intervals, basis, prior, modelled_intervals))
+                                 token, cache, fit, intervals, basis, prior, modelled_intervals,
+                                 black_carbon))
         catch e
             e isa InterruptException && rethrow()
             GEMB_GlacierSims.is_caller_error(e) && rethrow()
@@ -390,7 +396,7 @@ function assert_matches_reference(reference, name, requested)
 end
 
 function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache,
-                  fit, intervals, basis, prior, modelled_intervals)
+                  fit, intervals, basis, prior, modelled_intervals, black_carbon)
     t0 = time()
     path = joinpath(tile_dir, cell.name)
     row = first(eachrow(cell.core))
@@ -443,6 +449,7 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                                simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                convergence_drift_fac = SPINUP_DRIFT_FAC,
                                modelled_intervals,
+                               background_black_carbon = black_carbon,
                                restart = appending ? restart : nothing)
     catch err
         err isa ForcingUpToDate &&

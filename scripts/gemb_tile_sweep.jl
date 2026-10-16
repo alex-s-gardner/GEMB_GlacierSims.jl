@@ -28,7 +28,7 @@
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
-# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, BACKGROUND_BLACK_CARBON (off, bc, bc_dust)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
@@ -244,6 +244,7 @@ function settings_rows()
                     "SPINUP_SIMULATION_YEARS_MAXIMUM"),
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
+        background_black_carbon_setting(),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         # From JLOptions, not ENV: this is the value the collector acts on, so a hint lost on its way to
         # the worker shows up here as "none" instead of being reported as if it had taken effect.
@@ -408,6 +409,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
             :fitted : :climatology
     prior = decoupling_factor_prior(tile.core)
     applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior)
+    black_carbon = tile_background_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current
     # against another and the change never takes effect. `run_parameter_differences` only compares keys
     # present in *both* dicts, so a setting omitted here is a setting the skip test cannot notice —
@@ -419,7 +421,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
-                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
+                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
+                                   background_black_carbon = black_carbon)
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :
@@ -480,6 +483,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                 simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                 convergence_drift_fac = SPINUP_DRIFT_FAC,
                                 donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
+                                background_black_carbon = black_carbon,
                                 restart = appending ? restart : nothing)
     catch err
         # The record grew by less than one usable step. Not a failure: the file already says everything

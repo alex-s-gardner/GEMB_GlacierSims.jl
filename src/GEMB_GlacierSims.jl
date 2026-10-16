@@ -116,6 +116,12 @@ export read_downscaling_tile, read_downscaling_tile_status
 include("downscaling_tiles.jl")
 export downscaling_tiles, tile_index, tile_bounds, derive_downscaling_parameter_tiles
 
+# Per-region background snow impurity loading. Before the tile run, which applies it.
+include("background_black_carbon.jl")
+export background_black_carbon, background_black_carbon_table, dust_bc_equivalent
+export rgi_o1_region, tile_rgi_o1_region
+export BACKGROUND_BLACK_CARBON_TABLE, BACKGROUND_BLACK_CARBON_BASES, RGI7_O1_REGIONS_FILE
+
 include("glacier_tile_run.jl")
 export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id
 export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
