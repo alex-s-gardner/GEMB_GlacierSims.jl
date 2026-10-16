@@ -84,11 +84,12 @@ const CORRECTION_MAX_DISTANCE_KM = parse(Float64, get(ENV, "CORRECTION_MAX_DISTA
 # the reference check compares, so a change here is a change of experiment.
 const TILE_SIZE = 2
 const BUFFER = 1
-const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const FORCING_RECORD = era5_land_record_span(joinpath(CLIMATE_CACHE, "cache"))
+const RUN_TIME = run_time_range(ARGS, FORCING_RECORD)
 const TIME_RANGE = RUN_TIME.time_range
 const SPINUP_SIMULATION_YEARS_MAXIMUM = 500.0
 const SPINUP_DRIFT_FAC = 1e-2
-const SPINUP_CLIMATOLOGY_WINDOW = (DateTime(1950, 1, 1), DateTime(1980, 12, 31))
+const SPINUP_CLIMATOLOGY_WINDOW = spinup_window_range(nothing, "1980", FORCING_RECORD, TIME_RANGE)
 const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "50.0"))
 const OUTPUT_FREQUENCY = :weekly
 const RESTART_FETCH_OVERLAP = Day(1)

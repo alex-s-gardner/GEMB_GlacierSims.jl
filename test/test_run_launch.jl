@@ -74,6 +74,21 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     @test_throws "neither a year, an ISO date-time nor `record-start`" run_time_range(["soon"], span)
     @test_throws "neither a year, an ISO date-time nor `record-end`" run_time_range(["1951", "record-start"], span)
 
+    # The spinup climatology window starts at the record's first step by default. A start before the
+    # record or before the run is refused: the climatology keeps complete years only, so it would
+    # silently lose the forcing's partial first year.
+    @test spinup_window_range(nothing, "1980", span, r.time_range) ==
+          (DateTime(1950, 1, 2), DateTime(1980, 12, 31))
+    @test spinup_window_range("record-start", "1950-12-31T23:00:00", span, r.time_range) ==
+          (DateTime(1950, 1, 2), DateTime(1950, 12, 31, 23))
+    @test spinup_window_range("1951", "1980", span, r.time_range) ==
+          (DateTime(1951, 1, 1), DateTime(1980, 12, 31))
+    @test_throws "the spinup climatology window starts at 1950-01-01T00:00:00, before the cached ERA5-Land record, which starts at 1950-01-02T00:00:00; start it at or after the record start, or pass `record-start`" spinup_window_range("1950", "1980", span, r.time_range)
+    @test_throws "before the run, which starts at 1951-01-01T00:00:00" spinup_window_range(
+        nothing, "1980", span, run_time_range(["1951"], span).time_range)
+    @test_throws "not before its end" spinup_window_range("1951", "1950", span, r.time_range)
+    @test_throws "neither a year nor an ISO date-time" spinup_window_range(nothing, "soon", span, r.time_range)
+
     # A cache the loader would refuse is refused here too.
     @test_throws "no ERA5-Land disk cache" era5_land_record_span(joinpath(cache, "absent"))
     rm(joinpath(cache, "sfc-wind"); recursive = true)
@@ -97,9 +112,20 @@ _tree_state(dir) = sort!([(joinpath(root, f), filesize(joinpath(root, f)), mtime
     out = String(read(sweep(), String))
     @test occursin("1950-01-02 .. 1951-01-01T05:00", out)
     @test occursin("start of the cached record, end of the cached record", out)
-    @test occursin("1951-01-01 .. 1951-01-01T05:00", String(read(sweep("1951"), String)))
+    @test occursin(r"spinup climatology +1950-01-02 \.\. 1980-12-31", out)
+    err = IOBuffer()
+    @test !success(pipeline(addenv(sweep(), "SPINUP_CLIMATOLOGY_START" => "1950"); stdout = devnull,
+                            stderr = err))
+    @test occursin("the spinup climatology window starts at 1950-01-01T00:00:00, before the cached " *
+                   "ERA5-Land record", String(take!(err)))
+    # A run starting after the record start fetches no forcing before it, so it needs a spinup window
+    # that starts with it.
+    @test occursin("1951-01-01 .. 1951-01-01T05:00",
+                   String(read(addenv(sweep("1951"), "SPINUP_CLIMATOLOGY_START" => "1951"), String)))
     for (args, message) in ((("1950",), "before the cached ERA5-Land record"),
-                            (("record-start", "2027"), "reaches outside the cached ERA5-Land record"))
+                            (("record-start", "2027"), "reaches outside the cached ERA5-Land record"),
+                            (("1951",), "the spinup climatology window starts at 1950-01-02T00:00:00, " *
+                                        "before the run, which starts at 1951-01-01T00:00:00"))
         err = IOBuffer()
         @test !success(pipeline(sweep(args...); stdout = devnull, stderr = err))
         @test occursin(message, String(take!(err)))
@@ -422,6 +448,7 @@ end
                              "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)
     out = read(native(gga), String)
     @test occursin("1950-01-02 .. 1950-01-02T09:00", out)       # the whole cached record
+    @test occursin(r"spinup climatology +1950-01-02 \.\. 1980-12-31", out)
     @test occursin(fit, out)
     @test occursin(joinpath(climate, "tile_runs_v2"), out)
     err = IOBuffer()

@@ -68,7 +68,8 @@ const BUFFER = 1
 
 # `climate_forcing` refuses a request outside the cached record, so the run spans that record unless
 # told otherwise, and a range the cache cannot serve fails here rather than in every tile.
-const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const FORCING_RECORD = era5_land_record_span(joinpath(CLIMATE_CACHE, "cache"))
+const RUN_TIME = run_time_range(ARGS, FORCING_RECORD)
 const TIME_RANGE = RUN_TIME.time_range
 
 # The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
@@ -113,11 +114,13 @@ const SPINUP_DRIFT_FAC = 1e-2
 # makes an appended update defensible: were it tied to the record, extending the record would change the
 # spinup and the new segment would not continue the old one. 1950-1980 is the earliest three decades
 # ERA5-Land offers, so it is the closest this forcing comes to a pre-industrial reference. It must span at
-# least `SPINUP_CLIMATOLOGY_N_YEARS`, which `_spinup_climatology` checks.
-const SPINUP_CLIMATOLOGY_WINDOW = (
-    DateTime(parse(Int, get(ENV, "SPINUP_CLIMATOLOGY_START", "1950")), 1, 1),
-    DateTime(parse(Int, get(ENV, "SPINUP_CLIMATOLOGY_STOP", "1980")), 12, 31),
-)
+# least `SPINUP_CLIMATOLOGY_N_YEARS`, which `_spinup_climatology` checks. The start defaults to the cached
+# record's first step (1950-01-02T00:00); SPINUP_CLIMATOLOGY_START is a year, an ISO date-time or
+# `record-start`, and `spinup_window_range` refuses one before the record or the run. The climatology
+# keeps complete years only, so the default draws on 1951-1980.
+const SPINUP_CLIMATOLOGY_WINDOW = spinup_window_range(get(ENV, "SPINUP_CLIMATOLOGY_START", nothing),
+                                                      get(ENV, "SPINUP_CLIMATOLOGY_STOP", "1980"),
+                                                      FORCING_RECORD, TIME_RANGE)
 
 # How far a cell that carries ice but falls outside ERA5-Land's land mask may borrow forcing from; see
 # `elevation_interval_forcing`. Donors are drawn from the tile's *buffered* neighbourhood rather than its

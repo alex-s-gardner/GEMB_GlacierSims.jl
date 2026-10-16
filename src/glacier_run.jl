@@ -415,9 +415,13 @@ Base.showerror(io::IO, e::ForcingUnavailable) = print(io, "ForcingUnavailable: "
     SpinupWindowUnavailable(window, n_selected, extent)
 
 Thrown by [`gemb_glacier_cell`](@ref) when the spinup window selects too little of the supplied
-forcing to average a climatological year. `window` is the `(start, stop)` that was asked for,
-`n_selected` how many steps fell inside it, and `extent` the `(first, last)` time of the forcing
-actually supplied.
+forcing to average a climatological year, or starts before the supplied forcing does. `window` is
+the `(start, stop)` that was asked for, `n_selected` how many steps fell inside it, and `extent` the
+`(first, last)` time of the forcing actually supplied.
+
+A window that starts before the forcing is refused even when the rest of it would do. The
+climatology keeps only complete years, so it would drop the forcing's partial first year and come
+from later years than the window names, while the window recorded as provenance still names them.
 
 Its usual cause is a continuation: the window is inherited from the record being extended, but the
 caller fetched only forcing from near the saved time, so those years are absent. Unlike
@@ -431,7 +435,12 @@ struct SpinupWindowUnavailable <: Exception
     extent::Tuple{DateTime,DateTime}
 end
 
-Base.showerror(io::IO, e::SpinupWindowUnavailable) = print(io,
+Base.showerror(io::IO, e::SpinupWindowUnavailable) = e.window[1] < e.extent[1] ? print(io,
+    "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) starts before " *
+    "the forcing supplied ($(e.extent[1]) .. $(e.extent[2])). The climatology keeps only complete " *
+    "years, so it would silently drop the forcing's partial first year and come from later years " *
+    "than the window names. Start the window at or after $(e.extent[1]), or fetch forcing from " *
+    "$(e.window[1]).") : print(io,
     "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) selects " *
     "$(e.n_selected) forcing step(s) of those supplied ($(e.extent[1]) .. $(e.extent[2])), " *
     "too few to average a climatological year. On a continuation this window is the one the " *
@@ -496,12 +505,13 @@ or perturbations.
   directly, bypassing the table.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
   year used for spinup. When not given, a continuation inherits the window its saved record was
-  spun up on (from the restart's stored provenance) and a cold start takes the first 30 complete
-  years of `forcing_data`. Inheriting matters because a restart does not re-spin up: a bin with no
-  saved profile must be spun up on the same climatology as the rest of the file, not on whatever
-  slice of forcing the continuation happened to fetch. If that window's years are outside the
-  supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
-  climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
+  spun up on (from the restart's stored provenance) and a cold start takes `forcing_data`'s first
+  step through 31 December of its 30th calendar year. Inheriting matters because a restart does not
+  re-spin up: a bin with no saved profile must be spun up on the same climatology as the rest of the
+  file, not on whatever slice of forcing the continuation happened to fetch. If that window's years
+  are outside the supplied forcing, or the window starts before it, [`SpinupWindowUnavailable`](@ref)
+  says so rather than substituting a different climate — fetch the wider window, or pass
+  `spinup_window` to choose one deliberately.
 - `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to
   `gemb_spinup`, which divides by the cycle length to get its own cycle ceiling.
 - `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
@@ -809,10 +819,12 @@ function _lookup_decoupling_factor(row)
     return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
-# The first 30 complete years of a record. Used only when nothing more authoritative is available:
-# no explicit `spinup_window` and no window inherited from a restart.
+# From the record's first step to 31 December of its 30th calendar year. Used only when nothing more
+# authoritative is available: no explicit `spinup_window` and no window inherited from a restart. It
+# starts at the first step, not on 1 January, because `_spinup_climatology` refuses a window that starts
+# before the forcing (ERA5-Land starts 1950-01-02T00:00).
 function _default_spinup_window(forcing_data)
-    start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
+    start = first(lookup(forcing_data, Ti))
     return (start, DateTime(year(start) + 29, 12, 31))
 end
 
@@ -852,6 +864,11 @@ function _spinup_climatology(cf, window, mp::ModelParameters;
                              method = SPINUP_CLIMATOLOGY_METHOD,
                              n_years = SPINUP_CLIMATOLOGY_N_YEARS)
     times = lookup(cf, Ti)
+    # A window starting before the forcing would have its first year silently dropped; see
+    # `SpinupWindowUnavailable`.
+    window[1] < first(times) &&
+        throw(SpinupWindowUnavailable(window, count(t -> window[1] <= t <= window[2], times),
+                                      (first(times), last(times))))
     selected = filter(t -> window[1] <= t <= window[2], times)
 
     # A span, not a step count: `forcing_climatology` calls whichever years hold the most timesteps

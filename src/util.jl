@@ -632,6 +632,35 @@ function run_time_range(args, record)
     return (; time_range = (start, stop), source)
 end
 
+"""
+    spinup_window_range(start, stop, record, time_range) -> (start, stop)
+
+The window a run script's spinup climatology is drawn from, from the cached forcing `record`
+(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns) and the run's `time_range`. `start` is
+`nothing` or `record-start` for the record's first step, a year (its 1 January, 00:00) or an ISO
+date-time; `stop` is a year (its 31 December, 00:00) or an ISO date-time.
+
+Throws when the window is empty, starts before the cached record, or starts before the run (whose
+forcing is all a run fetches), naming the start it must not precede. `_spinup_climatology` refuses
+such a window too, once per band; this refuses it at start-up. The climatology keeps only complete
+years, so a window starting earlier would silently lose the forcing's partial first year.
+"""
+function spinup_window_range(start, stop::AbstractString, record, time_range)
+    t0 = start === nothing ? record.start : _parse_run_time(start, "record-start", record.start)
+    t1 = occursin(r"^\d{4}$", stop) ? DateTime(parse(Int, stop), 12, 31) : tryparse(DateTime, stop)
+    t1 === nothing && throw(ArgumentError(
+        "\"$stop\" is neither a year nor an ISO date-time (examples: 1980, 1980-12-31T23:00:00)"))
+    t0 < t1 || throw(ArgumentError("the spinup climatology window starts at $t0, not before its end $t1"))
+    record.start <= t0 || throw(ArgumentError(
+        "the spinup climatology window starts at $t0, before the cached ERA5-Land record, which " *
+        "starts at $(record.start); start it at or after the record start, or pass `record-start`"))
+    first(time_range) <= t0 || throw(ArgumentError(
+        "the spinup climatology window starts at $t0, before the run, which starts at " *
+        "$(first(time_range)) and fetches no forcing before it; start the run at or before $t0, " *
+        "or start the window at or after $(first(time_range))"))
+    return (t0, t1)
+end
+
 # `s` as a year, an ISO date-time, or `token`, which stands for `record_time`.
 function _parse_run_time(s::AbstractString, token, record_time)
     s == token && return record_time

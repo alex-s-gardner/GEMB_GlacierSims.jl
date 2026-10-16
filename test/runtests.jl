@@ -867,6 +867,12 @@ end
         cold = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
         @test GEMB_GlacierSims._default_spinup_window(cold) ==
               (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+        # An hourly ERA5-Land record starts at 1950-01-02T00: the window starts there, not on
+        # 1 January, which `_spinup_climatology` would refuse.
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1950, 2, 1))
+        era5 = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test GEMB_GlacierSims._default_spinup_window(era5) ==
+              (DateTime(1950, 1, 2), DateTime(1979, 12, 31))
 
         # A continuation inherits the window its record was spun up on, parsed back from the
         # strings NetCDF stored (it has no date attribute type). This is the whole point: a
@@ -921,6 +927,23 @@ end
         # complaint.
         partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
         @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
+
+        # A window starting before the forcing is refused even though the rest of it is supplied:
+        # the climatology keeps complete years only, so it would drop the partial first year and
+        # come from later years than the window it records.
+        t = collect(DateTime(1950, 1, 2):Day(1):DateTime(1955, 12, 31))
+        cf = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        early = (DateTime(1950, 1, 1), DateTime(1953, 12, 31))
+        err = try
+            GEMB_GlacierSims._spinup_climatology(cf, early, mp)
+            nothing
+        catch e
+            e
+        end
+        @test err isa SpinupWindowUnavailable
+        @test err.extent == (first(t), last(t))
+        @test occursin("the spinup window 1950-01-01T00:00:00 .. 1953-12-31T00:00:00 starts before " *
+                       "the forcing supplied (1950-01-02T00:00:00", sprint(showerror, err))
     end
 
     @testset "NetCDF append" begin
