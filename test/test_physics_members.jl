@@ -83,6 +83,22 @@ end
         @test_throws "unknown band decoupling level \"ks35\" in physics member \"A-ks35-table\"; one of kfit, kshaw" physics_member(
             "A-ks35-table")
         @test_throws "unknown impurity level \"soot\"" physics_member("A-kfit-soot")
+
+        # The wind level: a fourth token w<factor>, in one spelling; without it the factor is 1.
+        @test physics_member("B-kfit-table").wind_scaling === 1.0
+        w2 = physics_member("B-kfit-table-w2")
+        @test w2.wind_scaling === 2.0 && w2.id == "B-kfit-table-w2"
+        @test (w2.grain, w2.band_decoupling, w2.impurity) === (:B, :kfit, :table)
+        @test w2.model == physics_member("B-kfit-table").model
+        @test physics_member("D1-kshaw-table-w1.5").wind_scaling === 1.5
+        @test physics_member("B-kfit-table-w1").wind_scaling === 1.0
+        @test physics_member_parameters(w2)["physics_wind_scaling"] === 2.0
+        @test physics_member_parameters(physics_member("B-kfit-table"))["physics_wind_scaling"] === 1.0
+        @test_throws "must be a wind factor w<factor>" physics_member("B-kfit-table-x2")
+        @test_throws "write the wind factor of physics member \"B-kfit-table-w2.0\" as \"w2\"" physics_member(
+            "B-kfit-table-w2.0")
+        @test_throws "must be > 0" physics_member("B-kfit-table-w0")
+        @test_throws "a physics member is" physics_member("B-kfit-table-w2-w3")
     end
 
     @testset "model parameters under a member" begin
@@ -215,6 +231,51 @@ end
         c0 = only(hypsometry_intervals(low)).center
         @test collect(f0.forcing.temperature_air) ≈
               [T_obs(z[1], 0.0, a[i]) for i in eachindex(days)] .- lapse .* (c0 - z[1]) ./ 1000 atol = 1e-9
+    end
+
+    @testset "the wind level scales the band wind and nothing else" begin
+        T_ref = 273.15
+        z = collect(range(300.0, 3000.0; length = 8))
+        days = [DateTime(2003, 7, d, h) for d in 1:10 for h in (0, 12)]
+        a = [16.0 + 6.0 * sin(0.9i) for i in eachindex(days)]
+        own_bin(zi) = 100 * floor(Int, zi / 100) + 50
+        cells = [(lon = 10.0 + 0.01i, lat = 46.0, z = z[i], glm = 0.3, bins = [(own_bin(z[i]), 1.0)])
+                 for i in eachindex(z)]
+        table = _cp_table(cells)
+        loader = function (_model, lat, lon; kwargs...)
+            c = cells[findfirst(c -> c.lat == lat && c.lon == lon, cells)]
+            fd = _audit_forcing(days, lat, lon, c.z, [T_ref + ai - 0.006 * c.z for ai in a])
+            # A wind that varies in time and between cells, so a scaling cannot pass by coincidence.
+            fd[:wind_speed] .= [2.0 + 0.37 * sin(0.7i) + c.z / 1000 for i in eachindex(days)]
+            fd
+        end
+        p = derive_downscaling_parameters(:synthetic, (first(days), last(days)), table;
+                                          token = nothing, cache_path = nothing, forcing_loader = loader)
+        fit = (; time = p.time, p.decoupling, p.lapse_rate, p.lapse_rate_uncertainty)
+        intervals = hypsometry_intervals(table)
+        bands(; kw...) = collect(elevation_interval_forcing(
+            table, resolve_downscaling(fit, intervals, days; basis = :fitted, kw...);
+            climate_model = :synthetic, time_range = (first(days), last(days)), forcing_loader = loader))
+        layers(b) = Dict(v => collect(b.forcing[v]) for v in keys(b.forcing))
+        none, w1, w2 = bands(), bands(; wind_scaling = 1.0), bands(; wind_scaling = 2.0)
+        @test length(none) == length(w1) == length(w2) == length(intervals) > 1
+        for (b0, b1, b2) in zip(none, w1, w2)
+            # w1 is the band without a wind level, bit for bit, metadata included.
+            @test layers(b1) == layers(b0)
+            @test DimensionalData.metadata(b1.forcing) == DimensionalData.metadata(b0.forcing)
+            # w2 doubles the wind exactly and leaves every other layer as it was.
+            @test collect(b2.forcing.wind_speed) == 2 .* collect(b0.forcing.wind_speed)
+            @test all(layers(b2)[v] == layers(b0)[v] for v in keys(b0.forcing) if v !== :wind_speed)
+            @test DimensionalData.metadata(b2.forcing)["wind_speed_scaling"] == 2.0
+            @test DimensionalData.metadata(b2.forcing)["wind_speed_mean"] ==
+                  2 * DimensionalData.metadata(b0.forcing)["wind_speed_mean"]
+        end
+        @test resolve_downscaling(fit, intervals, days; basis = :fitted, wind_scaling = 2.0).settings["downscaling_wind_scaling"] === 2.0
+        @test resolve_downscaling(fit, intervals, days; basis = :fitted).settings["downscaling_wind_scaling"] === 1.0
+        for bad in (0.0, -1.0, Inf, NaN)
+            @test_throws "wind_scaling must be a positive finite factor" resolve_downscaling(
+                fit, intervals, days; basis = :fitted, wind_scaling = bad)
+        end
     end
 
     @testset "Shaw glacier bands: the area-weighted prior and band k" begin
@@ -416,6 +477,20 @@ end
             mp, shawapplied; spinup_window = window, background_black_carbon = bbc, physics_member = m0)
         @test tile_run_parameters(mp, shawapplied; spinup_window = window,
                                   physics_member = m0)["model_black_carbon_snow"] == 0.0
+
+        # The wind level must be the one the downscaling was resolved with.
+        windapplied(w) = GEMB_GlacierSims.AppliedDownscaling(
+            shawapplied.time, shawapplied.lapse_rate, shawapplied.lapse_rate_source, shawapplied.bands,
+            shawapplied.basis, merge(shawapplied.settings, Dict{String,Any}("downscaling_wind_scaling" => w)))
+        mw = physics_member("C-kshaw-table-w2")
+        pw = tile_run_parameters(mp, windapplied(2.0); spinup_window = window, background_black_carbon = bbc,
+                                 physics_member = mw)
+        @test pw["physics_wind_scaling"] === 2.0 && pw["downscaling_wind_scaling"] === 2.0
+        @test_throws "physics member C-kshaw-table-w2 scales the band wind by 2.0, but the downscaling was resolved with wind_scaling = 1.0" tile_run_parameters(
+            mp, windapplied(1.0); spinup_window = window, background_black_carbon = bbc, physics_member = mw)
+        @test_throws "physics member C-kshaw-table scales the band wind by 1.0, but the downscaling was resolved with wind_scaling = 2.0" tile_run_parameters(
+            mp, windapplied(2.0); spinup_window = window, background_black_carbon = bbc, physics_member = m)
+        @test haskey(run_parameter_differences(p, pw), "physics_wind_scaling")
 
         # The capped effective loading, fitted for the member's own grain variant.
         mv = physics_member("C-kfit-cvis")

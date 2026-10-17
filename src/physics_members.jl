@@ -3,17 +3,20 @@ Physics members: the unresolved physics choices a tile sweep can be run under, s
 fluxes can be compared across them.
 
 A member is one level of each of three factors, written `<grain>-<band decoupling>-<impurity>`, for
-example `"C-kfit-table"`:
+example `"C-kfit-table"`, optionally followed by a fourth, `-w<factor>`:
 
 - grain growth, fresh snow and wind packing ([`PHYSICS_GRAIN_VARIANTS`](@ref)): `A`, `B`, `C`, `D1`;
 - the band decoupling ([`PHYSICS_BAND_DECOUPLING`](@ref)): `kfit`, `kshaw`;
 - the fresh-snow impurity loading ([`PHYSICS_IMPURITY`](@ref)): `table`, `tbc`, `tdang`, `traw`,
-  `bc0`, `cvis`.
+  `bc0`, `cvis`;
+- a wind correction: `w<factor>` multiplies every band's wind speed by `factor` (written in its
+  shortest form, `w2`, `w1.5`) before GEMB, through `resolve_downscaling(...; wind_scaling)`. Without
+  the token the factor is 1.
 
 Each level fixes every setting it is about, so a member names one model configuration whatever the
-GEMB defaults are. [`tile_run_parameters`](@ref) records the member and its three levels as
-`physics_*` run parameters and refuses a member whose settings disagree with the model parameters,
-the downscaling resolution or the impurity loading the run actually uses. The model settings
+GEMB defaults are. [`tile_run_parameters`](@ref) records the member and its levels as `physics_*` run
+parameters and refuses a member whose settings disagree with the model parameters, the downscaling
+resolution or the impurity loading the run actually uses. The model settings
 themselves stay in the `model_*`, `downscaling_*` and `*_black_carbon_*` parameters, which is what a
 restart compares.
 """
@@ -109,30 +112,47 @@ const PHYSICS_IMPURITY = (
             basis = :effective, cap = 0.045),
 )
 
+# The `w` token of a wind factor, in its one spelling: `w2`, `w1.5`.
+_wind_token(factor::Real) = "w" * (isinteger(factor) ? string(Int(factor)) : string(Float64(factor)))
+
 """
     physics_member(id::AbstractString) -> NamedTuple
 
-The physics member `id` = `"<grain>-<band decoupling>-<impurity>"` (see the module notes above), as
-`(; id, grain, band_decoupling, impurity, model, band_rule, impurity_level, description)`: the three
-level names as `Symbol`s, the `ModelParameters` fields the grain level sets, the `band_decoupling`
-rule (`(; rule)`; a `:shaw` rule takes its per-band `k` from the tile), and the impurity level. Throws for an unknown level or a
+The physics member `id` = `"<grain>-<band decoupling>-<impurity>"` or
+`"<grain>-<band decoupling>-<impurity>-w<factor>"` (see the module notes above), as
+`(; id, grain, band_decoupling, impurity, model, band_rule, impurity_level, wind_scaling,
+description)`: the three level names as `Symbol`s, the `ModelParameters` fields the grain level sets,
+the `band_decoupling` rule (`(; rule)`; a `:shaw` rule takes its per-band `k` from the tile), the
+impurity level, and the wind factor (1.0 without a `w` token). Throws for an unknown level or a
 malformed id.
 """
 function physics_member(id::AbstractString)
     parts = split(id, '-')
-    length(parts) == 3 || throw(ArgumentError(
-        "a physics member is \"<grain>-<band decoupling>-<impurity>\", e.g. \"C-kfit-table\"; " *
-        "got \"$id\""))
-    grain, k, impurity = Symbol.(parts)
+    length(parts) in (3, 4) || throw(ArgumentError(
+        "a physics member is \"<grain>-<band decoupling>-<impurity>\", e.g. \"C-kfit-table\", or " *
+        "\"<grain>-<band decoupling>-<impurity>-w<factor>\"; got \"$id\""))
+    wind_scaling = 1.0
+    if length(parts) == 4
+        m = match(r"^w([0-9]+(\.[0-9]+)?)$", parts[4])
+        m === nothing && throw(ArgumentError(
+            "the fourth level of physics member \"$id\" must be a wind factor w<factor>, e.g. \"w2\"; " *
+            "got \"$(parts[4])\""))
+        wind_scaling = parse(Float64, m[1])
+        wind_scaling > 0 || throw(ArgumentError("the wind factor of physics member \"$id\" must be > 0"))
+        parts[4] == _wind_token(wind_scaling) || throw(ArgumentError(
+            "write the wind factor of physics member \"$id\" as \"$(_wind_token(wind_scaling))\""))
+    end
+    grain, k, impurity = Symbol.(parts[1:3])
     _check_level(grain, PHYSICS_GRAIN_VARIANTS, "grain variant", id)
     _check_level(k, PHYSICS_BAND_DECOUPLING, "band decoupling level", id)
     _check_level(impurity, PHYSICS_IMPURITY, "impurity level", id)
     g = PHYSICS_GRAIN_VARIANTS[grain]
     d = PHYSICS_BAND_DECOUPLING[k]
     i = PHYSICS_IMPURITY[impurity]
+    wind = wind_scaling == 1 ? "ERA5-Land wind" : "band wind × $(_wind_token(wind_scaling)[2:end])"
     return (; id = String(id), grain, band_decoupling = k, impurity, model = g.model,
-            band_rule = d.rule, impurity_level = i,
-            description = "$(g.description) | $(d.description) | $(i.description)")
+            band_rule = d.rule, impurity_level = i, wind_scaling,
+            description = "$(g.description) | $(d.description) | $(i.description) | $wind")
 end
 
 _check_level(level, table, what, id) = haskey(table, level) || throw(ArgumentError(
@@ -156,13 +176,15 @@ end
     physics_member_parameters(member) -> Dict{String,Any}
 
 The run parameters that name `member`: `physics_member` (its id), `physics_grain`,
-`physics_band_decoupling` and `physics_impurity` (its levels).
+`physics_band_decoupling`, `physics_impurity` (its levels) and `physics_wind_scaling` (its wind factor,
+1.0 without a `w` level).
 """
 physics_member_parameters(member) = Dict{String,Any}(
     "physics_member" => member.id,
     "physics_grain" => string(member.grain),
     "physics_band_decoupling" => string(member.band_decoupling),
-    "physics_impurity" => string(member.impurity))
+    "physics_impurity" => string(member.impurity),
+    "physics_wind_scaling" => Float64(member.wind_scaling))
 
 # Throw unless a run under `mp`, `applied`, `background_black_carbon` and `effective_black_carbon` is
 # the configuration `member` names.
@@ -182,6 +204,10 @@ function _assert_physics_member(member, mp::ModelParameters, applied, background
     recorded == expected || throw(ArgumentError(
         "physics member $(member.id) applies band decoupling $expected, but the downscaling was " *
         "resolved with $recorded"))
+    wind = Float64(get(applied.settings, "downscaling_wind_scaling", 1.0))
+    wind == member.wind_scaling || throw(ArgumentError(
+        "physics member $(member.id) scales the band wind by $(member.wind_scaling), but the " *
+        "downscaling was resolved with wind_scaling = $wind"))
     level = member.impurity_level
     if level.basis === :off
         (background_black_carbon === nothing && effective_black_carbon === nothing) ||

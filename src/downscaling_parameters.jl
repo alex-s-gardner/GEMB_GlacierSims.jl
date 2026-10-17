@@ -611,6 +611,8 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     # How a cell's `glm` enters the donor conversion: the form the fits were derived under
     # (`decoupling_glacier_fraction`).
     glacier_fraction_form::Symbol
+    # The factor on each band's wind speed (`downscaling_wind_scaling`), applied to the band average.
+    wind_scaling::Float64
 end
 
 function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling,
@@ -629,7 +631,8 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
                                      Dict{Tuple{Float64,Float64},Any}(),
                                      Set{Tuple{Float64,Float64}}(),
                                      Symbol(get(applied.settings, "downscaling_glacier_fraction_form",
-                                                "fraction")))
+                                                "fraction")),
+                                     Float64(get(applied.settings, "downscaling_wind_scaling", 1.0)))
 end
 
 # The applied `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is
@@ -1126,6 +1129,9 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
     layers = NamedTuple(v => DimArray(_band_layer(v, sums, weight), (time_dim,);
                                       metadata = DimensionalData.metadata(template[v]))
                         for v in _FORCING_VARIABLES)
+    # The wind correction acts on the band's wind alone, after the average; skipped at 1 so the band
+    # is then the uncorrected one bit for bit.
+    ivf.wind_scaling == 1 || (layers.wind_speed .*= ivf.wind_scaling)
 
     # Where `k` actually changed this band's forcing. The decoupling correction scales
     # `max(T - T_ref, 0)`, so at a below-freezing timestep every value of `k` yields bit-identical
@@ -1179,7 +1185,8 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
         # kg m-2 yr-1, as GEMB reads it: the mean per step times the steps in a 365-day year, the
         # convention `climate_forcing` and `precipitation_adjust` use.
         "precipitation_mean" => Statistics.mean(layers.precipitation) * _steps_per_year(time_dim),
-        "wind_speed_mean" => Statistics.mean(layers.wind_speed)))
+        "wind_speed_mean" => Statistics.mean(layers.wind_speed),
+        "wind_speed_scaling" => ivf.wind_scaling))
 
     # The provenance of every applied value, by source, for `k` at this band and for the tile's lapse
     # rate. `*_above_freezing` is the same count over the timesteps where `k` mattered.

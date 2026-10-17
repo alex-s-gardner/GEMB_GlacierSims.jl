@@ -358,6 +358,9 @@ silently reverting to the climatology.
 
   The rule, the per-band `k` of `:shaw` and whether donors are converted
   (`downscaling_donor_conversion`) are recorded in `settings`.
+- `wind_scaling = 1.0`: a factor on every band's wind speed, applied by
+  [`elevation_interval_forcing`](@ref) after the band average and before GEMB, and recorded as
+  `downscaling_wind_scaling`. It acts on wind alone; at 1 the bands are unchanged bit for bit.
 
 `fit.glacier_fraction_form` (the [`GLACIER_FRACTION_FORMS`](@ref) form the fits were derived under,
 `:fraction` when the fit does not record one) is recorded as `downscaling_glacier_fraction_form`;
@@ -375,11 +378,14 @@ function resolve_downscaling(fit, intervals, run_time;
                              lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                              decoupling_factor_prior = nothing,
                              band_decoupling = (; rule = :fitted),
+                             wind_scaling::Real = 1.0,
                              albedo_ice_default = _DEFAULT_ALBEDO_ICE,
                              albedo_ice_range = GEMB_ALBEDO_ICE_RANGE)
     basis in (:climatology, :fitted) ||
         throw(ArgumentError("basis must be :climatology or :fitted, got :$basis"))
     band_rule = band_decoupling_rule(band_decoupling; n_bands = length(intervals))
+    (isfinite(wind_scaling) && wind_scaling > 0) ||
+        throw(ArgumentError("wind_scaling must be a positive finite factor, got $wind_scaling"))
     run_time = _plain_times(run_time)
     isempty(run_time) && throw(ArgumentError("run_time is empty; there is nothing to resolve onto"))
 
@@ -485,6 +491,7 @@ function resolve_downscaling(fit, intervals, run_time;
         "downscaling_band_decoupling_rule" => string(band_rule.rule),
         "downscaling_band_decoupling_band_k" => band_rule.band_k,
         "downscaling_donor_conversion" => band_rule.rule === :shaw ? "none" : "fitted",
+        "downscaling_wind_scaling" => Float64(wind_scaling),
         "downscaling_glacier_fraction_form" => string(glacier_fraction_form),
         "downscaling_fit_time_coverage_start" => isempty(fit_time) ? "none" : string(first(fit_time)),
         "downscaling_fit_time_coverage_end" => isempty(fit_time) ? "none" : string(last(fit_time)),

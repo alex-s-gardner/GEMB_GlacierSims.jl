@@ -416,7 +416,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
     prior = tile_decoupling_factor_prior(tile)
     band_rule = tile_band_decoupling(tile, intervals)
     applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
-                                  band_decoupling = band_rule)
+                                  band_decoupling = band_rule,
+                                  wind_scaling = PHYSICS_MEMBER.wind_scaling)
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current
@@ -478,7 +479,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
     if appending
         applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
                                       basis, decoupling_factor_prior = prior,
-                                      band_decoupling = band_rule)
+                                      band_decoupling = band_rule,
+                                      wind_scaling = PHYSICS_MEMBER.wind_scaling)
     end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps
