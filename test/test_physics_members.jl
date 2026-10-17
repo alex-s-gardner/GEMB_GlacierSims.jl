@@ -61,7 +61,13 @@ end
         @test (m.grain, m.band_decoupling, m.impurity) === (:C, :kshaw, :table)
         @test m.model == (; grain_growth_method = :FlannerZender2006,
                           new_snow_method = :vanKampenhout2017, densification_method = :Crocus,
-                          destructive_metamorphism = true)
+                          destructive_metamorphism = true, blowing_snow_method = :none,
+                          drift_fetch_length = 10.0)
+        # D1 is C with Keenan et al. (2021) wind packing at a 10 m fetch, and nothing else.
+        d1 = physics_member("D1-kfit-table")
+        @test d1.grain === :D1
+        @test d1.model == merge(m.model, (; blowing_snow_method = :Keenan2021, drift_fetch_length = 10.0))
+        @test m.model.blowing_snow_method === :none
         @test m.band_rule == (; rule = :shaw)
         @test physics_member("B-kfit-table").band_rule == (; rule = :fitted)
         @test m.impurity_level.basis === :bc_dust && m.impurity_level.optics === :snicar_adv3
@@ -72,7 +78,7 @@ end
         end
         @test allequal(keys(v.model) for v in PHYSICS_GRAIN_VARIANTS)
         @test_throws "a physics member is \"<grain>-<band decoupling>-<impurity>\"" physics_member("C-kfit")
-        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C" physics_member(
+        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C, D1" physics_member(
             "D-kfit-table")
         @test_throws "unknown band decoupling level \"ks35\" in physics member \"A-ks35-table\"; one of kfit, kshaw" physics_member(
             "A-ks35-table")
@@ -93,6 +99,10 @@ end
         @test all(getproperty(default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.A.model))
         @test_throws "physics member B-kfit-bc0 sets grain_growth_method; remove it from the keywords" physics_model_parameters(
             physics_member("B-kfit-bc0"); grain_growth_method = :hybrid)
+        @test_throws "physics member D1-kfit-table sets blowing_snow_method" physics_model_parameters(
+            physics_member("D1-kfit-table"); blowing_snow_method = :none)
+        mp = physics_model_parameters(physics_member("D1-kfit-table"))
+        @test mp.blowing_snow_method === :Keenan2021 && mp.drift_fetch_length == 10.0
     end
 
     @testset "band decoupling rule" begin

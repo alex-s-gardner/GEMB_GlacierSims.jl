@@ -5,7 +5,7 @@ fluxes can be compared across them.
 A member is one level of each of three factors, written `<grain>-<band decoupling>-<impurity>`, for
 example `"C-kfit-table"`:
 
-- grain growth and fresh snow ([`PHYSICS_GRAIN_VARIANTS`](@ref)): `A`, `B`, `C`;
+- grain growth, fresh snow and wind packing ([`PHYSICS_GRAIN_VARIANTS`](@ref)): `A`, `B`, `C`, `D1`;
 - the band decoupling ([`PHYSICS_BAND_DECOUPLING`](@ref)): `kfit`, `kshaw`;
 - the fresh-snow impurity loading ([`PHYSICS_IMPURITY`](@ref)): `table`, `tbc`, `tdang`, `traw`,
   `bc0`, `cvis`.
@@ -21,26 +21,41 @@ restart compares.
 """
     PHYSICS_GRAIN_VARIANTS
 
-Grain-growth and fresh-snow levels of a physics member, as the `ModelParameters` fields each sets:
+Grain-growth, fresh-snow and wind-packing levels of a physics member, as the `ModelParameters` fields
+each sets:
 
 - `A`: `:hybrid` grain growth (Brun/Marbouty below 400 kg m⁻³), 350 kg m⁻³ fresh snow, `:Arthern`
   densification;
 - `B`: Flanner & Zender (2006) grain growth (`:FlannerZender2006`), otherwise as `A`;
 - `C`: Flanner & Zender (2006) grain growth with van Kampenhout et al. (2017) fresh-snow density,
-  `:Crocus` densification and destructive metamorphism, the pairing GEMB documents for that density.
+  `:Crocus` densification and destructive metamorphism, the pairing GEMB documents for that density;
+- `D1`: `C` with the Keenan et al. (2021) erosion–redeposition packing (`blowing_snow_method =
+  :Keenan2021`) at a fetch length of 10 m (`drift_fetch_length`, their eq. 3).
+
+`A`, `B` and `C` run without wind packing (`blowing_snow_method = :none`, under which
+`drift_fetch_length` is not read and is held at GEMB's default), so every level fixes the same fields.
 """
 const PHYSICS_GRAIN_VARIANTS = (
     A = (; description = "hybrid grain growth; 350 kg m-3 fresh snow; Arthern densification",
          model = (; grain_growth_method = :hybrid, new_snow_method = :Constant350,
-                  densification_method = :Arthern, destructive_metamorphism = false)),
+                  densification_method = :Arthern, destructive_metamorphism = false,
+                  blowing_snow_method = :none, drift_fetch_length = 10.0)),
     B = (; description = "Flanner & Zender (2006) grain growth; 350 kg m-3 fresh snow; " *
                          "Arthern densification",
          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :Constant350,
-                  densification_method = :Arthern, destructive_metamorphism = false)),
+                  densification_method = :Arthern, destructive_metamorphism = false,
+                  blowing_snow_method = :none, drift_fetch_length = 10.0)),
     C = (; description = "Flanner & Zender (2006) grain growth; van Kampenhout et al. (2017) " *
                          "fresh snow; Crocus densification with destructive metamorphism",
          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017,
-                  densification_method = :Crocus, destructive_metamorphism = true)),
+                  densification_method = :Crocus, destructive_metamorphism = true,
+                  blowing_snow_method = :none, drift_fetch_length = 10.0)),
+    D1 = (; description = "Flanner & Zender (2006) grain growth; van Kampenhout et al. (2017) " *
+                          "fresh snow; Crocus densification with destructive metamorphism; " *
+                          "Keenan et al. (2021) wind packing, 10 m fetch",
+          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017,
+                   densification_method = :Crocus, destructive_metamorphism = true,
+                   blowing_snow_method = :Keenan2021, drift_fetch_length = 10.0)),
 )
 
 """
