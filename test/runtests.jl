@@ -3452,4 +3452,6 @@ include("test_physics_members.jl")
 
 include("test_column_profiles.jl")
 
+include("test_dem_archive.jl")
+
 include("test_run_launch.jl")

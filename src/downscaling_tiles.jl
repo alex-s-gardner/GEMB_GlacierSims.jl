@@ -340,9 +340,13 @@ unconditionally.
   albedo does not step at a tile seam.
 
   Unlike the two forcing fits this needs no CDS token — the albedo is read from tables vendored in
-  GEMB_ClimateForcing — but it does need the Copernicus DEM, and so network. A tile whose albedo
+  GEMB_ClimateForcing — but it does need the Copernicus DEM: from the network, or from a local
+  mirror (`dem_archive`). A tile whose albedo
   cannot be derived is still written with its fits, and every band falls back to the default
   `albedo_ice`; only a broken caller propagates.
+- `dem_archive = nothing`: the root of a local Copernicus DEM mirror
+  ([`copernicus_dem_archive`](@ref)). When given, the albedo reads the DEM from it and needs no
+  network; `dem_cache_path` is then unused.
 - `dem_cache_path = nothing`: where the Copernicus DEM's 1° tiles are cached. Tiles are fetched whole
   and reused, so a sweep pays for each 1° tile once however many 2° tiles overlap it — but the path
   must be durable or `climate_model_invariant` throws rather than write tiles the OS will reap.
@@ -388,6 +392,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             glacier_fraction_form = :fraction,
                                             derive_albedo::Bool = true,
                                             dem_cache_path::Union{Nothing,AbstractString} = nothing,
+                                            dem_archive::Union{Nothing,AbstractString} = nothing,
                                             precision::Type = Float32,
                                             deflatelevel::Int = 4,
                                             order::Symbol = :chunk,
@@ -462,7 +467,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
             albedo = if derive_albedo
                 try
                     derive_bare_ice_albedo(tile.buffered; bins = hypsometry_bin_edges(tile.buffered),
-                                           dem_cache_path, label = tile.name, verbose = false)
+                                           dem_cache_path, dem_archive, label = tile.name,
+                                           verbose = false)
                 catch err
                     is_caller_error(err) && rethrow()
                     @warn "Could not derive bare-ice albedo for this tile; every band will fall back to the default albedo_ice" tile =

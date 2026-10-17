@@ -112,6 +112,51 @@ function _bia_densified_box(xmin::Real, xmax::Real, ymin::Real, ymax::Real, step
 end
 
 """
+    copernicus_dem_archive(root, extent; vrt_dir = mktempdir()) -> Raster
+
+The Copernicus GLO-30 DEM over `extent` (an `Extents.Extent` or `(; X, Y)` in degrees) as a lazy
+`Raster`, read from a local mirror of the `copernicus-dem-30m` bucket at `root` instead of the
+network. The mirror has the bucket's own layout: `root/tileList.txt`, the published tile list, and
+`root/<id>/<id>.tif` for each tile `id`.
+
+The tiles covering `extent` are chosen from `tileList.txt` and mosaicked on the grid
+`climate_model_invariant(model = :copernicus_dem_30m)` builds from the same files (one tile is read
+directly, several through a VRT written to `vrt_dir`), then cropped to `extent`, so the elevations
+are the ones the network loader returns.
+
+Throws when `tileList.txt` is missing, and when a tile the list publishes inside `extent` is absent
+from the mirror: an incomplete mirror would otherwise read as ocean. An `extent` that holds no
+published tile throws the `ArgumentError` the network loader throws ("No Copernicus DEM tiles …").
+"""
+function copernicus_dem_archive(root::AbstractString, extent; vrt_dir::AbstractString = mktempdir())
+    list = joinpath(root, "tileList.txt")
+    isfile(list) || throw(ArgumentError(
+        "no tileList.txt in $root; a Copernicus DEM archive is a mirror of the copernicus-dem-30m " *
+        "bucket, holding tileList.txt and <id>/<id>.tif per tile"))
+    index = Set{String}(String(strip(l)) for l in eachline(list) if !isempty(strip(l)))
+    xmin, xmax, ymin, ymax = GEMB_ClimateForcing._copernicus_dem_extent(extent)
+    ids = GEMB_ClimateForcing._copernicus_dem_tiles_for_extent(xmin, xmax, ymin, ymax, index)
+    sources = [joinpath(root, id, id * ".tif") for id in ids]
+    absent = [id for (id, s) in zip(ids, sources) if !isfile(s)]
+    isempty(absent) || throw(ArgumentError(
+        "the Copernicus DEM archive at $root lacks $(length(absent)) tile(s) its tileList.txt " *
+        "publishes inside X = ($xmin, $xmax), Y = ($ymin, $ymax): $(join(absent, ", "))"))
+    raster = if length(ids) == 1
+        Raster(only(sources); lazy = true)
+    else
+        vrt = joinpath(vrt_dir, "cop30_archive_" * string(hash((root, ids)); base = 16) * ".vrt")
+        Raster(GEMB_ClimateForcing._copernicus_dem_write_vrt(ids, vrt, sources); lazy = true)
+    end
+    cropped = view(raster, X = (xmin .. xmax), Y = (ymin .. ymax))
+    meta = Dict{String,Any}("source" => "Copernicus GLO-30 DEM, local archive", "archive" => String(root),
+                            "resolution_m" => 30, "n_tiles" => length(ids),
+                            "extent" => (X = (xmin, xmax), Y = (ymin, ymax)), "units" => "m",
+                            "long_name" => "surface elevation above EGM2008 geoid")
+    length(ids) <= 64 && (meta["tiles"] = ids)
+    return DimensionalData.rebuild(cropped; metadata = meta)
+end
+
+"""
     bare_ice_albedo_tile(tile, dem; kwargs...) -> (; per_cell, per_bin, hyps, census)
 
 Bare-ice albedo binned by elevation for every cell a downscaling `tile` owns.
@@ -222,7 +267,10 @@ with `extrapolate = :hold` (the default here) every class gets a value drawn fro
   some bin measured.
 - `boundary = :center`, `cell_size = 0.1`, `dem_fetch_concurrency = 8`, `verbose = true`: as for
   [`bare_ice_albedo_tile`](@ref).
-- `dem_cache_path = nothing`, `dem_cache_tiles = true`: only read when `dem === nothing`.
+- `dem_cache_path = nothing`, `dem_cache_tiles = true`: only read when `dem === nothing` and
+  `dem_archive === nothing`.
+- `dem_archive = nothing`: the root of a local Copernicus DEM mirror; when given (and `dem` is not)
+  the DEM is read from it with [`copernicus_dem_archive`](@ref) over the cells' box, with no network.
 
 # The DEM, and why the extent matters
 With `dem === nothing` this calls
@@ -249,18 +297,22 @@ function derive_bare_ice_albedo(cells;
                                 dem_fetch_concurrency::Integer = 8,
                                 dem_cache_path::Union{Nothing,AbstractString} = nothing,
                                 dem_cache_tiles::Bool = true,
+                                dem_archive::Union{Nothing,AbstractString} = nothing,
                                 label::AbstractString = "region",
                                 verbose::Bool = true)
     nrow(cells) > 0 || throw(ArgumentError(
         "no cells supplied, so there is no region to pool albedo over"))
+    isnothing(dem) || isnothing(dem_archive) || throw(ArgumentError(
+        "pass either a dem or a dem_archive to read one from, not both"))
 
     if isnothing(dem)
         box = _bia_cells_box(cells, Float64(cell_size))
-        dem = climate_model_invariant(; model = :copernicus_dem_30m,
-                                      extent = Extents.Extent(X = (box.xmin, box.xmax),
-                                                              Y = (box.ymin, box.ymax)),
-                                      cache_path = dem_cache_path,
-                                      cache_tiles = dem_cache_tiles, verbose)
+        extent = Extents.Extent(X = (box.xmin, box.xmax), Y = (box.ymin, box.ymax))
+        dem = isnothing(dem_archive) ?
+            climate_model_invariant(; model = :copernicus_dem_30m, extent,
+                                    cache_path = dem_cache_path, cache_tiles = dem_cache_tiles,
+                                    verbose) :
+            copernicus_dem_archive(dem_archive, extent)
     end
 
     s = _bia_sample(cells, dem; label, cell_size, boundary, dem_fetch_concurrency, verbose)

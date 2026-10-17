@@ -77,7 +77,7 @@ export gemb_glacier_elevation_class_runfile, hypsometry_bin_edges, glacier_hypso
 include("bare_ice_albedo_hyps.jl")
 include("bare_ice_albedo_cells.jl")
 export era5_land_cell_polygon, era5_land_cell_key, bare_ice_albedo_tile
-export derive_bare_ice_albedo, resolve_albedo_ice
+export derive_bare_ice_albedo, resolve_albedo_ice, copernicus_dem_archive
 export BARE_ICE_ALBEDO_SOURCES, GEMB_ALBEDO_ICE_RANGE
 export bare_ice_albedo_source_code, bare_ice_albedo_source_name
 export bare_ice_albedo, bare_ice_albedo_points, bare_ice_albedo_hyps, BareIceAlbedoHyps

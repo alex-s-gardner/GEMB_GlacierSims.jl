@@ -54,8 +54,17 @@ const AREA_MINIMUM = 0.0
 # Derive each tile's observed bare-ice albedo profile from MODIS and store it in the tile file, so every
 # elevation class runs at a measured `albedo_ice`? Off, every band falls back to the tuned constant
 # `albedo_ice` — a tile file written that way carries no profile, and nothing downstream can recover one.
-# Needs the Copernicus DEM and so network, but no CDS token.
+# Needs the Copernicus DEM, but no CDS token.
 const DERIVE_ALBEDO = get(ENV, "DERIVE_ALBEDO", "1") == "1"
+
+# Where the albedo reads the Copernicus DEM: `COPERNICUS_DEM_ARCHIVE` names a local mirror of the
+# copernicus-dem-30m bucket (`tileList.txt` and `<id>/<id>.tif`; `copernicus_dem_archive`), read with
+# no network. Unset, the DEM is fetched from the bucket and its tiles cached under GEMB_CACHE_PATH.
+const DEM_ARCHIVE = let root = get(ENV, "COPERNICUS_DEM_ARCHIVE", nothing)
+    root === nothing || isfile(joinpath(root, "tileList.txt")) ||
+        error("COPERNICUS_DEM_ARCHIVE=$root holds no tileList.txt; it must be a mirror of the copernicus-dem-30m bucket")
+    root
+end
 
 # Also store each tile's glacier-area weighted per-elevation-interval forcing? This is the expensive
 # half — most of the output volume, plus at least one extra pass over every cell's forcing — and the
@@ -147,8 +156,11 @@ function settings_rows()
                     "TILE_NAMES"),
         env_setting("forcing cache budget", "$(CACHE_BUDGET_GIB) GiB", "FORCING_CACHE_GIB"),
         env_setting("climate cache", CLIMATE_CACHE, "CLIMATE_CACHE"),
-        env_setting("DEM tile cache", get(ENV, "GEMB_CACHE_PATH",
-                                          "GEMB_ClimateForcing data/ (package default)"),
+        env_setting("Copernicus DEM", DEM_ARCHIVE === nothing ? "network (copernicus-dem-30m bucket)" :
+                                      "local archive $(DEM_ARCHIVE)", "COPERNICUS_DEM_ARCHIVE"),
+        env_setting("DEM tile cache", DEM_ARCHIVE === nothing ?
+                                      get(ENV, "GEMB_CACHE_PATH", "GEMB_ClimateForcing data/ (package default)") :
+                                      "unused (local archive)",
                     "GEMB_CACHE_PATH"),
         env_setting("output", OUTPUT_DIR, "OUTPUT_DIR"),
     ]
@@ -209,6 +221,7 @@ function main()
                                                 min_cells = MIN_CELLS,
                                                 area_minimum = AREA_MINIMUM,
                                                 derive_albedo = DERIVE_ALBEDO,
+                                                dem_archive = DEM_ARCHIVE,
                                                 retain_elevation_interval_forcing =
                                                     RETAIN_ELEVATION_INTERVAL_FORCING,
                                                 glacier_fraction_form = tile_glacier_fraction_form,
