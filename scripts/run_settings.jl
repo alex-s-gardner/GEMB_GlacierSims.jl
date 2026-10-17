@@ -24,12 +24,14 @@ const TILE_RUN_DIR = "tile_runs_v2"
 const SPINUP_CLIMATOLOGY_LAST_YEAR = 1980
 
 # The regional background snow impurity loading (`background_black_carbon`), shared by the tile sweep
-# and the native run so that a native cell runs at its reference tile's loading. `off` (the default)
-# runs every tile at `ModelParameters.black_carbon_snow`; `bc` and `bc_dust` set each tile's value
-# from its RGI 7.0 region in `data/background_black_carbon.csv`. A run under a different setting
-# records different run parameters, so its tiles are rebuilt rather than appended to.
+# and the native run so that a native cell runs at its reference tile's loading. Production uses
+# `bc_dust` (the default): each tile's BC plus dust from its RGI 7.0 regions in
+# `data/background_black_carbon.csv`, converted with `BACKGROUND_BLACK_CARBON_OPTICS`. `bc` (BC only)
+# and `off` (every tile at `ModelParameters.black_carbon_snow`) are kept for sensitivity runs. A run
+# under a different setting records different run parameters, so its tiles are rebuilt rather than
+# appended to.
 import GEMB_GlacierSims
-const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "off")
+const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "bc_dust")
     v == "off" ? :off :
     Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES ? Symbol(v) :
     error("BACKGROUND_BLACK_CARBON must be off, " *
@@ -37,7 +39,8 @@ const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "off
 end
 
 # The reference optics the measured loading is converted to a Gardner & Sharp loading with:
-# `snicar_adv3` (the default), `dang2015`, or `none` for the measured loading unconverted.
+# `snicar_adv3` (the default, used in production), or `dang2015` and `none` (the measured loading
+# unconverted) for sensitivity runs.
 const BACKGROUND_BLACK_CARBON_OPTICS = let v = get(ENV, "BACKGROUND_BLACK_CARBON_OPTICS", "snicar_adv3")
     Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_OPTICS ? Symbol(v) :
     error("BACKGROUND_BLACK_CARBON_OPTICS must be " *

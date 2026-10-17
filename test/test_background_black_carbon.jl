@@ -286,7 +286,15 @@ end
         loading(m, cells) =
             Base.invokelatest(() -> getglobal(m, :tile_background_black_carbon)(cells))
         cells = _cp_table([(lon = 6.9, lat = 45.9, z = 3000.0, glm = 1.0, bins = [(3050, 1.0)])])
-        off = load(nothing)
+        # The production default: BC plus dust, converted with SNICAR-ADv3.
+        production = load(nothing)
+        @test setting(production) === :bc_dust
+        @test loading(production, cells) ==
+              background_black_carbon("11"; basis = :bc_dust, optics = :snicar_adv3)
+        @test loading(production, cells).basis === :bc_dust
+        @test loading(production, cells).optics === :snicar_adv3
+        # `off` stays selectable and runs at `ModelParameters.black_carbon_snow`.
+        off = load("off")
         @test setting(off) === :off
         @test loading(off, cells) === nothing
         for basis in BACKGROUND_BLACK_CARBON_BASES
@@ -302,6 +310,8 @@ end
             @test isequal(loading(m, cells), background_black_carbon("11"; basis = :bc_dust, optics))
         end
         @test loading(load("bc"), cells).optics === :snicar_adv3
+        @test loading(load(nothing, "dang2015"), cells) ==
+              background_black_carbon("11"; basis = :bc_dust, optics = :dang2015)
         @test_throws "BACKGROUND_BLACK_CARBON_OPTICS must be snicar_adv3, dang2015 or none" load(
             "bc", "tartes")
         # Both scripts pass the tile's loading to the run parameters and to the run.

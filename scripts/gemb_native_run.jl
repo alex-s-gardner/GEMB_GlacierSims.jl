@@ -41,8 +41,8 @@
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
 # CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM,
-# BACKGROUND_BLACK_CARBON (off, bc, bc_dust) and BACKGROUND_BLACK_CARBON_OPTICS (snicar_adv3,
-# dang2015, none), both matching the reference tile sweep's
+# BACKGROUND_BLACK_CARBON (bc_dust, the default; bc; off) and BACKGROUND_BLACK_CARBON_OPTICS
+# (snicar_adv3, the default; dang2015; none), both matching the reference tile sweep's
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing

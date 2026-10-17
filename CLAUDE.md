@@ -64,9 +64,10 @@ background.
   callers add them from the Point geometry and leave them native, because that is what
   `climate_forcing` is keyed on. `wrap_lon` converts to `(-180, 180]` for geometry.
 - `data/background_black_carbon.csv` — background BC (and dust) in snow per RGI 7.0 o1 region, with
-  method, season and source per row; read by `background_black_carbon`. The scripts apply it only
-  when `BACKGROUND_BLACK_CARBON` is `bc` or `bc_dust` (default `off`), converted with the optics in
-  `BACKGROUND_BLACK_CARBON_OPTICS` (default `snicar_adv3`).
+  method, season and source per row; read by `background_black_carbon`. Production runs use BC plus
+  dust converted with SNICAR-ADv3: `BACKGROUND_BLACK_CARBON` defaults to `bc_dust` and
+  `BACKGROUND_BLACK_CARBON_OPTICS` to `snicar_adv3`. `bc`, `off`, `dang2015` and `none` are for
+  sensitivity runs.
 - `data/snicar_adv3_albedo.csv` — SNICAR-ADv3 broadband snow albedo over grain radius, BC and dust,
   written by `scripts/snicar_adv3_albedo_grid.m`; the reference optics `background_black_carbon`
   converts a measured loading against.
