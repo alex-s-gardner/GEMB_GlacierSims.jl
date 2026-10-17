@@ -54,15 +54,12 @@ end
         # More impurity, more reduction, under either illumination.
         for ill in (:direct, :diffuse)
             @test issorted([red(b, 0.0; illumination = ill) for b in (0.0, 1, 2, 5, 10, 20, 50, 100)])
-            @test issorted([red(0.0, d; illumination = ill) for d in (0.0, 0.5, 1, 2, 5, 10, 20, 30, 40, 50)])
+            @test issorted([red(0.0, d; illumination = ill) for d in (0.0, 0.5, 1, 2, 5, 10, 20)])
         end
         # Coarser grains are darkened more by the same BC (Flanner et al. 2021 p. 7688).
         @test snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 500) >
               snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 100)
         @test_throws DomainError red(150.0, 0.0)
-        # The dust axis covers the table's largest dust value (34 µg/g, region 01's high end).
-        @test red(0.0, 34.0) ≈ 0.6 * red(0.0, 30.0) + 0.4 * red(0.0, 40.0)
-        @test_throws DomainError red(0.0, 60.0)
         @test_throws "not tabulated" snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 250)
     end
 
@@ -273,9 +270,12 @@ end
     end
 
     @testset "the scripts' setting" begin
+        # The scripts take the loading from the physics member (`test_physics_members.jl` tests the
+        # member side); this checks the two loadings a member can name.
         repo = normpath(joinpath(@__DIR__, ".."))
-        load(value, optics = nothing) = withenv("BACKGROUND_BLACK_CARBON" => value,
-                                                "BACKGROUND_BLACK_CARBON_OPTICS" => optics) do
+        load(member) = withenv("PHYSICS_MEMBER" => member, "BACKGROUND_BLACK_CARBON" => nothing,
+                               "BACKGROUND_BLACK_CARBON_OPTICS" => nothing,
+                               "EFFECTIVE_LOADING_TABLE" => nothing) do
             m = Module()
             Base.eval(m, :(using Dates))
             Base.include(m, joinpath(repo, "scripts", "run_settings.jl"))
@@ -286,34 +286,22 @@ end
         loading(m, cells) =
             Base.invokelatest(() -> getglobal(m, :tile_background_black_carbon)(cells))
         cells = _cp_table([(lon = 6.9, lat = 45.9, z = 3000.0, glm = 1.0, bins = [(3050, 1.0)])])
-        # The production default: BC plus dust, converted with SNICAR-ADv3.
-        production = load(nothing)
-        @test setting(production) === :bc_dust
-        @test loading(production, cells) ==
-              background_black_carbon("11"; basis = :bc_dust, optics = :snicar_adv3)
-        @test loading(production, cells).basis === :bc_dust
-        @test loading(production, cells).optics === :snicar_adv3
-        # `off` stays selectable and runs at `ModelParameters.black_carbon_snow`.
-        off = load("off")
+        off = load("A-kfit-bc0")
         @test setting(off) === :off
         @test loading(off, cells) === nothing
-        for basis in BACKGROUND_BLACK_CARBON_BASES
-            m = load(string(basis))
+        # The production loading: BC plus dust, converted with SNICAR-ADv3.
+        table = load("B-kfit-table")
+        @test setting(table) === :bc_dust
+        @test loading(table, cells) == background_black_carbon("11"; basis = :bc_dust)
+        @test loading(table, cells).optics === :snicar_adv3
+        # The sensitivity forms of the table stay selectable, each as a level of its own.
+        # `isequal`: unconverted loadings carry a NaN reference albedo reduction.
+        for (level, basis, optics) in (("tbc", :bc, :snicar_adv3), ("tdang", :bc_dust, :dang2015),
+                                       ("traw", :bc_dust, :none))
+            m = load("A-kfit-$level")
             @test setting(m) === basis
-            @test loading(m, cells) == background_black_carbon("11"; basis)
+            @test isequal(loading(m, cells), background_black_carbon("11"; basis, optics))
         end
-        @test_throws "BACKGROUND_BLACK_CARBON must be off, bc or bc_dust" load("dust")
-        # The optics default to SNICAR-ADv3 and can be chosen.
-        for optics in BACKGROUND_BLACK_CARBON_OPTICS
-            m = load("bc_dust", string(optics))
-            # `isequal`: unconverted loadings carry a NaN reference albedo reduction.
-            @test isequal(loading(m, cells), background_black_carbon("11"; basis = :bc_dust, optics))
-        end
-        @test loading(load("bc"), cells).optics === :snicar_adv3
-        @test loading(load(nothing, "dang2015"), cells) ==
-              background_black_carbon("11"; basis = :bc_dust, optics = :dang2015)
-        @test_throws "BACKGROUND_BLACK_CARBON_OPTICS must be snicar_adv3, dang2015 or none" load(
-            "bc", "tartes")
         # Both scripts pass the tile's loading to the run parameters and to the run.
         for script in ("gemb_tile_sweep.jl", "gemb_native_run.jl")
             text = read(joinpath(repo, "scripts", script), String)

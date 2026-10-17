@@ -44,6 +44,7 @@ import NCDatasets
 import GeoParquet
 import GeoParquet.Parquet2
 import TOML
+import SHA
 # Read only to learn the span of the cached ERA5-Land record, from the Zarr groups the forcing
 # loader caches on disk.
 import Zarr
@@ -100,6 +101,7 @@ include("applied_downscaling.jl")
 export hypsometry_intervals, resolve_downscaling, AppliedDownscaling
 export DOWNSCALING_SOURCES, downscaling_source_counts, decoupling_factor_prior
 export APPLIED_LAPSE_RATE_STDERR_MAXIMUM, APPLIED_LAPSE_RATE_WINDOW
+export BAND_DECOUPLING_RULES, band_decoupling_rule
 
 include("forcing_cache.jl")
 export CachedForcingLoader, forcing_cache_capacity, forcing_cache_report
@@ -123,6 +125,12 @@ export dang2015_albedo_reduction, snicar_adv3_albedo_reduction, gs2010_equivalen
 export rgi_o1_region, tile_rgi_o1_region, tile_rgi_o1_region_shares
 export BACKGROUND_BLACK_CARBON_TABLE, BACKGROUND_BLACK_CARBON_BASES, BACKGROUND_BLACK_CARBON_OPTICS
 export SNICAR_ADV3_ALBEDO_TABLE, GS2010_EQUIVALENT_REFERENCE, RGI7_O1_REGIONS_FILE
+
+# The physics members a sweep can be run under. After the background loading, whose table reader
+# the effective loading shares; before the tile run, which records the member.
+include("physics_members.jl")
+export physics_member, physics_model_parameters, physics_member_parameters, effective_black_carbon
+export PHYSICS_GRAIN_VARIANTS, PHYSICS_BAND_DECOUPLING, PHYSICS_IMPURITY
 
 include("glacier_tile_run.jl")
 export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id

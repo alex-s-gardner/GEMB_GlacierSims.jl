@@ -3448,4 +3448,6 @@ include("test_pipeline_audit.jl")
 
 include("test_background_black_carbon.jl")
 
+include("test_physics_members.jl")
+
 include("test_run_launch.jl")

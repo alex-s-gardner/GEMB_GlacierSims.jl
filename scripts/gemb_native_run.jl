@@ -41,8 +41,8 @@
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
 # CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM,
-# BACKGROUND_BLACK_CARBON (bc_dust, the default; bc; off) and BACKGROUND_BLACK_CARBON_OPTICS
-# (snicar_adv3, the default; dang2015; none), both matching the reference tile sweep's
+# PHYSICS_MEMBER and EFFECTIVE_LOADING_TABLE (see run_settings.jl), both matching the reference tile
+# sweep's
 
 using GEMB_GlacierSims
 using GEMB_ClimateForcing
@@ -61,12 +61,13 @@ const CLIMATE_MODEL = :era5land
 const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", string(CLIMATE_MODEL)))
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
-const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "native_runs"))
+const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "native_runs", PHYSICS_MEMBER.id))
 
 # The calibration to apply: the `gemb_calibration` output of GlobalGlacierAnalysis.jl's reference
 # ensemble member. The member is the `reference_ensemble_file` its checkout declares (GGA_PROJECT, by
 # default the checkout beside this one), or REFERENCE_ENSEMBLE_FILE; FORCING_CORRECTIONS names the
-# correction file directly. Whichever is used must exist, or the run stops here.
+# correction file directly. Whichever is used must exist, or the run stops here. The member's fit is the
+# one GlobalGlacierAnalysis.jl made against this physics member's sweep.
 const GGA_PROJECT = get(ENV, "GGA_PROJECT",
                         joinpath(dirname(dirname(@__DIR__)), "GlobalGlacierAnalysis.jl"))
 const FORCING_CORRECTIONS_SOURCE =
@@ -75,10 +76,10 @@ const FORCING_CORRECTIONS_SOURCE =
     "reference member of $GGA_PROJECT"
 const FORCING_CORRECTIONS = haskey(ENV, "FORCING_CORRECTIONS") ? ENV["FORCING_CORRECTIONS"] :
     reference_forcing_corrections(get(() -> gga_reference_ensemble_file(GGA_PROJECT), ENV,
-                                      "REFERENCE_ENSEMBLE_FILE"))
+                                      "REFERENCE_ENSEMBLE_FILE"); physics_member = PHYSICS_MEMBER.id)
 # The tile sweep that correction was fitted against, whose stored run parameters this run must match:
-# by default the directory the sweep writes (`TILE_RUN_DIR`).
-const REFERENCE_TILE_DIR = get(ENV, "REFERENCE_TILE_DIR", joinpath(CLIMATE_CACHE, TILE_RUN_DIR))
+# by default the directory the sweep writes for this physics member (`tile_run_dir`).
+const REFERENCE_TILE_DIR = get(ENV, "REFERENCE_TILE_DIR", tile_run_dir(CLIMATE_CACHE))
 # How far a geotile the calibration did not fit may borrow a neighbour's correction.
 const CORRECTION_MAX_DISTANCE_KM = parse(Float64, get(ENV, "CORRECTION_MAX_DISTANCE_KM", "1000"))
 
@@ -128,7 +129,9 @@ function settings_rows()
         setting("spinup ceiling", "$(SPINUP_SIMULATION_YEARS_MAXIMUM) simulated years"),
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
+        physics_member_setting(),
         background_black_carbon_setting(),
+        effective_black_carbon_setting(),
         env_setting("columns per work unit", UNIT_COLUMNS, "UNIT_COLUMNS"),
         env_setting("worker blocks", NATIVE_BLOCKS, "NATIVE_BLOCKS"),
         let hint = Base.JLOptions().heap_size_hint
@@ -182,7 +185,7 @@ function main()
     mkpath(OUTPUT_DIR)
     claim_dir = joinpath(OUTPUT_DIR, CLAIM_SUBDIR)
     mkpath(claim_dir)
-    mp = GEMB.initialize_parameters(output_frequency = OUTPUT_FREQUENCY)
+    mp = physics_model_parameters(output_frequency = OUTPUT_FREQUENCY)
 
     @info "GEMB native-resolution run" units=length(order) tiles=length(selected) of=length(tiles) columns=Int(sum(weights)) block="$NATIVE_BLOCK/$NATIVE_BLOCKS" time_range=TIME_RANGE corrections=FORCING_CORRECTIONS output=OUTPUT_DIR
 
@@ -269,9 +272,11 @@ function run_native_unit(unit, mp, corrections; token, cache)
     basis = length(fit.time) == length(probe_time) && collect(fit.time) == probe_time ?
             :fitted : :climatology
     applied = resolve_downscaling(fit, intervals, probe_time; basis,
-                                  decoupling_factor_prior = decoupling_factor_prior(tile.core))
+                                  decoupling_factor_prior = decoupling_factor_prior(tile.core),
+                                  band_decoupling = PHYSICS_MEMBER.band_rule)
     # The reference tile's loading, so every cell runs at the value its tile run was calibrated with.
     black_carbon = tile_background_black_carbon(tile.core)
+    effective = tile_effective_black_carbon(tile.core)
     requested = tile_run_parameters(mp, applied;
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
@@ -280,7 +285,9 @@ function run_native_unit(unit, mp, corrections; token, cache)
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
-                                   background_black_carbon = black_carbon)
+                                   background_black_carbon = black_carbon,
+                                   effective_black_carbon = effective,
+                                   physics_member = PHYSICS_MEMBER)
     # A tile the reference sweep never wrote has no settings to check against, and no calibrated tile
     # behind its correction: skipped and counted rather than run unverified.
     reference = joinpath(REFERENCE_TILE_DIR, tile.name)
@@ -303,7 +310,7 @@ function run_native_unit(unit, mp, corrections; token, cache)
         try
             push!(rows, run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                                  token, cache, fit, intervals, basis, prior, modelled_intervals,
-                                 black_carbon))
+                                 black_carbon, effective))
         catch e
             e isa InterruptException && rethrow()
             GEMB_GlacierSims.is_caller_error(e) && rethrow()
@@ -397,7 +404,7 @@ function assert_matches_reference(reference, name, requested)
 end
 
 function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache,
-                  fit, intervals, basis, prior, modelled_intervals, black_carbon)
+                  fit, intervals, basis, prior, modelled_intervals, black_carbon, effective)
     t0 = time()
     path = joinpath(tile_dir, cell.name)
     row = first(eachrow(cell.core))
@@ -437,7 +444,8 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
     # The band forcing is built on the fetched steps, so the applied parameters are resolved onto them.
     if appending
         applied = resolve_downscaling(fit, intervals, probe_run_time(cell, token, cache, fetch_range);
-                                      basis, decoupling_factor_prior = prior)
+                                      basis, decoupling_factor_prior = prior,
+                                      band_decoupling = PHYSICS_MEMBER.band_rule)
     end
 
     local run
@@ -451,6 +459,8 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
                                convergence_drift_fac = SPINUP_DRIFT_FAC,
                                modelled_intervals,
                                background_black_carbon = black_carbon,
+                               effective_black_carbon = effective,
+                               physics_member = PHYSICS_MEMBER,
                                restart = appending ? restart : nothing)
     catch err
         err isa ForcingUpToDate &&

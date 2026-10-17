@@ -489,8 +489,16 @@ end
     @test gga_reference_ensemble_file(gga) == member
     # Its `gemb_calibration` output, named as GlobalGlacierAnalysis.jl names it.
     @test_throws "no `gemb_calibration` output for the reference ensemble member" reference_forcing_corrections(member)
-    fit = touch(joinpath(binned, "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_synthesized_gembfit.arrow"))
-    @test reference_forcing_corrections(member) == fit
+    fit_name = "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_synthesized_gembfit.arrow"
+    beside = touch(joinpath(binned, fit_name))
+    @test reference_forcing_corrections(member) == beside
+    # A physics member's fit is in that member's folder beside it, under the same name.
+    @test_throws "no `gemb_calibration` output" reference_forcing_corrections(
+        member; physics_member = "B-kfit-table")
+    fit = joinpath(binned, "gemb_physics", "B-kfit-table", fit_name)
+    mkpath(dirname(fit))
+    touch(fit)
+    @test reference_forcing_corrections(member; physics_member = "B-kfit-table") == fit
     @test_throws "is not an `…_aligned.jld2` file" reference_forcing_corrections(joinpath(binned, "x.jld2"))
     @test_throws "no GlobalGlacierAnalysis.jl source" gga_reference_ensemble_file(mktempdir())
     write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = joinpath(\"a\", \"b\")\n")
@@ -525,21 +533,32 @@ end
         fit, sweep, merge(reference_parameters, Dict("software_gemb_tree" => "d"^40)))
     @test_throws "reference nothing" assert_corrections_fitted_on(
         fit, sweep, delete!(copy(reference_parameters), "software_gemb_version"))
+    # A reference sweep run as a physics member needs a fit that records the member.
+    members = Dict("physics_member" => "B-kfit-table", "physics_grain" => "B",
+                   "physics_band_decoupling" => "kfit", "physics_impurity" => "table")
+    @test_throws "was run as physics member \"B-kfit-table\", but $provenance does not record physics_band_decoupling, physics_grain, physics_impurity, physics_member" assert_corrections_fitted_on(
+        fit, sweep, merge(reference_parameters, members))
+    record(sweep, Dict(trees..., "software_gemb_version" => "2.0.0", members...))
+    @test assert_corrections_fitted_on(fit, sweep, merge(reference_parameters, members)) === nothing
+    @test_throws "physics_member: fitted on \"B-kfit-table\", reference \"C-ks35-table\"" assert_corrections_fitted_on(
+        fit, sweep, merge(reference_parameters, members, Dict("physics_member" => "C-ks35-table")))
     # A record without the source trees cannot show which code the fit saw.
     record(sweep, Dict("software_gemb_version" => "2.0.0"))
     @test_throws "does not record software_gemb_tree" assert_corrections_fitted_on(fit, sweep)
 
-    # The tile sweep writes, and the native run reads, the same directory by default; the launcher
-    # agrees with the scripts.
+    # The tile sweep writes, and the native run reads, the same directory by default: the physics
+    # member's under `TILE_RUN_DIR`. The launcher agrees with the scripts.
     settings = Module()
     Base.eval(settings, :(using Dates))
-    Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
+    withenv("PHYSICS_MEMBER" => nothing) do
+        Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
+    end
     @test settings.TILE_RUN_DIR == "tile_runs_v2"
     for script in ("gemb_tile_sweep.jl", "gemb_native_run.jl")
-        @test occursin("joinpath(CLIMATE_CACHE, TILE_RUN_DIR)",
+        @test occursin("tile_run_dir(CLIMATE_CACHE)",
                        read(joinpath(_REPO, "scripts", script), String))
     end
-    @test occursin("OUTPUT_DIR=\"\${OUTPUT_DIR:-\$CLIMATE_CACHE/$(settings.TILE_RUN_DIR)}\"",
+    @test occursin("OUTPUT_DIR=\"\${OUTPUT_DIR:-\$CLIMATE_CACHE/$(settings.TILE_RUN_DIR)/\$PHYSICS_MEMBER}\"",
                    read(joinpath(_REPO, "scripts", "run_tile_sweep.sh"), String))
 
     # The native script's settings pass takes the corrections from the reference member, and stops when
@@ -554,7 +573,8 @@ end
     @test occursin("1950-01-02 .. 2026-08-14T23:00", out)       # the whole cached record
     @test occursin(r"spinup climatology +1951-01-01 \.\. 1980-12-31T23:00", out)
     @test occursin(fit, out)
-    @test occursin(joinpath(climate, "tile_runs_v2"), out)
+    @test occursin(joinpath(climate, "tile_runs_v2", "B-kfit-table"), out)
+    @test occursin(r"physics member +B-kfit-table", out)
     err = IOBuffer()
     @test !success(pipeline(native(mktempdir()); stdout = devnull, stderr = err))
     @test occursin("no GlobalGlacierAnalysis.jl source", String(take!(err)))

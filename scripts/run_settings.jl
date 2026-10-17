@@ -12,10 +12,11 @@
 
 const SHOW_SETTINGS = get(ENV, "SHOW_SETTINGS", "0") == "1"
 
-# The directory under `CLIMATE_CACHE` the tile sweep writes by default and the native run takes its
-# reference tile runs from, so the two agree without either being told. `run_tile_sweep.sh` carries the
-# same name. A new name is a new set of tile runs: GlobalGlacierAnalysis.jl reads every file in the
-# directory its GEMB run id names.
+# The directory under `CLIMATE_CACHE` holding one directory of tile runs per physics member
+# (`tile_run_dir`), which the tile sweep writes by default and the native run takes its reference tile
+# runs from, so the two agree without either being told. `run_tile_sweep.sh` carries the same name. A
+# new name is a new set of tile runs: GlobalGlacierAnalysis.jl reads every file in the directory its
+# GEMB run id and physics member name.
 const TILE_RUN_DIR = "tile_runs_v2"
 
 # The last calendar year of the default spinup climatology window, shared by the tile sweep and the
@@ -23,28 +24,70 @@ const TILE_RUN_DIR = "tile_runs_v2"
 # `SPINUP_CLIMATOLOGY_WINDOW` in `gemb_tile_sweep.jl`.
 const SPINUP_CLIMATOLOGY_LAST_YEAR = 1980
 
-# The regional background snow impurity loading (`background_black_carbon`), shared by the tile sweep
-# and the native run so that a native cell runs at its reference tile's loading. Production uses
-# `bc_dust` (the default): each tile's BC plus dust from its RGI 7.0 regions in
-# `data/background_black_carbon.csv`, converted with `BACKGROUND_BLACK_CARBON_OPTICS`. `bc` (BC only)
-# and `off` (every tile at `ModelParameters.black_carbon_snow`) are kept for sensitivity runs. A run
-# under a different setting records different run parameters, so its tiles are rebuilt rather than
-# appended to.
+# The physics member the tile sweep and the native run are run as (`GEMB_GlacierSims.physics_member`):
+# its grain-growth level sets the GEMB snow settings, its band decoupling level the `band_decoupling`
+# rule of `resolve_downscaling`, and its impurity level the snow impurity loading. Shared so that a
+# native cell runs as its reference tile's member. `PHYSICS_MEMBER` overrides the default, which is
+# Flanner & Zender grain growth with 350 kg m-3 fresh snow, the fitted band k, and the production
+# background impurity table; `run_tile_sweep.sh` and `run_native_sweep.sh` carry the same default.
+# Each member's tiles go to a directory of their own (`tile_run_dir`), so no two members' tiles share
+# a directory.
 import GEMB_GlacierSims
-const BACKGROUND_BLACK_CARBON = let v = get(ENV, "BACKGROUND_BLACK_CARBON", "bc_dust")
-    v == "off" ? :off :
-    Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES ? Symbol(v) :
-    error("BACKGROUND_BLACK_CARBON must be off, " *
-          join(GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_BASES, " or ") * "; got \"$v\"")
+const DEFAULT_PHYSICS_MEMBER = "B-kfit-table"
+const PHYSICS_MEMBER = GEMB_GlacierSims.physics_member(get(ENV, "PHYSICS_MEMBER", DEFAULT_PHYSICS_MEMBER))
+
+"""
+    tile_run_dir(climate_cache) -> String
+
+The directory of tile runs for `PHYSICS_MEMBER` under `climate_cache`:
+`<climate_cache>/<TILE_RUN_DIR>/<member>`. The tile sweep writes it by default and the native run
+takes its reference tiles from it.
+"""
+tile_run_dir(climate_cache) = joinpath(climate_cache, TILE_RUN_DIR, PHYSICS_MEMBER.id)
+
+"""
+    physics_model_parameters(; kwargs...) -> ModelParameters
+
+`GEMB.initialize_parameters` under `PHYSICS_MEMBER`'s grain level, with `kwargs` for every other
+field.
+"""
+physics_model_parameters(; kwargs...) =
+    GEMB_GlacierSims.physics_model_parameters(PHYSICS_MEMBER; kwargs...)
+
+# The regional background snow impurity loading (`background_black_carbon`), from the member's impurity
+# level: the production table (`bc_dust`, `snicar_adv3`) for `table`, the table's sensitivity forms for
+# `tbc` (`bc`), `tdang` (`dang2015` optics) and `traw` (`none`), and `off` for `bc0` and `cvis`.
+# `BACKGROUND_BLACK_CARBON` and `BACKGROUND_BLACK_CARBON_OPTICS`, when set, must name the same loading:
+# a stale `export` that disagrees with the member stops the script here instead of running a tile under
+# a member it is not.
+const BACKGROUND_BLACK_CARBON, BACKGROUND_BLACK_CARBON_OPTICS = let level = PHYSICS_MEMBER.impurity_level
+    basis = level.basis === :effective ? :off : level.basis
+    optics = basis === :off ? :snicar_adv3 : level.optics
+    for (var, value) in (("BACKGROUND_BLACK_CARBON", basis), ("BACKGROUND_BLACK_CARBON_OPTICS", optics))
+        haskey(ENV, var) || continue
+        basis === :off && var == "BACKGROUND_BLACK_CARBON_OPTICS" && continue
+        ENV[var] == string(value) || error(
+            "$var=$(ENV[var]) disagrees with physics member $(PHYSICS_MEMBER.id), whose impurity " *
+            "level $(PHYSICS_MEMBER.impurity) sets $(value); choose the loading with PHYSICS_MEMBER " *
+            "and unset $var")
+    end
+    basis, optics
 end
 
-# The reference optics the measured loading is converted to a Gardner & Sharp loading with:
-# `snicar_adv3` (the default, used in production), or `dang2015` and `none` (the measured loading
-# unconverted) for sensitivity runs.
-const BACKGROUND_BLACK_CARBON_OPTICS = let v = get(ENV, "BACKGROUND_BLACK_CARBON_OPTICS", "snicar_adv3")
-    Symbol(v) in GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_OPTICS ? Symbol(v) :
-    error("BACKGROUND_BLACK_CARBON_OPTICS must be " *
-          join(GEMB_GlacierSims.BACKGROUND_BLACK_CARBON_OPTICS, ", ", " or ") * "; got \"$v\"")
+# The effective loading table a `cvis` member reads (`EFFECTIVE_LOADING_TABLE`), and `nothing` for any
+# other member. Required for a `cvis` member and refused for the others, so a member is always run at
+# the loading its name says.
+const EFFECTIVE_LOADING_TABLE = let level = PHYSICS_MEMBER.impurity_level
+    path = get(ENV, "EFFECTIVE_LOADING_TABLE", nothing)
+    if level.basis === :effective
+        path === nothing && error("physics member $(PHYSICS_MEMBER.id) takes an effective loading; " *
+                                  "set EFFECTIVE_LOADING_TABLE to its regional table")
+        isfile(path) || error("EFFECTIVE_LOADING_TABLE=$path does not exist")
+    else
+        path === nothing || error("EFFECTIVE_LOADING_TABLE is set, but physics member " *
+                                  "$(PHYSICS_MEMBER.id) takes no effective loading")
+    end
+    path
 end
 
 """
@@ -57,11 +100,29 @@ tile_background_black_carbon(cells) = BACKGROUND_BLACK_CARBON === :off ? nothing
     GEMB_GlacierSims.background_black_carbon(cells; basis = BACKGROUND_BLACK_CARBON,
                                              optics = BACKGROUND_BLACK_CARBON_OPTICS)
 
+"""
+    tile_effective_black_carbon(cells) -> NamedTuple or nothing
+
+The `effective_black_carbon` keyword for a tile whose core is `cells`: the loading in
+`EFFECTIVE_LOADING_TABLE`, or `nothing` when the member takes none.
+"""
+tile_effective_black_carbon(cells) = EFFECTIVE_LOADING_TABLE === nothing ? nothing :
+    GEMB_GlacierSims.effective_black_carbon(cells, EFFECTIVE_LOADING_TABLE;
+                                            cap = PHYSICS_MEMBER.impurity_level.cap)
+
+physics_member_setting() =
+    env_setting("physics member", "$(PHYSICS_MEMBER.id) ($(PHYSICS_MEMBER.description))",
+                "PHYSICS_MEMBER")
+
 background_black_carbon_setting() =
-    env_setting("background snow black carbon",
-                BACKGROUND_BLACK_CARBON === :off ? "off" :
-                "$(BACKGROUND_BLACK_CARBON), $(BACKGROUND_BLACK_CARBON_OPTICS) optics",
-                "BACKGROUND_BLACK_CARBON")
+    setting("background snow black carbon",
+            BACKGROUND_BLACK_CARBON === :off ? "off" :
+            "$(BACKGROUND_BLACK_CARBON), $(BACKGROUND_BLACK_CARBON_OPTICS) optics", "physics member")
+
+effective_black_carbon_setting() =
+    env_setting("effective snow impurity table",
+                EFFECTIVE_LOADING_TABLE === nothing ? "none" : EFFECTIVE_LOADING_TABLE,
+                "EFFECTIVE_LOADING_TABLE")
 
 """
     setting(label, value, source = "default") -> NamedTuple

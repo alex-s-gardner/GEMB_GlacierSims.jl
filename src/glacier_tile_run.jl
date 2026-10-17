@@ -208,6 +208,12 @@ published 2° products exclude rain from their aggregates.
   given, every run of the tile uses its `black_carbon_snow` [ppmw] in place of `mp`'s, and the run
   parameters record the region shares, basis, optics, measured loading and source beside
   `model_black_carbon_snow`.
+- `effective_black_carbon = nothing`: an effective loading as [`effective_black_carbon`](@ref)
+  returns it, used in place of `mp.black_carbon_snow` as `background_black_carbon` is, with its
+  variant, region values and table checksum recorded. At most one of the two may be given.
+- `physics_member = nothing`: the [`physics_member`](@ref) this run is, or `nothing`. When given,
+  the run parameters name it (`physics_*`), and the tile throws before any GEMB run unless `mp`, the
+  band decoupling rule `applied` was resolved with, and the impurity loading are the ones it names.
 
 Every glacier area of the tile's hypsometry ends up in exactly one of `glacier_area_km2` (modelled),
 `dropped_area_km2` and `unrecovered_area_km2`, so `hypsometry_area_km2 = glacier_area_km2 +
@@ -246,9 +252,13 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            on_output = nothing,
                            modelled_intervals = nothing,
                            lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM,
-                           background_black_carbon = nothing)
-    background_black_carbon === nothing ||
-        (mp = _with_black_carbon_snow(mp, background_black_carbon.black_carbon_snow))
+                           background_black_carbon = nothing,
+                           effective_black_carbon = nothing,
+                           physics_member = nothing)
+    mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
+                                                         background_black_carbon,
+                                                         effective_black_carbon)
     0 <= lost_area_fraction_maximum <= 1 || throw(ArgumentError(
         "lost_area_fraction_maximum must be in [0, 1], got $(lost_area_fraction_maximum)"))
     delta_temperatures = collect(Float64, delta_temperatures)
@@ -303,7 +313,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                                      convergence_drift_fac, drift_window, donor_max_distance_km,
                                      climatology_method = SPINUP_CLIMATOLOGY_METHOD,
                                      climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS,
-                                     background_black_carbon)
+                                     background_black_carbon, effective_black_carbon,
+                                     physics_member)
 
     # Resuming: keep only forcing newer than the saved state, and let each run inherit its saved column
     # instead of spinning up again. The saved time is the last *output* time, and every forcing step up to
@@ -835,15 +846,23 @@ model parameters could not tell them apart.
 before the parameters are recorded and adds `background_black_carbon_*` keys: the largest region and
 every region's share, the basis and optics, the proxy region, the measured BC, dust and non-BC
 loadings, the reference albedo reduction and its grain radius and zenith angle (converted loadings
-only), and the source. Without it no such key is written.
+only), and the source. Without it no such key is written. `effective_black_carbon` does the same
+for an effective loading ([`effective_black_carbon`](@ref)), with `effective_black_carbon_*` keys; at
+most one of the two may be given.
+
+`physics_member`, a [`physics_member`](@ref), adds the `physics_*` keys that name it, after checking
+that `mp`, `applied` and the loading are the configuration it names.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
                              simulation_years_maximum = nothing, convergence_drift_fac = nothing,
                              drift_window = nothing, donor_max_distance_km = nothing,
                              climatology_method = nothing, climatology_n_years = nothing,
-                             background_black_carbon = nothing)
-    background_black_carbon === nothing ||
-        (mp = _with_black_carbon_snow(mp, background_black_carbon.black_carbon_snow))
+                             background_black_carbon = nothing, effective_black_carbon = nothing,
+                             physics_member = nothing)
+    mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
+                                                         background_black_carbon,
+                                                         effective_black_carbon)
     params = Dict{String,Any}("spinup_window_start" => string(spinup_window[1]),
                               "spinup_window_stop" => string(spinup_window[2]))
     # How the columns were settled. Two runs that spun up to different tolerances, or under different
@@ -872,6 +891,9 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     # current; the loading itself is `model_black_carbon_snow` below either way.
     background_black_carbon === nothing ||
         _record_background_black_carbon!(params, background_black_carbon)
+    effective_black_carbon === nothing ||
+        _record_effective_black_carbon!(params, effective_black_carbon)
+    physics_member === nothing || merge!(params, physics_member_parameters(physics_member))
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
@@ -888,4 +910,13 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
                                           for b in applied.bands])
     end
     return params
+end
+
+# `mp` at the snow impurity loading a tile runs under: the background or the effective loading when
+# one is given, `mp.black_carbon_snow` otherwise.
+function _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    background_black_carbon === nothing || effective_black_carbon === nothing || throw(ArgumentError(
+        "give a background loading or an effective loading, not both"))
+    loading = background_black_carbon === nothing ? effective_black_carbon : background_black_carbon
+    return loading === nothing ? mp : _with_black_carbon_snow(mp, loading.black_carbon_snow)
 end

@@ -100,19 +100,23 @@ function _geotile_center(id::AbstractString)
 end
 
 """
-    reference_forcing_corrections(reference_ensemble_file) -> String
+    reference_forcing_corrections(reference_ensemble_file; physics_member = nothing) -> String
 
 The `gemb_calibration` output GlobalGlacierAnalysis.jl writes for the ensemble member whose aligned
 binned file is `reference_ensemble_file` (`…_aligned.jld2`): `…_synthesized_gembfit.arrow` beside it.
 GlobalGlacierAnalysis.jl names the synthesized file by replacing `aligned.jld2` with `synthesized.jld2`
-and its fit by replacing `.jld2` with `_gembfit.arrow`. Throws when the name does not end in
-`_aligned.jld2` or the file does not exist.
+and its fit by replacing `.jld2` with `_gembfit.arrow`. A fit against a physics member's sweep is
+written to `gemb_physics/<member>/` under the same directory, with the same name; `physics_member` is
+that member's id. Throws when the name does not end in `_aligned.jld2` or the file does not exist.
 """
-function reference_forcing_corrections(reference_ensemble_file::AbstractString)
+function reference_forcing_corrections(reference_ensemble_file::AbstractString;
+                                       physics_member::Union{Nothing,AbstractString} = nothing)
     endswith(reference_ensemble_file, "_aligned.jld2") || throw(ArgumentError(
         "the reference ensemble member $reference_ensemble_file is not an `…_aligned.jld2` file, " *
         "so its `gemb_calibration` output cannot be named"))
     path = replace(reference_ensemble_file, r"aligned\.jld2$" => "synthesized_gembfit.arrow")
+    physics_member === nothing ||
+        (path = joinpath(dirname(path), "gemb_physics", physics_member, basename(path)))
     isfile(path) || throw(ArgumentError(
         "no `gemb_calibration` output for the reference ensemble member at $path; run the " *
         "calibration for that member, or name the correction file with FORCING_CORRECTIONS"))
@@ -216,6 +220,14 @@ function assert_corrections_fitted_on(corrections::AbstractString, reference_dir
         "$path does not record $(join(absent, ", ")), so the code the fitted tile runs came from " *
         "is unknown"))
     reference_parameters === nothing && return nothing
+    # A reference sweep run as a physics member must have been fitted as that member, which the
+    # provenance can only show by recording the member.
+    member_keys = [k for k in keys(reference_parameters) if startswith(k, "physics_")]
+    unrecorded = sort!([k for k in member_keys if !haskey(recorded, k)])
+    isempty(unrecorded) || throw(ArgumentError(
+        "the reference sweep $reference_dir was run as physics member " *
+        "$(repr(get(reference_parameters, "physics_member", nothing))), but $path does not record " *
+        "$(join(unrecorded, ", ")), so nothing shows the corrections were fitted on that member"))
     differences = String[]
     for key in sort!(collect(keys(recorded)))
         stored = get(reference_parameters, key, nothing)

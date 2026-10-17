@@ -1,0 +1,260 @@
+"""
+Physics members: the unresolved physics choices a tile sweep can be run under, so that the calibrated
+fluxes can be compared across them.
+
+A member is one level of each of three factors, written `<grain>-<band decoupling>-<impurity>`, for
+example `"C-ks35-table"`:
+
+- grain growth and fresh snow ([`PHYSICS_GRAIN_VARIANTS`](@ref)): `A`, `B`, `C`;
+- the band decoupling factor rule ([`PHYSICS_BAND_DECOUPLING`](@ref)): `kfit`, `ks22`, `ks35`,
+  `kc077`, `kc100`;
+- the fresh-snow impurity loading ([`PHYSICS_IMPURITY`](@ref)): `table`, `tbc`, `tdang`, `traw`,
+  `bc0`, `cvis`.
+
+Each level fixes every setting it is about, so a member names one model configuration whatever the
+GEMB defaults are. [`tile_run_parameters`](@ref) records the member and its three levels as
+`physics_*` run parameters and refuses a member whose settings disagree with the model parameters,
+the downscaling resolution or the impurity loading the run actually uses. The model settings
+themselves stay in the `model_*`, `downscaling_*` and `*_black_carbon_*` parameters, which is what a
+restart compares.
+"""
+
+"""
+    PHYSICS_GRAIN_VARIANTS
+
+Grain-growth and fresh-snow levels of a physics member, as the `ModelParameters` fields each sets:
+
+- `A`: `:hybrid` grain growth (Brun/Marbouty below 400 kg m⁻³), 350 kg m⁻³ fresh snow, `:Arthern`
+  densification;
+- `B`: Flanner & Zender (2006) grain growth (`:FlannerZender2006`), otherwise as `A`;
+- `C`: Flanner & Zender (2006) grain growth with van Kampenhout et al. (2017) fresh-snow density,
+  `:Crocus` densification and destructive metamorphism, the pairing GEMB documents for that density.
+"""
+const PHYSICS_GRAIN_VARIANTS = (
+    A = (; description = "hybrid grain growth; 350 kg m-3 fresh snow; Arthern densification",
+         model = (; grain_growth_method = :hybrid, new_snow_method = :Constant350,
+                  densification_method = :Arthern, destructive_metamorphism = false)),
+    B = (; description = "Flanner & Zender (2006) grain growth; 350 kg m-3 fresh snow; " *
+                         "Arthern densification",
+         model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :Constant350,
+                  densification_method = :Arthern, destructive_metamorphism = false)),
+    C = (; description = "Flanner & Zender (2006) grain growth; van Kampenhout et al. (2017) " *
+                         "fresh snow; Crocus densification with destructive metamorphism",
+         model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017,
+                  densification_method = :Crocus, destructive_metamorphism = true)),
+)
+
+"""
+    PHYSICS_BAND_DECOUPLING
+
+Band decoupling levels of a physics member, as the `band_decoupling` rule
+[`resolve_downscaling`](@ref) applies to every band's `k`:
+
+- `kfit`: the resolved ERA5-Land fit;
+- `ks22`, `ks35`: `min(1, s·k)` with `s` = 2.2 and 3.5;
+- `kc077`, `kc100`: one constant `k`, 0.77 and 1.0.
+"""
+const PHYSICS_BAND_DECOUPLING = (
+    kfit = (; description = "fitted band k", rule = (; rule = :fitted)),
+    ks22 = (; description = "min(1, 2.2 k)", rule = (; rule = :scaled, scale = 2.2)),
+    ks35 = (; description = "min(1, 3.5 k)", rule = (; rule = :scaled, scale = 3.5)),
+    kc077 = (; description = "constant k = 0.77", rule = (; rule = :constant, constant = 0.77)),
+    kc100 = (; description = "constant k = 1.0", rule = (; rule = :constant, constant = 1.0)),
+)
+
+"""
+    PHYSICS_IMPURITY
+
+Fresh-snow impurity levels of a physics member:
+
+- `table`: the regional background table, black carbon plus dust converted with SNICAR-ADv3 optics
+  ([`background_black_carbon`](@ref), `basis = :bc_dust`, `optics = :snicar_adv3`), the production
+  loading;
+- `tbc`: the table's black carbon alone, SNICAR-ADv3 optics (`basis = :bc`);
+- `tdang`, `traw`: black carbon plus dust converted with the Dang et al. (2015) optics, or
+  unconverted (`optics = :dang2015`, `:none`);
+- `bc0`: no loading (`black_carbon_snow = 0`);
+- `cvis`: the effective loading fitted to MODIS shortwave albedo for the member's grain variant,
+  capped at 0.045 ppmw, read from a regional table ([`effective_black_carbon`](@ref)). 0.045 ppmw is
+  the largest absorber that MCD43C3 visible white-sky albedo allows on the Arctic ice caps once its
+  deficit over nearly pure Antarctic snow is removed. Regions the table gives the background value
+  keep it.
+"""
+const PHYSICS_IMPURITY = (
+    table = (; description = "regional background table, BC + dust, SNICAR-ADv3 optics",
+             basis = :bc_dust, optics = :snicar_adv3),
+    tbc = (; description = "regional background table, BC only, SNICAR-ADv3 optics",
+           basis = :bc, optics = :snicar_adv3),
+    tdang = (; description = "regional background table, BC + dust, Dang et al. (2015) optics",
+             basis = :bc_dust, optics = :dang2015),
+    traw = (; description = "regional background table, BC + dust, unconverted",
+            basis = :bc_dust, optics = :none),
+    bc0 = (; description = "no snow impurity", basis = :off),
+    cvis = (; description = "MODIS effective loading capped at 0.045 ppmw",
+            basis = :effective, cap = 0.045),
+)
+
+"""
+    physics_member(id::AbstractString) -> NamedTuple
+
+The physics member `id` = `"<grain>-<band decoupling>-<impurity>"` (see the module notes above), as
+`(; id, grain, band_decoupling, impurity, model, band_rule, impurity_level, description)`: the three
+level names as `Symbol`s, the `ModelParameters` fields the grain level sets, the `band_decoupling`
+keyword for [`resolve_downscaling`](@ref), and the impurity level. Throws for an unknown level or a
+malformed id.
+"""
+function physics_member(id::AbstractString)
+    parts = split(id, '-')
+    length(parts) == 3 || throw(ArgumentError(
+        "a physics member is \"<grain>-<band decoupling>-<impurity>\", e.g. \"C-ks35-table\"; " *
+        "got \"$id\""))
+    grain, k, impurity = Symbol.(parts)
+    _check_level(grain, PHYSICS_GRAIN_VARIANTS, "grain variant", id)
+    _check_level(k, PHYSICS_BAND_DECOUPLING, "band decoupling level", id)
+    _check_level(impurity, PHYSICS_IMPURITY, "impurity level", id)
+    g = PHYSICS_GRAIN_VARIANTS[grain]
+    d = PHYSICS_BAND_DECOUPLING[k]
+    i = PHYSICS_IMPURITY[impurity]
+    return (; id = String(id), grain, band_decoupling = k, impurity, model = g.model,
+            band_rule = d.rule, impurity_level = i,
+            description = "$(g.description) | $(d.description) | $(i.description)")
+end
+
+_check_level(level, table, what, id) = haskey(table, level) || throw(ArgumentError(
+    "unknown $what \"$level\" in physics member \"$id\"; one of $(join(keys(table), ", "))"))
+
+"""
+    physics_model_parameters(member; kwargs...) -> ModelParameters
+
+`GEMB.initialize_parameters` under `member`'s grain level, with `kwargs` for every other field.
+Throws when `kwargs` sets a field the member sets, so a run cannot be labelled with a member whose
+grain settings it overrode.
+"""
+function physics_model_parameters(member; kwargs...)
+    clash = intersect(keys(kwargs), keys(member.model))
+    isempty(clash) || throw(ArgumentError(
+        "physics member $(member.id) sets $(join(clash, ", ")); remove it from the keywords"))
+    return GEMB.initialize_parameters(; kwargs..., member.model...)
+end
+
+"""
+    physics_member_parameters(member) -> Dict{String,Any}
+
+The run parameters that name `member`: `physics_member` (its id), `physics_grain`,
+`physics_band_decoupling` and `physics_impurity` (its levels).
+"""
+physics_member_parameters(member) = Dict{String,Any}(
+    "physics_member" => member.id,
+    "physics_grain" => string(member.grain),
+    "physics_band_decoupling" => string(member.band_decoupling),
+    "physics_impurity" => string(member.impurity))
+
+# Throw unless a run under `mp`, `applied`, `background_black_carbon` and `effective_black_carbon` is
+# the configuration `member` names.
+function _assert_physics_member(member, mp::ModelParameters, applied, background_black_carbon,
+                                effective_black_carbon)
+    for (field, value) in pairs(member.model)
+        getproperty(mp, field) == value || throw(ArgumentError(
+            "physics member $(member.id) sets $field = $(repr(value)), but the run's " *
+            "ModelParameters has $(repr(getproperty(mp, field)))"))
+    end
+    # An `AppliedDownscaling` built without a rule (by hand, or by a resolution predating the keyword)
+    # applied none, which is the `:fitted` rule.
+    recorded = (; rule = get(applied.settings, "downscaling_band_decoupling_rule", "fitted"),
+                scale = get(applied.settings, "downscaling_band_decoupling_scale", "none"),
+                constant = get(applied.settings, "downscaling_band_decoupling_constant", "none"))
+    rule = band_decoupling_rule(member.band_rule)
+    expected = (; rule = string(rule.rule), rule.scale, rule.constant)
+    recorded == expected || throw(ArgumentError(
+        "physics member $(member.id) applies band decoupling $expected, but the downscaling was " *
+        "resolved with $recorded"))
+    level = member.impurity_level
+    if level.basis === :off
+        (background_black_carbon === nothing && effective_black_carbon === nothing) ||
+            throw(ArgumentError("physics member $(member.id) runs without a snow impurity loading, " *
+                                "but one was given"))
+    elseif level.basis === :effective
+        effective_black_carbon === nothing && throw(ArgumentError(
+            "physics member $(member.id) needs an effective loading (`effective_black_carbon`)"))
+        effective_black_carbon.cap == level.cap || throw(ArgumentError(
+            "physics member $(member.id) caps the effective loading at $(level.cap) ppmw, but the " *
+            "loading given is capped at $(effective_black_carbon.cap)"))
+        background_black_carbon === nothing || throw(ArgumentError(
+            "physics member $(member.id) takes the effective loading, not the background table"))
+        startswith(effective_black_carbon.variant, string(member.grain)) || throw(ArgumentError(
+            "physics member $(member.id) has grain variant $(member.grain), but the effective " *
+            "loading was fitted for variant $(effective_black_carbon.variant)"))
+    else
+        background_black_carbon === nothing && throw(ArgumentError(
+            "physics member $(member.id) needs the background loading (`background_black_carbon`)"))
+        effective_black_carbon === nothing || throw(ArgumentError(
+            "physics member $(member.id) takes the background table, not an effective loading"))
+        (background_black_carbon.basis === level.basis &&
+         background_black_carbon.optics === level.optics) || throw(ArgumentError(
+            "physics member $(member.id) takes the background table with basis :$(level.basis) " *
+            "and optics :$(level.optics), but the loading given has basis " *
+            ":$(background_black_carbon.basis) and optics :$(background_black_carbon.optics)"))
+    end
+    return nothing
+end
+
+"""
+    effective_black_carbon(cells, path; cap = Inf) -> NamedTuple
+
+The effective fresh-snow impurity loading for the tile whose core is `cells`, from the regional table
+at `path`: the glacier-area weighted mean, over the RGI 7.0 o1 regions of `cells`
+([`tile_rgi_o1_region_shares`](@ref)), of each region's `black_carbon_snow` [ppmw, Gardner & Sharp
+(2010) equivalent] capped at `cap`.
+
+The table is a CSV with at least the columns `rgi_o1region`, `black_carbon_snow` and `variant` (the
+grain variant the loading was fitted for, e.g. `C0`), one row per region, and one variant throughout.
+Throws when a column is missing, a region of the tile has no row or more than one, a loading lies
+outside GEMB's `[0, 2]` ppmw, or the table mixes variants.
+
+Returns `(; black_carbon_snow, variant, cap, region_shares, region_values, table_file,
+table_sha256)`, with `region_values` the capped values.
+"""
+function effective_black_carbon(cells::AbstractDataFrame, path::AbstractString; cap::Real = Inf)
+    cap > 0 || throw(ArgumentError("the cap on an effective loading must be positive, got $cap"))
+    isfile(path) || throw(ArgumentError("no effective-loading table at $path"))
+    raw = _read_csv_strings(path)
+    absent = setdiff(["rgi_o1region", "black_carbon_snow", "variant"], names(raw))
+    isempty(absent) || throw(ArgumentError(
+        "effective-loading table $path lacks column(s) $(join(absent, ", "))"))
+    variants = unique(String.(strip.(raw.variant)))
+    length(variants) == 1 || throw(ArgumentError(
+        "effective-loading table $path holds variants $(join(variants, ", ")); it must hold one"))
+    regions = String.(strip.(raw.rgi_o1region))
+    shares = tile_rgi_o1_region_shares(cells)
+    values = map(shares) do (region, _)
+        rows = findall(==(region), regions)
+        length(rows) == 1 || throw(ArgumentError(
+            "effective-loading table $path has $(length(rows)) rows for RGI region $region; it " *
+            "needs one"))
+        v = tryparse(Float64, strip(String(raw.black_carbon_snow[only(rows)])))
+        (v !== nothing && 0 <= v <= _BLACK_CARBON_SNOW_MAXIMUM) || throw(ArgumentError(
+            "effective-loading table $path gives region $region a loading of " *
+            "$(raw.black_carbon_snow[only(rows)]); it must be in [0, $(_BLACK_CARBON_SNOW_MAXIMUM)] " *
+            "ppmw"))
+        region => min(v, Float64(cap))
+    end
+    value = sum(last(s) * last(v) for (s, v) in zip(shares, values))
+    return (; black_carbon_snow = value, variant = only(variants), cap = Float64(cap),
+            region_shares = shares,
+            region_values = values, table_file = basename(path),
+            table_sha256 = bytes2hex(open(SHA.sha256, path)))
+end
+
+# The run settings an effective loading adds to `tile_run_parameters`, beside the
+# `model_black_carbon_snow` every run records.
+function _record_effective_black_carbon!(params, ebc)
+    params["effective_black_carbon_variant"] = ebc.variant
+    params["effective_black_carbon_cap"] = isfinite(ebc.cap) ? ebc.cap : "none"
+    params["effective_black_carbon_region_shares"] =
+        join(("$r:$(round(s; digits = 4))" for (r, s) in ebc.region_shares), ",")
+    params["effective_black_carbon_region_values"] =
+        join(("$r:$v" for (r, v) in ebc.region_values), ",")
+    params["effective_black_carbon_table_file"] = ebc.table_file
+    params["effective_black_carbon_table_sha256"] = ebc.table_sha256
+    return params
+end

@@ -28,8 +28,8 @@
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
-# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, BACKGROUND_BLACK_CARBON (bc_dust, the
-# default; bc; off), BACKGROUND_BLACK_CARBON_OPTICS (snicar_adv3, the default; dang2015; none)
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, PHYSICS_MEMBER (see run_settings.jl),
+# EFFECTIVE_LOADING_TABLE (for a `cvis` member)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
@@ -58,8 +58,9 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", s
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 # Overridable so a timing probe on a reduced perturbation grid can share the forcing cache without
 # writing files the production sweep would then have to recognise as a different experiment and rebuild.
-# The default is the directory the native run takes as its reference (`TILE_RUN_DIR`).
-const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, TILE_RUN_DIR))
+# The default is the directory the native run takes as its reference: the physics member's under
+# `TILE_RUN_DIR` (`tile_run_dir`).
+const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", tile_run_dir(CLIMATE_CACHE))
 
 # Must match the gridding the parameter tiles were derived on, or a tile's parameters describe a
 # different neighbourhood than its cells. The parameter files record their own `tile_size`/`tile_buffer`,
@@ -238,6 +239,7 @@ function settings_rows()
                 "$(length(DELTA_TEMPERATURES)) × $(length(PRECIPITATION_SCALINGS)) = " *
                 "$(length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS))"),
         setting("bare-ice albedo", albedo_profile_sample(), "parameter tiles"),
+        physics_member_setting(),
         setting("spinup climatology", SPINUP_CLIMATOLOGY_WINDOW,
                 haskey(ENV, "SPINUP_CLIMATOLOGY_START") || haskey(ENV, "SPINUP_CLIMATOLOGY_STOP") ?
                 "ENV[SPINUP_CLIMATOLOGY_START/STOP]" : "default"),
@@ -246,6 +248,7 @@ function settings_rows()
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
         background_black_carbon_setting(),
+        effective_black_carbon_setting(),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         # From JLOptions, not ENV: this is the value the collector acts on, so a hint lost on its way to
         # the worker shows up here as "none" instead of being reported as if it had taken effect.
@@ -332,7 +335,7 @@ function main()
     mkpath(OUTPUT_DIR)
     claim_dir = joinpath(OUTPUT_DIR, CLAIM_SUBDIR)
     mkpath(claim_dir)
-    mp = GEMB.initialize_parameters(output_frequency = OUTPUT_FREQUENCY)
+    mp = physics_model_parameters(output_frequency = OUTPUT_FREQUENCY)
 
     @info "GEMB tile sweep" candidates=length(order) of=length(tiles) block="$TILE_BLOCK/$TILE_BLOCKS" time_range=TIME_RANGE output_frequency=OUTPUT_FREQUENCY perturbations="$(length(DELTA_TEMPERATURES))x$(length(PRECIPITATION_SCALINGS))" threads=Threads.nthreads() output=OUTPUT_DIR
 
@@ -409,8 +412,10 @@ function run_tile(i, tile, name, path, mp; token, cache)
     basis = length(fit.time) == length(probe_time) && collect(fit.time) == probe_time ?
             :fitted : :climatology
     prior = decoupling_factor_prior(tile.core)
-    applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior)
+    applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
+                                  band_decoupling = PHYSICS_MEMBER.band_rule)
     black_carbon = tile_background_black_carbon(tile.core)
+    effective = tile_effective_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current
     # against another and the change never takes effect. `run_parameter_differences` only compares keys
     # present in *both* dicts, so a setting omitted here is a setting the skip test cannot notice —
@@ -423,7 +428,9 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
-                                   background_black_carbon = black_carbon)
+                                   background_black_carbon = black_carbon,
+                                   effective_black_carbon = effective,
+                                   physics_member = PHYSICS_MEMBER)
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :
@@ -461,7 +468,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
     # the same axis. Under `:climatology` this changes no setting the run records.
     if appending
         applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
-                                      basis, decoupling_factor_prior = prior)
+                                      basis, decoupling_factor_prior = prior,
+                                      band_decoupling = PHYSICS_MEMBER.band_rule)
     end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps
@@ -485,6 +493,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                 convergence_drift_fac = SPINUP_DRIFT_FAC,
                                 donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                 background_black_carbon = black_carbon,
+                                effective_black_carbon = effective,
+                                physics_member = PHYSICS_MEMBER,
                                 restart = appending ? restart : nothing)
     catch err
         # The record grew by less than one usable step. Not a failure: the file already says everything
