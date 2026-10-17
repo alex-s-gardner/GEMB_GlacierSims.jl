@@ -82,7 +82,7 @@ function write_column_profiles_netcdf(path::AbstractString, r::ColumnProfileReco
             "no column profile for band $b m at ΔT $t, pscale $p; the run did not reach the recorder"))
     end
     nl = maximum((c === nothing ? 0 : length(c.dz)) for v in values(r.profiles) for c in v; init = 1)
-    dz = fill(NaN, nl, nd, nb, nt, np); rho = similar(dz); age = similar(dz)
+    dz = fill(NaN, nl, nd, nb, nt, np); rho = fill(NaN, size(dz)); age = fill(NaN, size(dz))
     sample = fill(NaN, nd, nb, nt, np); nlay = zeros(Int32, nd, nb, nt, np)
     for (ib, b) in pairs(r.band_centers), (it, t) in pairs(dts), (ip, p) in pairs(pss)
         for (id, c) in pairs(r.profiles[(b, t, p)])

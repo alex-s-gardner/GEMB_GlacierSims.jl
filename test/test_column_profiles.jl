@@ -45,6 +45,24 @@
             path, recorder; tile_name = "N46_E010", delta_temperatures = [0.0, 1.0],
             precipitation_scalings = [1.0])
         @test_throws "mass_max must be positive" ColumnProfileRecorder([1150.0], dates; mass_max = 0)
+
+        # Every slot below a profile's last layer, and every slot of a date with no profile, is NaN in
+        # each of dz, density and age, so the file's contents depend on the profiles alone.
+        padded = ColumnProfileRecorder([1150.0], [dates[1], DateTime(1990, 1, 1)]; mass_max = 300.0)
+        padded(outputs[1150.0]; band = (; center = 1150.0), delta = 0.0, pscale = 1.0)
+        ppath = joinpath(mktempdir(), "padded.nc")
+        write_column_profiles_netcdf(ppath, padded; tile_name = "N46_E010", delta_temperatures = [0.0],
+                                     precipitation_scalings = [1.0])
+        GEMB_GlacierSims.NCDatasets.NCDataset(ppath) do ds
+            # Dates are held in ascending order: 1990 (outside the record), then dates[1].
+            n = Int.(ds["n_layers"].var[:, 1, 1, 1])
+            @test n[1] == 0 && n[2] > 0
+            for v in ("dz", "density", "age")
+                raw = ds[v].var[:, :, 1, 1, 1]
+                @test all(isnan, raw[:, 1]) && all(isnan, raw[n[2]+1:end, 2])
+                @test !any(isnan, raw[1:n[2], 2])
+            end
+        end
     end
 
     @testset "the sweep's setting" begin
