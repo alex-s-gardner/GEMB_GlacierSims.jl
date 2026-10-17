@@ -54,12 +54,15 @@ end
         # More impurity, more reduction, under either illumination.
         for ill in (:direct, :diffuse)
             @test issorted([red(b, 0.0; illumination = ill) for b in (0.0, 1, 2, 5, 10, 20, 50, 100)])
-            @test issorted([red(0.0, d; illumination = ill) for d in (0.0, 0.5, 1, 2, 5, 10, 20)])
+            @test issorted([red(0.0, d; illumination = ill) for d in (0.0, 0.5, 1, 2, 5, 10, 20, 30, 40, 50)])
         end
         # Coarser grains are darkened more by the same BC (Flanner et al. 2021 p. 7688).
         @test snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 500) >
               snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 100)
         @test_throws DomainError red(150.0, 0.0)
+        # The dust axis covers the table's largest dust value (34 µg/g, region 01's high end).
+        @test red(0.0, 34.0) ≈ 0.6 * red(0.0, 30.0) + 0.4 * red(0.0, 40.0)
+        @test_throws DomainError red(0.0, 60.0)
         @test_throws "not tabulated" snicar_adv3_albedo_reduction(10.0, 0.0; radius_um = 250)
     end
 

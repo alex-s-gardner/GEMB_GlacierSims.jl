@@ -40,7 +40,7 @@ const BACKGROUND_BLACK_CARBON_TABLE =
 """
 Path of the vendored SNICAR-ADv3 albedo table: broadband albedo of optically semi-infinite snow with
 columns `illumination` (`direct`, `diffuse`), `radius_um`, `bc_ng_g`, `dust_ug_g`, `albedo`, over
-radii 50–500 µm, BC 0–100 ng g⁻¹ and dust 0–20 µg g⁻¹. Written by `scripts/snicar_adv3_albedo_grid.m`
+radii 50–500 µm, BC 0–100 ng g⁻¹ and dust 0–50 µg g⁻¹. Written by `scripts/snicar_adv3_albedo_grid.m`
 with SNICAR-ADv3 (Flanner et al. 2021, GMD 14, doi:10.5194/gmd-14-7673-2021; code
 github.com/mflanner/SNICARv3 at a122b20) for spheres, uncoated BC, Saharan dust, the merged
 Picard et al. (2016) ice refractive index, the sub-Arctic summer atmosphere, and a direct beam at a
@@ -80,8 +80,9 @@ const BACKGROUND_BLACK_CARBON_OPTICS = (:snicar_adv3, :dang2015, :none)
 """
 Grain radius [µm] and geometry of the conversion to a Gardner & Sharp loading: semi-infinite snow
 of 200 µm grains under a direct beam at a 49.5° solar zenith angle and clear sky (Dang et al. 2015's
-clear-sky geometry). Against SNICAR-ADv3 the converted loading varies by at most 5 % over 50–500 µm
-grains at any tabulated BC and dust loading, so one radius serves every grain size in that range.
+clear-sky geometry). Against SNICAR-ADv3 the converted loading varies over 50–500 µm grains by at most
+3 % for BC, 5 % for dust up to 20 µg g⁻¹ and 7.4 % at 50 µg g⁻¹, so one radius serves every grain size
+in that range.
 """
 const GS2010_EQUIVALENT_REFERENCE = (; radius_um = 200.0, solar_zenith_angle = 49.5,
                                      cloud_optical_thickness = 0.0, illumination = :direct)

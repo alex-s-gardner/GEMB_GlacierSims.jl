@@ -16,7 +16,7 @@
 function snicar_adv3_albedo_grid(path)
 radii = [50 100 200 300 500];
 bcs   = [0 1 2 5 10 20 30 50 100];
-dusts = [0 0.5 1 2 5 10 20];
+dusts = [0 0.5 1 2 5 10 20 30 40 50];
 edges = [0.05 0.5 1.25 2.5 5.0 50];
 cdf = 0.5*(1 + erf(log(edges/1.75)/(log(2)*sqrt(2))));
 fr = diff(cdf); fr = fr/sum(fr);
