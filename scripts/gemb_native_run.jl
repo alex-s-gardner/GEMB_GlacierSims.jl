@@ -271,9 +271,10 @@ function run_native_unit(unit, mp, corrections; token, cache)
     probe_time = probe_run_time(tile, token, cache)
     basis = length(fit.time) == length(probe_time) && collect(fit.time) == probe_time ?
             :fitted : :climatology
+    band_rule = tile_band_decoupling(tile, intervals)
     applied = resolve_downscaling(fit, intervals, probe_time; basis,
-                                  decoupling_factor_prior = decoupling_factor_prior(tile.core),
-                                  band_decoupling = PHYSICS_MEMBER.band_rule)
+                                  decoupling_factor_prior = tile_decoupling_factor_prior(tile),
+                                  band_decoupling = band_rule)
     # The reference tile's loading, so every cell runs at the value its tile run was calibrated with.
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
@@ -301,7 +302,7 @@ function run_native_unit(unit, mp, corrections; token, cache)
     # The bands the reference tile run modelled: an interval it dropped is dropped from every cell, so
     # the two runs drop the same intervals.
     modelled_intervals = reference_status(reference).band_edges
-    prior = decoupling_factor_prior(tile.core)
+    prior = tile_decoupling_factor_prior(tile)
 
     mkpath(tile_dir)
     rows = NamedTuple[]
@@ -309,8 +310,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
         t0 = time()
         try
             push!(rows, run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
-                                 token, cache, fit, intervals, basis, prior, modelled_intervals,
-                                 black_carbon, effective))
+                                 token, cache, fit, intervals, basis, prior, band_rule,
+                                 modelled_intervals, black_carbon, effective))
         catch e
             e isa InterruptException && rethrow()
             GEMB_GlacierSims.is_caller_error(e) && rethrow()
@@ -404,7 +405,8 @@ function assert_matches_reference(reference, name, requested)
 end
 
 function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp; token, cache,
-                  fit, intervals, basis, prior, modelled_intervals, black_carbon, effective)
+                  fit, intervals, basis, prior, band_rule, modelled_intervals, black_carbon,
+                  effective)
     t0 = time()
     path = joinpath(tile_dir, cell.name)
     row = first(eachrow(cell.core))
@@ -445,7 +447,7 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
     if appending
         applied = resolve_downscaling(fit, intervals, probe_run_time(cell, token, cache, fetch_range);
                                       basis, decoupling_factor_prior = prior,
-                                      band_decoupling = PHYSICS_MEMBER.band_rule)
+                                      band_decoupling = band_rule)
     end
 
     local run

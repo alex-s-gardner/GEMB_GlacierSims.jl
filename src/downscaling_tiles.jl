@@ -330,6 +330,9 @@ unconditionally.
   `decoupling_factor_prior`: how the fits are turned into applied parameters, forwarded to
   [`resolve_downscaling`](@ref). These affect **only** the interval forcing, since that is the only
   thing here that applies a fit; the stored fits themselves are always raw.
+- `glacier_fraction_form = :fraction`: the [`GLACIER_FRACTION_FORMS`](@ref) form of `glm` in the
+  fits, or a function `tile -> form` choosing it per tile. Recorded in each file and compared on a
+  re-run, so a tile derived under another form is re-derived.
 - `derive_albedo = true`: also derive each tile's observed bare-ice albedo profile
   ([`derive_bare_ice_albedo`](@ref)) over its **buffered** cells, and store it in the tile file, so
   every elevation class can be run at a measured `albedo_ice` instead of a tuned constant. Pooling
@@ -382,6 +385,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                                             lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                                             decoupling_factor_prior = nothing,
+                                            glacier_fraction_form = :fraction,
                                             derive_albedo::Bool = true,
                                             dem_cache_path::Union{Nothing,AbstractString} = nothing,
                                             precision::Type = Float32,
@@ -418,6 +422,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
         # gate — not this loop — owns the coordination, so the sweep needs no notion of workers.
         tile_gate === nothing || tile_gate(tile, path) || continue
         t0 = time()
+        form = glacier_fraction_form isa Symbol ? glacier_fraction_form : glacier_fraction_form(tile)
         try
             # --- pre-flight, before any forcing I/O ------------------------------------------
             # The whole point of reading the status first: for a re-run most tiles are already done,
@@ -425,7 +430,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
             status = read_downscaling_tile_status(path)
             if !force && status !== nothing &&
                _tile_is_current(status, time_range; climate_model, tile_size, buffer, min_cells,
-                                area_minimum, retain_elevation_interval_forcing)
+                                area_minimum, retain_elevation_interval_forcing,
+                                glacier_fraction_form = form)
                 @info "Tile already covers the request; skipping" tile=i path last_time=status.time_last
                 push!(rows, _tile_summary_row(tile, status, :skipped, time() - t0))
                 continue
@@ -440,6 +446,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                                      reason = "below_min_cells",
                                                      elevation_interval_forcing =
                                                          retain_elevation_interval_forcing,
+                                                     glacier_fraction_form = form,
                                                      institution, references)
                 @info "Tile has too few cells to fit; wrote sparse tile" tile=i path cells=nrow(tile.buffered) min_cells
                 push!(rows, _tile_summary_row(tile, nothing, :sparse, time() - t0;
@@ -473,6 +480,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                              lapse_rate_stderr_maximum,
                                              lapse_rate_window, lapse_rate_prior,
                                              decoupling_factor_prior,
+                                             glacier_fraction_form = form,
                                              bare_ice_albedo = albedo, forcing_loader)
 
             # `elevation_interval_forcing` is a lazy iterator: leaving it alone reads no forcing at
@@ -499,6 +507,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                                      reason = "no_usable_forcing",
                                                      elevation_interval_forcing =
                                                          retain_elevation_interval_forcing,
+                                                     glacier_fraction_form = form,
                                                      institution, references)
                 @info "Tile has no usable forcing; wrote sparse tile" tile=i path cells=nrow(tile.buffered)
                 push!(rows, _tile_summary_row(tile, nothing, :sparse, time() - t0;
@@ -527,7 +536,8 @@ end
 # Compared against the file's own stored roster, in the encoded form the attributes hold, so the
 # comparison does not depend on a key list this version happens to know about.
 function _tile_is_current(status, time_range; climate_model, tile_size, buffer, min_cells,
-                          area_minimum, retain_elevation_interval_forcing)
+                          area_minimum, retain_elevation_interval_forcing,
+                          glacier_fraction_form::Symbol = :fraction)
     stored = status.parameters
     isempty(stored) && return false
     requested = Dict{String,Any}(
@@ -537,6 +547,7 @@ function _tile_is_current(status, time_range; climate_model, tile_size, buffer, 
         "min_cells" => min_cells,
         "area_minimum" => Float64(area_minimum),
         "elevation_interval_forcing" => _encode_attribute(retain_elevation_interval_forcing),
+        "glacier_fraction_form" => string(glacier_fraction_form),
         # Not a setting but a property of the file: a tile written by an earlier version stores fewer
         # variables than the current writer produces, and no comparison of *settings* can see that.
         "downscaling_schema_version" => _TILE_SCHEMA_VERSION)

@@ -5,6 +5,7 @@ authors = ["Alex Gardner"]
 
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 ConstructionBase = "187b0558-2788-49d3-abe0-74a17ed4e7c9"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
@@ -30,6 +31,7 @@ Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
 [compat]
 CairoMakie = "0.15.13"
+CodecZlib = "0.7"
 ConstructionBase = "1"
 DataFrames = "1.8.2"
 DimensionalData = "0.30"

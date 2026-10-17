@@ -317,7 +317,10 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                    decoupling_factor_prior = nothing,
                                    bare_ice_albedo = nothing,
                                    donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT,
+                                   glacier_fraction_form::Symbol = :fraction,
                                    forcing_loader = climate_forcing)
+    glacier_fraction_form in GLACIER_FRACTION_FORMS || throw(ArgumentError(
+        "glacier_fraction_form must be one of $(GLACIER_FRACTION_FORMS), got :$glacier_fraction_form"))
     elevation_interval_batch >= 0 || throw(ArgumentError(
         "elevation_interval_batch must be >= 0, got $elevation_interval_batch"))
     min_cells >= 2 ||
@@ -334,7 +337,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     # One pass to accumulate the cross-cell regression sums for both fits, and to learn which cells
     # actually have forcing. Both fits need only per-timestep sums over cells, so neither the cell
     # forcing stacks nor their temperature vectors are retained.
-    acc = _accumulate_cross_cell(selected, load)
+    acc = _accumulate_cross_cell(selected, load; glacier_fraction_form)
     isempty(acc.used) && throw(RegionForcingUnavailable(nrow(selected)))
 
     grid_cells = @view selected[acc.used, :]
@@ -353,7 +356,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     # center from the fitted coefficients — `k` varies with elevation, and the bands are the glacier
     # rather than the reanalysis surface — accepts or rejects each fit against its diagnostics, and
     # labels the provenance of whatever it substitutes. Nothing downstream of it fills or clamps.
-    fit = (; time = acc.time, decoupling, lapse_rate, bare_ice_albedo)
+    fit = (; time = acc.time, decoupling, lapse_rate, bare_ice_albedo, glacier_fraction_form)
     applied = resolve_downscaling(fit, hypsometry_intervals(grid_cells), acc.time;
                                   basis = downscaling_basis, min_cells,
                                   spread_minimum = elevation_spread_minimum,
@@ -374,6 +377,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
         "area_minimum" => Float64(area_minimum),
         "mean_elevation" => acc.mean_elevation,
         "adjustment_order" => "ambient_lapse_decouple",
+        "glacier_fraction_form" => string(glacier_fraction_form),
         # How much of each fit is measurement rather than absence. The judgement about whether that
         # is enough is the caller's; this just reports the count so it can be made.
         "n_timesteps" => acc.n,
@@ -391,8 +395,40 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
     # they are what the fits were taken *over*: `reference_elevation` alone is their area-weighted
     # mean, from which the spread that made the slope identifiable cannot be recovered.
     return (; grid_cells, time = acc.time, decoupling, lapse_rate, lapse_rate_uncertainty, applied,
+            glacier_fraction_form,
             cell_elevations = acc.elevations, cell_areas = acc.areas,
             elevation_interval_forcing = interval_forcing, bare_ice_albedo, provenance)
+end
+
+"""
+    GLACIER_FRACTION_FORMS
+
+How a cell's ERA5-Land glacier-mask fraction `glm` enters the decoupling model
+`E = α + β·z + g·(γ + δ·z)` (`derive_decoupling_factor`), its lapse-rate correction and the donor
+conversion: `:fraction` (`g = glm`) or `:indicator` (`g = 1` for `glm ≥`
+[`GLACIER_INDICATOR_THRESHOLD`](@ref), else 0).
+"""
+const GLACIER_FRACTION_FORMS = (:fraction, :indicator)
+
+"""
+    GLACIER_INDICATOR_THRESHOLD
+
+The `glm` at and above which `:indicator` counts a cell as glaciated. ERA5-Land assigns 10 m of snow
+water equivalent to grid boxes more than half covered by ice (Muñoz-Sabater et al. 2021, p. 4351), so
+such a cell is damped as a whole.
+"""
+const GLACIER_INDICATOR_THRESHOLD = 0.5
+
+"""
+    decoupling_glacier_fraction(glm, form) -> Float64
+
+The glacier fraction `g` the decoupling model uses for a cell with glacier-mask fraction `glm`, under
+the [`GLACIER_FRACTION_FORMS`](@ref) `form`.
+"""
+function decoupling_glacier_fraction(glm::Real, form::Symbol)
+    form === :fraction && return Float64(glm)
+    form === :indicator && return glm >= GLACIER_INDICATOR_THRESHOLD ? 1.0 : 0.0
+    throw(ArgumentError("glacier fraction form must be one of $(GLACIER_FRACTION_FORMS), got :$form"))
 end
 
 # Per-timestep cross-cell sums for both fits, plus the per-cell metadata the interval pass needs.
@@ -401,7 +437,7 @@ end
 # and glacier fraction `glm`. Accumulating the normal-equation sums as cells stream by keeps this
 # O(n_time) rather than O(n_cells * n_time) — a region of 200 cells over 76 hourly years would
 # otherwise be ~100 GB of retained temperature.
-function _accumulate_cross_cell(selected, load)
+function _accumulate_cross_cell(selected, load; glacier_fraction_form::Symbol = :fraction)
     n = nothing
     time = nothing
     used = Int[]
@@ -440,7 +476,7 @@ function _accumulate_cross_cell(selected, load)
                 "$n; every cell must share one time axis"))
         end
 
-        glm = _row_glm(row)
+        glm = decoupling_glacier_fraction(_row_glm(row), glacier_fraction_form)
         _accumulate_downscaling_cell!(S, T, z, glm)
         _accumulate_lapse_moments!(S, T, z, glm)
 
@@ -572,6 +608,9 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     # Keyed by coordinate rather than by row, so the two batching passes over the cells share it.
     donor_forcing::Dict{Tuple{Float64,Float64},Any}
     donor_unusable::Set{Tuple{Float64,Float64}}
+    # How a cell's `glm` enters the donor conversion: the form the fits were derived under
+    # (`decoupling_glacier_fraction`).
+    glacier_fraction_form::Symbol
 end
 
 function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling,
@@ -588,7 +627,9 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
                                      applied.donor_decoupling_factor_at,
                                      Dict{Float64,Vector{Float64}}(),
                                      Dict{Tuple{Float64,Float64},Any}(),
-                                     Set{Tuple{Float64,Float64}}())
+                                     Set{Tuple{Float64,Float64}}(),
+                                     Symbol(get(applied.settings, "downscaling_glacier_fraction_form",
+                                                "fraction")))
 end
 
 # The applied `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is
@@ -761,7 +802,8 @@ function _accumulate_intervals(ivf::_ElevationIntervalForcing, range)
         # The series brought to the ice-free state once per cell, with `k` at the cell's own
         # reanalysis elevation and the `glm` of the cell the series belongs to, so every band lapses
         # from the same ambient temperature.
-        ambient = _ambient_forcing(fd, glm, _donor_decoupling_factor(ivf, z_cell, glm))
+        g = decoupling_glacier_fraction(glm, ivf.glacier_fraction_form)
+        ambient = _ambient_forcing(fd, g, _donor_decoupling_factor(ivf, z_cell, g))
 
         # A function barrier: with substitution, `fd` may come from the donor memo, whose element type
         # is not concrete. Resolving it at this one call keeps the record-length inner loops specialized

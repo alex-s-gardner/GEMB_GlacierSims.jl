@@ -3,11 +3,10 @@ Physics members: the unresolved physics choices a tile sweep can be run under, s
 fluxes can be compared across them.
 
 A member is one level of each of three factors, written `<grain>-<band decoupling>-<impurity>`, for
-example `"C-ks35-table"`:
+example `"C-kfit-table"`:
 
 - grain growth and fresh snow ([`PHYSICS_GRAIN_VARIANTS`](@ref)): `A`, `B`, `C`;
-- the band decoupling factor rule ([`PHYSICS_BAND_DECOUPLING`](@ref)): `kfit`, `ks22`, `ks35`,
-  `kc077`, `kc100`;
+- the band decoupling ([`PHYSICS_BAND_DECOUPLING`](@ref)): `kfit`, `kshaw`;
 - the fresh-snow impurity loading ([`PHYSICS_IMPURITY`](@ref)): `table`, `tbc`, `tdang`, `traw`,
   `bc0`, `cvis`.
 
@@ -47,19 +46,20 @@ const PHYSICS_GRAIN_VARIANTS = (
 """
     PHYSICS_BAND_DECOUPLING
 
-Band decoupling levels of a physics member, as the `band_decoupling` rule
-[`resolve_downscaling`](@ref) applies to every band's `k`:
+Band decoupling levels of a physics member, as the `band_decoupling` rule of
+[`resolve_downscaling`](@ref):
 
-- `kfit`: the resolved ERA5-Land fit;
-- `ks22`, `ks35`: `min(1, s·k)` with `s` = 2.2 and 3.5;
-- `kc077`, `kc100`: one constant `k`, 0.77 and 1.0.
+- `kfit`: the band `k` fitted to ERA5-Land's glaciated cells, on the donor-converted ambient;
+- `kshaw`: the framework of Shaw et al. (2025): the raw ERA5-Land ambient (no donor conversion),
+  decoupled with each band's glacier-area weighted Shaw `k`, with
+  [`SHAW_FILL_DECOUPLING_FACTOR`](@ref) for the ice Shaw does not cover
+  ([`shaw_band_decoupling`](@ref)). The per-band `k` depends on the tile, so the rule here is the
+  template the scripts fill in.
 """
 const PHYSICS_BAND_DECOUPLING = (
-    kfit = (; description = "fitted band k", rule = (; rule = :fitted)),
-    ks22 = (; description = "min(1, 2.2 k)", rule = (; rule = :scaled, scale = 2.2)),
-    ks35 = (; description = "min(1, 3.5 k)", rule = (; rule = :scaled, scale = 3.5)),
-    kc077 = (; description = "constant k = 0.77", rule = (; rule = :constant, constant = 0.77)),
-    kc100 = (; description = "constant k = 1.0", rule = (; rule = :constant, constant = 1.0)),
+    kfit = (; description = "fitted band k on the donor-converted ambient", rule = (; rule = :fitted)),
+    kshaw = (; description = "Shaw et al. (2025) band k on the raw ERA5-Land ambient",
+             rule = (; rule = :shaw)),
 )
 
 """
@@ -100,13 +100,13 @@ const PHYSICS_IMPURITY = (
 The physics member `id` = `"<grain>-<band decoupling>-<impurity>"` (see the module notes above), as
 `(; id, grain, band_decoupling, impurity, model, band_rule, impurity_level, description)`: the three
 level names as `Symbol`s, the `ModelParameters` fields the grain level sets, the `band_decoupling`
-keyword for [`resolve_downscaling`](@ref), and the impurity level. Throws for an unknown level or a
+rule (`(; rule)`; a `:shaw` rule takes its per-band `k` from the tile), and the impurity level. Throws for an unknown level or a
 malformed id.
 """
 function physics_member(id::AbstractString)
     parts = split(id, '-')
     length(parts) == 3 || throw(ArgumentError(
-        "a physics member is \"<grain>-<band decoupling>-<impurity>\", e.g. \"C-ks35-table\"; " *
+        "a physics member is \"<grain>-<band decoupling>-<impurity>\", e.g. \"C-kfit-table\"; " *
         "got \"$id\""))
     grain, k, impurity = Symbol.(parts)
     _check_level(grain, PHYSICS_GRAIN_VARIANTS, "grain variant", id)
@@ -159,12 +159,11 @@ function _assert_physics_member(member, mp::ModelParameters, applied, background
             "ModelParameters has $(repr(getproperty(mp, field)))"))
     end
     # An `AppliedDownscaling` built without a rule (by hand, or by a resolution predating the keyword)
-    # applied none, which is the `:fitted` rule.
+    # applied none, which is the `:fitted` rule on the converted ambient.
     recorded = (; rule = get(applied.settings, "downscaling_band_decoupling_rule", "fitted"),
-                scale = get(applied.settings, "downscaling_band_decoupling_scale", "none"),
-                constant = get(applied.settings, "downscaling_band_decoupling_constant", "none"))
-    rule = band_decoupling_rule(member.band_rule)
-    expected = (; rule = string(rule.rule), rule.scale, rule.constant)
+                donor_conversion = get(applied.settings, "downscaling_donor_conversion", "fitted"))
+    expected = (; rule = string(member.band_rule.rule),
+                donor_conversion = member.band_rule.rule === :shaw ? "none" : "fitted")
     recorded == expected || throw(ArgumentError(
         "physics member $(member.id) applies band decoupling $expected, but the downscaling was " *
         "resolved with $recorded"))

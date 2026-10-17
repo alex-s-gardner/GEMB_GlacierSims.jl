@@ -110,6 +110,29 @@ tile_effective_black_carbon(cells) = EFFECTIVE_LOADING_TABLE === nothing ? nothi
     GEMB_GlacierSims.effective_black_carbon(cells, EFFECTIVE_LOADING_TABLE;
                                             cap = PHYSICS_MEMBER.impurity_level.cap)
 
+"""
+    tile_band_decoupling(tile, intervals) -> NamedTuple
+
+The `band_decoupling` rule of `resolve_downscaling` for `tile` under `PHYSICS_MEMBER`: the member's rule,
+with the tile's per-band Shaw `k` (`shaw_band_decoupling` over its core hypsometry) for a `:shaw`
+member.
+"""
+function tile_band_decoupling(tile, intervals)
+    PHYSICS_MEMBER.band_rule.rule === :shaw || return PHYSICS_MEMBER.band_rule
+    areas = GEMB_GlacierSims.tile_interval_areas(tile.core, intervals)
+    return (; rule = :shaw,
+            band_k = GEMB_GlacierSims.shaw_band_decoupling(tile.bounds, intervals, areas).band_k)
+end
+
+"""
+    tile_decoupling_factor_prior(tile) -> Float64 or nothing
+
+The `decoupling_factor_prior` of `resolve_downscaling` for `tile`: the glacier-area weighted Shaw et al.
+(2025) `k` of the glaciers in it (`shaw_decoupling_prior`). It is the whole band `k` of a tile whose
+cells carry no glacier fraction, and the fallback for timesteps no fit or climatology resolves.
+"""
+tile_decoupling_factor_prior(tile) = GEMB_GlacierSims.shaw_decoupling_prior(tile.bounds)
+
 physics_member_setting() =
     env_setting("physics member", "$(PHYSICS_MEMBER.id) ($(PHYSICS_MEMBER.description))",
                 "PHYSICS_MEMBER")

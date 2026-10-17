@@ -347,17 +347,21 @@ silently reverting to the climatology.
   tile's region is known; no region is inferred, because the elevation-class table does not carry one.
 - `decoupling_factor_prior = nothing`: the prior `k`, typically from
   [`decoupling_factor_prior`](@ref). `nothing` means an unresolvable timestep is left ambient.
-- `band_decoupling = (; rule = :fitted)`: what becomes of each band's resolved `k` series, one of
+- `band_decoupling = (; rule = :fitted)`: how each band is decoupled, one of
   [`BAND_DECOUPLING_RULES`](@ref):
-  - `(; rule = :fitted)`: applied as resolved above;
-  - `(; rule = :scaled, scale = s)`: `min(1, s·k)` at every timestep, `s > 0`, with each timestep's
-    source label kept;
-  - `(; rule = :constant, constant = c)`: `c` at every timestep, `0 < c ≤ 1`, labelled `:prior`
-    because it is prescribed rather than fitted.
+  - `(; rule = :fitted)`: the band `k` resolved above, on the donor-converted ambient;
+  - `(; rule = :shaw, band_k)`: the framework of Shaw et al. (2025), whose per-glacier `k` was fitted
+    against ERA5-Land without a glacier correction. Each band takes the constant `band_k[i]` (one per
+    interval, in `(0, 1]`, typically [`shaw_band_decoupling`](@ref)), labelled `:prior` because it is
+    prescribed, and **no cell is converted to the ice-free state**: `donor_decoupling_factor_at`
+    returns 1, so the band ambient is the raw reanalysis lapsed to the band.
 
-  The rule acts on band `k` only. A donor cell's conversion to the ice-free state keeps its own
-  resolution, because that `k` describes the reanalysis's glaciated cell rather than the glacier
-  surface. The rule and its constant are recorded in `settings`.
+  The rule, the per-band `k` of `:shaw` and whether donors are converted
+  (`downscaling_donor_conversion`) are recorded in `settings`.
+
+`fit.glacier_fraction_form` (the [`GLACIER_FRACTION_FORMS`](@ref) form the fits were derived under,
+`:fraction` when the fit does not record one) is recorded as `downscaling_glacier_fraction_form`;
+[`elevation_interval_forcing`](@ref) converts donors with the same form.
 
 Every applied value is inside the domain its consumer validates, by construction rather than by
 clamping, and that is asserted before returning. A failure there is a bug here, not bad data.
@@ -375,7 +379,7 @@ function resolve_downscaling(fit, intervals, run_time;
                              albedo_ice_range = GEMB_ALBEDO_ICE_RANGE)
     basis in (:climatology, :fitted) ||
         throw(ArgumentError("basis must be :climatology or :fitted, got :$basis"))
-    band_rule = band_decoupling_rule(band_decoupling)
+    band_rule = band_decoupling_rule(band_decoupling; n_bands = length(intervals))
     run_time = _plain_times(run_time)
     isempty(run_time) && throw(ArgumentError("run_time is empty; there is nothing to resolve onto"))
 
@@ -442,10 +446,10 @@ function resolve_downscaling(fit, intervals, run_time;
     # an older tile still resolves — with the tuned constant, exactly as it ran before.
     albedo_profile = hasproperty(fit, :bare_ice_albedo) ? fit.bare_ice_albedo : nothing
 
-    bands = map(intervals) do interval
+    bands = map(enumerate(intervals)) do (i, interval)
         k = _apply_band_decoupling_rule(
             _resolve_decoupling_at(fit.decoupling, interval.center, fit_time, run_time, basis,
-                                   k_prior; elevation_range = z_range), band_rule)
+                                   k_prior; elevation_range = z_range), band_rule, i)
 
         albedo_ice, albedo_ice_source = resolve_albedo_ice(albedo_profile, interval.center;
                                                           default = albedo_ice_default,
@@ -461,7 +465,11 @@ function resolve_downscaling(fit, intervals, run_time;
     # `k` at a donor cell's reanalysis elevation, by the same tiers without the prior. No elevation
     # range: a reanalysis surface can sit below the hypsometry, and it is among the elevations the
     # fit was taken over.
-    donor_decoupling_factor_at = _DonorDecouplingResolver(fit.decoupling, fit_time, run_time, basis)
+    # Under `:shaw` the ambient is the raw reanalysis, so no donor is converted.
+    donor_decoupling_factor_at = band_rule.rule === :shaw ? _NoDonorConversion(length(run_time)) :
+        _DonorDecouplingResolver(fit.decoupling, fit_time, run_time, basis)
+    glacier_fraction_form = hasproperty(fit, :glacier_fraction_form) ?
+                            Symbol(fit.glacier_fraction_form) : :fraction
 
     settings = Dict{String,Any}(
         "downscaling_basis" => string(basis),
@@ -475,8 +483,9 @@ function resolve_downscaling(fit, intervals, run_time;
             k_prior === nothing ? "none" : Float64(k_prior),
         "downscaling_donor_decoupling_factor_limits" => collect(_DONOR_DECOUPLING_FACTOR_LIMITS),
         "downscaling_band_decoupling_rule" => string(band_rule.rule),
-        "downscaling_band_decoupling_scale" => band_rule.scale,
-        "downscaling_band_decoupling_constant" => band_rule.constant,
+        "downscaling_band_decoupling_band_k" => band_rule.band_k,
+        "downscaling_donor_conversion" => band_rule.rule === :shaw ? "none" : "fitted",
+        "downscaling_glacier_fraction_form" => string(glacier_fraction_form),
         "downscaling_fit_time_coverage_start" => isempty(fit_time) ? "none" : string(first(fit_time)),
         "downscaling_fit_time_coverage_end" => isempty(fit_time) ? "none" : string(last(fit_time)),
         "downscaling_n_fit_timesteps" => length(fit_time),
@@ -536,61 +545,59 @@ function _resolve_decoupling_at(decoupling, z::Real, fit_time, run_time, basis, 
             n_fit_held = count(i -> in_domain[i] && held[i], eachindex(in_domain)))
 end
 
+# The donor resolver of a resolution that converts no donor: `k = 1` at every step, the identity of
+# `_ambient_forcing`.
+struct _NoDonorConversion
+    n::Int
+end
+(r::_NoDonorConversion)(z::Real) = ones(r.n)
+
 """
     BAND_DECOUPLING_RULES
 
-The rules [`resolve_downscaling`](@ref) can apply to a band's resolved decoupling factor `k`:
-`:fitted` (as resolved), `:scaled` (`min(1, s·k)`) and `:constant` (one prescribed `k`).
+The band decoupling rules [`resolve_downscaling`](@ref) applies: `:fitted` (the fitted `k` on the
+donor-converted ambient) and `:shaw` (prescribed per-band `k` on the raw reanalysis ambient).
 """
-const BAND_DECOUPLING_RULES = (:fitted, :scaled, :constant)
+const BAND_DECOUPLING_RULES = (:fitted, :shaw)
 
 """
-    band_decoupling_rule(spec) -> NamedTuple
+    band_decoupling_rule(spec; n_bands = nothing) -> NamedTuple
 
-The validated form of a `band_decoupling` keyword of [`resolve_downscaling`](@ref):
-`(; rule, scale, constant)`, with `"none"` in whichever of `scale` and `constant` the rule does not
-use, which is how the run parameters record them. `spec` is `(; rule = :fitted)`,
-`(; rule = :scaled, scale)` with `scale > 0` and finite, or `(; rule = :constant, constant)` with
-`0 < constant ≤ 1`. A field the rule does not use, or one it needs and lacks, throws.
+The validated form of a `band_decoupling` keyword of [`resolve_downscaling`](@ref): `(; rule, band_k)`,
+with `band_k` the per-band `k` of `:shaw` and `"none"` for `:fitted`, which is how the run parameters
+record it. `spec` is `(; rule = :fitted)` or `(; rule = :shaw, band_k)` with every value in `(0, 1]`
+and, when `n_bands` is given, one value per band. A field the rule does not use, or one it needs and
+lacks, throws.
 """
-function band_decoupling_rule(spec)
+function band_decoupling_rule(spec; n_bands = nothing)
     hasproperty(spec, :rule) || throw(ArgumentError(
         "band_decoupling needs a `rule`, one of $(BAND_DECOUPLING_RULES); got $spec"))
     rule = spec.rule
     rule in BAND_DECOUPLING_RULES || throw(ArgumentError(
         "band_decoupling rule must be one of $(BAND_DECOUPLING_RULES), got $(repr(rule))"))
     fields = Set(propertynames(spec))
-    expected = rule === :scaled ? Set((:rule, :scale)) :
-               rule === :constant ? Set((:rule, :constant)) : Set((:rule,))
+    expected = rule === :shaw ? Set((:rule, :band_k)) : Set((:rule,))
     fields == expected || throw(ArgumentError(
         "band_decoupling rule :$rule takes the fields $(sort!(collect(expected))), got " *
         "$(sort!(collect(fields)))"))
-    if rule === :scaled
-        s = Float64(spec.scale)
-        (isfinite(s) && s > 0) || throw(ArgumentError(
-            "band_decoupling scale must be positive and finite, got $(spec.scale)"))
-        return (; rule, scale = s, constant = "none")
-    elseif rule === :constant
-        c = Float64(spec.constant)
-        lo, hi = _DECOUPLING_FACTOR_LIMITS
-        lo < c <= hi || throw(ArgumentError(
-            "band_decoupling constant must be in ($lo, $hi], got $(spec.constant)"))
-        return (; rule, scale = "none", constant = c)
-    end
-    return (; rule, scale = "none", constant = "none")
+    rule === :fitted && return (; rule, band_k = "none")
+    band_k = collect(Float64, spec.band_k)
+    n_bands === nothing || length(band_k) == n_bands || throw(ArgumentError(
+        "band_decoupling :shaw gives $(length(band_k)) band k for $n_bands bands"))
+    lo, hi = _DECOUPLING_FACTOR_LIMITS
+    bad = findfirst(k -> !(isfinite(k) && lo < k <= hi), band_k)
+    bad === nothing || throw(ArgumentError(
+        "band_decoupling :shaw band k must be in ($lo, $hi], got $(band_k[bad]) for band $bad"))
+    return (; rule, band_k)
 end
 
-# One band's resolved `k` under a validated `band_decoupling_rule`. `:scaled` keeps the source labels
-# of the series it scales; `:constant` replaces the whole series, so every timestep is labelled
-# `:prior`. The fit counts describe the fit series either way and are kept.
-function _apply_band_decoupling_rule(k, rule)
+# Band `i`'s resolved `k` under a validated `band_decoupling_rule`. `:shaw` replaces the whole series
+# with the band's prescribed `k`, so every timestep is labelled `:prior`; the fit counts describe the
+# fit series either way and are kept.
+function _apply_band_decoupling_rule(k, rule, i)
     rule.rule === :fitted && return k
-    factor = rule.rule === :scaled ? min.(1.0, rule.scale .* k.factor) :
-             fill(rule.constant, length(k.factor))
-    source = rule.rule === :scaled ? k.source : fill(_SOURCE_PRIOR, length(k.source))
-    _assert_applicable(factor, _DECOUPLING_FACTOR_LIMITS, "band decoupling factor after rule " *
-                       ":$(rule.rule)"; open_lower = true)
-    return (; factor, source, k.n_fit_in_domain, k.n_fit_held)
+    factor = fill(rule.band_k[i], length(k.factor))
+    return (; factor, source = fill(_SOURCE_PRIOR, length(k.source)), k.n_fit_in_domain, k.n_fit_held)
 end
 
 # Where a resolution's bare-ice albedo came from, for the record rather than for comparison.

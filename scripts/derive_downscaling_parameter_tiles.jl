@@ -65,6 +65,16 @@ const RETAIN_ELEVATION_INTERVAL_FORCING = false
 
 const GI = GeoDataFrames.GeoInterface
 
+# How each cell's glacier-mask fraction `glm` enters the decoupling fit (`GLACIER_FRACTION_FORMS`):
+# `:indicator` (glm ≥ 0.5) in High Mountain Asia (RGI 7.0 regions 13-15), `:fraction` elsewhere. In
+# HMA glaciated cells sit almost only above the ice-free ones, so the fraction form leaves `glm` and
+# elevation nearly collinear and its k falls to or below zero on more than half the fitted hours;
+# ERA5-Land treats a cell more than half ice as wholly snow-covered, which is what the indicator
+# represents. Chosen from the tile's largest region by glacier area.
+const INDICATOR_REGIONS = ("13", "14", "15")
+tile_glacier_fraction_form(tile) =
+    nrow(tile.core) > 0 && tile_rgi_o1_region(tile.core) in INDICATOR_REGIONS ? :indicator : :fraction
+
 # Where the forcing cache and the tile outputs live. Kept outside the repo and off `tempdir()`: the
 # ERA5-Land chunks are tens of GB and expensive to re-fetch, so they must survive a reboot. Override
 # with `ENV["CLIMATE_CACHE"]` on a machine without this mount.
@@ -128,6 +138,8 @@ function settings_rows()
         setting("minimum cell glacier area", "$(AREA_MINIMUM) km²"),
         env_setting("observed bare-ice albedo", DERIVE_ALBEDO, "DERIVE_ALBEDO"),
         setting("elevation-interval forcing", RETAIN_ELEVATION_INTERVAL_FORCING),
+        setting("glacier fraction in the decoupling fit",
+                "indicator (glm ≥ $(GLACIER_INDICATOR_THRESHOLD)) in RGI $(join(INDICATOR_REGIONS, ", ")); fraction elsewhere"),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
         env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
@@ -199,6 +211,7 @@ function main()
                                                 derive_albedo = DERIVE_ALBEDO,
                                                 retain_elevation_interval_forcing =
                                                     RETAIN_ELEVATION_INTERVAL_FORCING,
+                                                glacier_fraction_form = tile_glacier_fraction_form,
                                                 institution = "NASA Jet Propulsion Laboratory",
                                                 tile_limit = TILE_LIMIT,
                                                 tile_gate = (TILE_BLOCKS == 1 && isempty(TILE_NAMES)) ?

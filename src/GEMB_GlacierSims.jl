@@ -45,6 +45,7 @@ import GeoParquet
 import GeoParquet.Parquet2
 import TOML
 import SHA
+import CodecZlib
 # Read only to learn the span of the cached ERA5-Land record, from the Zarr groups the forcing
 # loader caches on disk.
 import Zarr
@@ -110,6 +111,7 @@ include("downscaling_parameters.jl")
 export derive_downscaling_parameters, grid_cells_in_region, RegionForcingUnavailable
 export elevation_interval_forcing, derive_lapse_rate_uncertainty
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+export GLACIER_FRACTION_FORMS, GLACIER_INDICATOR_THRESHOLD, decoupling_glacier_fraction
 
 include("netcdf_downscaling_parameters.jl")
 export write_downscaling_tile_netcdf, write_sparse_downscaling_tile_netcdf
@@ -125,6 +127,11 @@ export dang2015_albedo_reduction, snicar_adv3_albedo_reduction, gs2010_equivalen
 export rgi_o1_region, tile_rgi_o1_region, tile_rgi_o1_region_shares
 export BACKGROUND_BLACK_CARBON_TABLE, BACKGROUND_BLACK_CARBON_BASES, BACKGROUND_BLACK_CARBON_OPTICS
 export SNICAR_ADV3_ALBEDO_TABLE, GS2010_EQUIVALENT_REFERENCE, RGI7_O1_REGIONS_FILE
+
+# Shaw et al. (2025) glacier areas per band: the area-weighted prior and the `:shaw` band decoupling.
+include("shaw_glacier_bands.jl")
+export shaw_glacier_bands, shaw_decoupling_prior, shaw_band_decoupling, tile_interval_areas
+export SHAW_GLACIER_BANDS_TABLE, SHAW_FILL_DECOUPLING_FACTOR
 
 # The physics members a sweep can be run under. After the background loading, whose table reader
 # the effective loading shares; before the tile run, which records the member.

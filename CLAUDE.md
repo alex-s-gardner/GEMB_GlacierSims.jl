@@ -70,6 +70,14 @@ background.
   levels `tbc`, `tdang`, `traw` and `bc0` (BC only, Dang optics, unconverted, none) are for
   sensitivity runs. `BACKGROUND_BLACK_CARBON` and `BACKGROUND_BLACK_CARBON_OPTICS`, when set, must
   agree with the member.
+- `data/shaw2025_glacier_bands.csv.gz` — the glaciers of the Shaw et al. (2025) decoupling table with
+  their RGI 6.0 area per 100 m band, written by `scripts/make_shaw_glacier_bands.jl` from the RGI 6.0
+  hypsometry files; read by `shaw_glacier_bands` for the area-weighted decoupling prior
+  (`shaw_decoupling_prior`) and the `kshaw` band decoupling (`shaw_band_decoupling`).
+- The decoupling fit reads each cell's `glm` as the fraction itself, or as an indicator (glm ≥ 0.5) in
+  High Mountain Asia (RGI 13-15; `tile_glacier_fraction_form` in
+  `scripts/derive_downscaling_parameter_tiles.jl`); the form is stored in each parameter tile and the
+  donor conversion uses the same form.
 - Tile runs of a physics member go to `$CLIMATE_CACHE/tile_runs_v2/<member>/` and native runs to
   `$CLIMATE_CACHE/native_runs/<member>/`; every tile records `physics_*` run parameters naming the
   member.

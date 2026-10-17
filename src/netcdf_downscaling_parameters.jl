@@ -21,7 +21,7 @@
 # roster (the same convention `_write_run_parameters!` uses for a cell run) so the status reader
 # names them from the file rather than recomputing a key set that a future version might extend.
 const _TILE_PARAMETER_KEYS = ("climate_model", "tile_size", "tile_buffer", "min_cells",
-                              "area_minimum", "elevation_interval_forcing",
+                              "area_minimum", "elevation_interval_forcing", "glacier_fraction_form",
                               "downscaling_schema_version")
 
 # What the file *contains*, as distinct from the settings it was derived under. Bumped whenever the set
@@ -122,6 +122,8 @@ function write_downscaling_tile_netcdf(path::AbstractString, tile, p;
                              min_cells, area_minimum,
                              n_intervals = elevation_intervals === nothing ? nothing :
                                            length(elevation_intervals),
+                             glacier_fraction_form = hasproperty(p, :glacier_fraction_form) ?
+                                                     p.glacier_fraction_form : :fraction,
                              institution, references)
     end
     return path
@@ -154,6 +156,7 @@ function write_sparse_downscaling_tile_netcdf(path::AbstractString, tile;
                                              area_minimum::Real = 0.0,
                                              reason::AbstractString,
                                              elevation_interval_forcing::Bool = false,
+                                             glacier_fraction_form::Symbol = :fraction,
                                              institution = nothing,
                                              references = nothing)
     mkpath(dirname(path))
@@ -167,7 +170,8 @@ function write_sparse_downscaling_tile_netcdf(path::AbstractString, tile;
         _write_tile_globals!(ds, tile, nothing; climate_model, time_range, tile_size, buffer,
                              min_cells, area_minimum, n_intervals = nothing,
                              sparse_reason = reason,
-                             elevation_interval_forcing, institution, references)
+                             elevation_interval_forcing, glacier_fraction_form, institution,
+                             references)
     end
     return path
 end
@@ -592,6 +596,7 @@ end
 function _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size, buffer,
                               min_cells, area_minimum, n_intervals,
                               sparse_reason = "", elevation_interval_forcing = nothing,
+                              glacier_fraction_form::Symbol = :fraction,
                               institution = nothing, references = nothing)
     for (k, v) in GEMB_CF_GLOBAL_ATTRIBUTES
         ds.attrib[k] = v
@@ -640,6 +645,9 @@ function _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size,
     has_intervals = elevation_interval_forcing === nothing ? n_intervals !== nothing :
                     elevation_interval_forcing
     ds.attrib["elevation_interval_forcing"] = _encode_attribute(has_intervals)
+    # How each cell's `glm` entered the decoupling and lapse-rate fits; a run applies the same form
+    # to the donor conversion (`decoupling_glacier_fraction`).
+    ds.attrib["glacier_fraction_form"] = string(glacier_fraction_form)
     ds.attrib["downscaling_schema_version"] = _TILE_SCHEMA_VERSION
     ds.attrib["downscaling_parameters"] = join(_TILE_PARAMETER_KEYS, " ")
     ds.attrib["downscaling_parameters_comment"] =
@@ -845,6 +853,9 @@ function read_downscaling_tile(path::AbstractString)
          # the fits and the albedo profile are otherwise anonymous once resolved, and a consumer
          # holding only the run cannot say which derivation produced them.
          source_path = abspath(path),
+         # The form the fits were derived under; a tile derived before it was recorded used the
+         # glacier fraction itself.
+         glacier_fraction_form = Symbol(get(dmeta, "glacier_fraction_form", "fraction")),
          attributes = dmeta)
     end
 end
