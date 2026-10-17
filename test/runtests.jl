@@ -3450,4 +3450,6 @@ include("test_background_black_carbon.jl")
 
 include("test_physics_members.jl")
 
+include("test_column_profiles.jl")
+
 include("test_run_launch.jl")

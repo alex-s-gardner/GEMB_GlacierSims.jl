@@ -29,7 +29,7 @@
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
 # DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, PHYSICS_MEMBER (see run_settings.jl),
-# EFFECTIVE_LOADING_TABLE (for a `cvis` member)
+# EFFECTIVE_LOADING_TABLE (for a `cvis` member), COLUMN_PROFILES (see run_settings.jl)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
@@ -249,6 +249,7 @@ function settings_rows()
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
         background_black_carbon_setting(),
         effective_black_carbon_setting(),
+        column_profiles_setting(),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         # From JLOptions, not ENV: this is the value the collector acts on, so a hint lost on its way to
         # the worker shows up here as "none" instead of being reported as if it had taken effect.
@@ -452,6 +453,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
         @info "Tile was run on per-timestep fits; rebuilding instead of appending" tile=i name
         disposition = :rebuild
     end
+    # Column profiles at past dates cannot come from an appended segment.
+    profiles = tile_column_profiles(name, intervals)
+    if disposition === :extendable && profiles !== nothing
+        @info "Tile records column profiles; rebuilding instead of appending" tile=i name
+        disposition = :rebuild
+    end
     restart = disposition === :extendable ? read_glacier_tile_restart(path) : nothing
     appending = restart !== nothing && restart.time !== nothing
     if disposition === :extendable && !appending
@@ -496,6 +503,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                 background_black_carbon = black_carbon,
                                 effective_black_carbon = effective,
                                 physics_member = PHYSICS_MEMBER,
+                                on_output = profiles,
                                 restart = appending ? restart : nothing)
     catch err
         # The record grew by less than one usable step. Not a failure: the file already says everything
@@ -511,6 +519,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
     else
         write_glacier_tile_netcdf(path, run; institution = "NASA Jet Propulsion Laboratory")
     end
+    # In a subdirectory, so a reader of the directory's tile files never meets one.
+    profiles === nothing ||
+        GEMB_GlacierSims.write_column_profiles_netcdf(
+            joinpath(mkpath(joinpath(OUTPUT_DIR, "column_profiles")), tile.name), profiles;
+            tile_name = name, delta_temperatures = DELTA_TEMPERATURES,
+            precipitation_scalings = PRECIPITATION_SCALINGS)
 
     @info(appending ? "Extended tile" : "Wrote tile", tile=i, name, bands=length(run.bands), simulations=length(run.bands)*length(DELTA_TEMPERATURES)*length(PRECIPITATION_SCALINGS), steps=length(run.time), forcing_s=round(t_forcing; digits = 1), gemb_s=round(t_gemb; digits = 1), basis, substituted_area_km2=round(run.provenance["substituted_area_km2"]; digits = 2), unrecovered_area_km2=round(run.provenance["unrecovered_area_km2"]; digits = 2))
     return summary_row(tile, name, appending ? :extended : :written, time() - t0;

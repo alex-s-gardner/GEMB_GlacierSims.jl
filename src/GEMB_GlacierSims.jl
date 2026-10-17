@@ -145,6 +145,10 @@ export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
 export LOST_AREA_FRACTION_MAXIMUM, DROPPED_BAND_CAUSES, dropped_band_cause_code
 
 include("netcdf_tile_run.jl")
+# Column profiles at requested dates for selected bands, kept apart from the tile files.
+include("column_profiles.jl")
+export ColumnProfileRecorder, column_profile_top, write_column_profiles_netcdf, read_column_profiles
+export COLUMN_PROFILE_MASS_MAXIMUM
 include("netcdf_tile_merge.jl")
 export merge_tile_perturbations
 export write_glacier_tile_netcdf, append_glacier_tile_netcdf

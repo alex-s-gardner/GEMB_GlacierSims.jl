@@ -133,6 +133,44 @@ cells carry no glacier fraction, and the fallback for timesteps no fit or climat
 """
 tile_decoupling_factor_prior(tile) = GEMB_GlacierSims.shaw_decoupling_prior(tile.bounds)
 
+# Column profiles for the WGMS density test (`ColumnProfileRecorder`), taken only for the bands that
+# hold a WGMS density record and only when `COLUMN_PROFILES` names the table of those records: a CSV with
+# columns `tile` (e.g. N46_E010), `date` (yyyy-mm-dd) and `z` (m, the record's elevation). Each tile
+# with records gets `column_profiles/<tile>.nc` under the sweep's output directory; tile files
+# themselves are unchanged. Off (`nothing`) by default.
+const COLUMN_PROFILES = let path = get(ENV, "COLUMN_PROFILES", nothing)
+    path === nothing || isfile(path) || error("COLUMN_PROFILES=$path does not exist")
+    path === nothing ? nothing : begin
+        raw = GEMB_GlacierSims._read_csv_strings(path)
+        absent = setdiff(["tile", "date", "z"], names(raw))
+        isempty(absent) || error("COLUMN_PROFILES table $path lacks column(s) $(join(absent, ", "))")
+        [(; tile = String(strip(r.tile)), date = Dates.DateTime(Dates.Date(strip(r.date))),
+            z = parse(Float64, strip(r.z))) for r in eachrow(raw)]
+    end
+end
+
+"""
+    tile_column_profiles(tile_name, intervals) -> ColumnProfileRecorder or nothing
+
+The recorder for the tile named `tile_name` (`N46_E010`): the dates of its `COLUMN_PROFILES` records
+and the bands among `intervals` holding their elevations, or `nothing` when profiles are off or the
+tile has no record inside its bands.
+"""
+function tile_column_profiles(tile_name, intervals)
+    COLUMN_PROFILES === nothing && return nothing
+    records = [r for r in COLUMN_PROFILES if r.tile == tile_name]
+    bands = Float64[iv.center for iv in intervals if any(r -> iv.lo <= r.z < iv.hi, records)]
+    isempty(bands) && return nothing
+    dates = [r.date for r in records if any(iv -> iv.lo <= r.z < iv.hi, intervals)]
+    return GEMB_GlacierSims.ColumnProfileRecorder(bands, dates)
+end
+
+column_profiles_setting() =
+    env_setting("column profiles (WGMS density bands)",
+                COLUMN_PROFILES === nothing ? "off" :
+                "$(length(COLUMN_PROFILES)) records in $(length(unique(r.tile for r in COLUMN_PROFILES))) tiles",
+                "COLUMN_PROFILES")
+
 physics_member_setting() =
     env_setting("physics member", "$(PHYSICS_MEMBER.id) ($(PHYSICS_MEMBER.description))",
                 "PHYSICS_MEMBER")
