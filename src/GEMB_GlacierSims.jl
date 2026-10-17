@@ -141,7 +141,7 @@ export PHYSICS_GRAIN_VARIANTS, PHYSICS_BAND_DECOUPLING, PHYSICS_IMPURITY
 
 include("glacier_tile_run.jl")
 export gemb_glacier_tile, GlacierTileRun, tile_run_parameters, geotile_id
-export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES
+export TILE_MASS_VARIABLES, TILE_HEIGHT_VARIABLES, TILE_DIAGNOSTIC_VARIABLES
 export LOST_AREA_FRACTION_MAXIMUM, DROPPED_BAND_CAUSES, dropped_band_cause_code
 
 include("netcdf_tile_run.jl")

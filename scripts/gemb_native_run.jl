@@ -522,6 +522,10 @@ function summary_row(cell, tile_name, status, seconds; run = nothing, correction
             unrecovered_area_km2 = get(p, "unrecovered_area_km2", 0.0),
             dropped_area_km2 = get(p, "dropped_area_km2", 0.0),
             max_dh_residual = get(p, "max_dh_residual", 0.0),
+            refreeze_thermal_cell_steps = run === nothing ? missing :
+                                          p["refreeze_thermal_cell_steps"],
+            refreeze_thermal_area_km2 = run === nothing ? missing : p["refreeze_thermal_area_km2"],
+            refreeze_thermal_fraction = run === nothing ? missing : p["refreeze_thermal_fraction"],
             dv_rate = run === nothing ? missing : run.totals[:dv][end, 1, 1] / years,
             dm_rate = run === nothing ? missing : run.totals[:dm][end, 1, 1] / years,
             runoff_rate = run === nothing ? missing : run.totals[:runoff][end, 1, 1] / years,

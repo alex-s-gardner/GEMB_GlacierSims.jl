@@ -113,7 +113,8 @@ stored value of the same series: the band-resolved `dh`, `dh_mass`, `dh_water`, 
 seam has no datum to continue from and is written as fill. The per-band forcing summaries become
 record-long: a time mean (`band_temperature_lapse_rate`, `band_glacier_decoupling_factor_mean`) is
 weighted by the forcing steps of each segment, and a per-step count (`band_*_n_<source>`,
-`band_n_timesteps_above_freezing`) is summed. `max_dh_residual` becomes the larger of the two.
+`band_n_timesteps_above_freezing`) is summed. `max_dh_residual` becomes the larger of the two, and the
+`refreeze_thermal_*` attributes are reduced again from the whole extended record.
 """
 function append_glacier_tile_netcdf(path::AbstractString, run::GlacierTileRun)
     isfile(path) || throw(ArgumentError("no tile file to append to at $path"))
@@ -141,6 +142,9 @@ function _append_glacier_tile!(path, run::GlacierTileRun)
         ds["time"][idx] = _nc_encode_time.(run.time)
         for v in keys(run.bands_series)
             name = string(v)
+            haskey(ds, name) ||
+                throw(ArgumentError("the tile file has no `$(name)` variable to extend; it was " *
+                                    "written by other code, so rewrite the tile from scratch"))
             series = run.bands_series[v]
             v in TILE_CUMULATIVE_HEIGHT_VARIABLES &&
                 (series = _continue_from_seam(series, ds[name][n_existing, :, :, :]))
@@ -156,6 +160,13 @@ function _append_glacier_tile!(path, run::GlacierTileRun)
         if haskey(run.provenance, "max_dh_residual")
             ds.attrib["max_dh_residual"] = max(Float64(get(ds.attrib, "max_dh_residual", 0.0)),
                                                Float64(run.provenance["max_dh_residual"]))
+        end
+        # Record totals, so reduced again from the whole extended series rather than from either part.
+        band_areas = Float64.(ds["band_area"][:])
+        for (k, val) in _refreeze_thermal_summary(_read_band_series(ds, "refreeze_thermal_count"),
+                                                  _read_band_series(ds, "refreeze_thermal"),
+                                                  _read_band_series(ds, "refreeze"), band_areas)
+            ds.attrib[k] = val
         end
 
         # The spinup provenance is left as written, both the per-run variables and the reduced
@@ -175,6 +186,14 @@ function _append_glacier_tile!(path, run::GlacierTileRun)
     end
 
     return path
+end
+
+# A stored per-band series as Float64, failing on any unwritten (fill) value: every slot of a band series
+# is written, a run that produced no output as zeros.
+function _read_band_series(ds, name::AbstractString)
+    raw = ds[name][:, :, :, :]
+    any(ismissing, raw) && throw(ArgumentError("`$(name)` holds fill values; the tile file is incomplete"))
+    return Float64.(raw)
 end
 
 # The band-resolved height series that accumulate from the start of the run, and so continue across a
@@ -731,6 +750,18 @@ function _write_tile_band_series!(ds, run::GlacierTileRun, precision::Type, defl
             "Per-band GEMB output for one output interval, not area-weighted and not cumulative. " *
             "The total_ variable of the same name is the area-weighted sum in Gt, accumulated from " *
             "the start of the record."
+        v[1:length(run.time), :, :, :] = run.bands_series[name]
+    end
+
+    for name in TILE_DIAGNOSTIC_VARIABLES
+        v = NCDatasets.defVar(ds, string(name), precision, dimnames;
+                              deflatelevel = deflate, fillvalue = precision(NC_FILL),
+                              chunksizes = chunks)
+        _set_attributes!(v, cf_attributes(name))
+        v.attrib["comment"] = get(cf_attributes(name), "comment", "") *
+            (haskey(cf_attributes(name), "comment") ? " " : "") *
+            "Per-band GEMB output for one output interval, not area-weighted and not cumulative. " *
+            "The refreeze_thermal_* global attributes summarize it for the tile."
         v[1:length(run.time), :, :, :] = run.bands_series[name]
     end
 

@@ -382,6 +382,7 @@ function main()
     done = summary[in.(summary.status, Ref(("written", "extended"))), :]
     if !isempty(done)
         @info "Closure across written tiles" max_dh_residual=maximum(done.max_dh_residual) worst_tile=done.name[argmax(done.max_dh_residual)]
+        @info "GEMB thermal-solve freezing across written tiles" tiles=count(>(0), done.refreeze_thermal_cell_steps) cell_steps=sum(done.refreeze_thermal_cell_steps) max_fraction=maximum(done.refreeze_thermal_fraction)
         @info "Volume change rate across written tiles (baseline, km3 i.e./yr)" median=round(median(skipmissing(done.dv_rate_baseline)); digits = 4) min=round(minimum(skipmissing(done.dv_rate_baseline)); digits = 4) max=round(maximum(skipmissing(done.dv_rate_baseline)); digits = 4)
     end
     return summary
@@ -568,6 +569,14 @@ function summary_row(tile, name, status, seconds; run = nothing,
             n_timesteps = run === nothing ? 0 : length(run.time),
             basis = basis === missing ? "" : string(basis),
             max_dh_residual = run === nothing ? 0.0 : run.provenance["max_dh_residual"],
+            # How often GEMB's thermal solve froze a wet cell's water itself, over this pass's run
+            # (an extended tile's new segment); the tile file's attributes hold the record values.
+            refreeze_thermal_cell_steps = run === nothing ? missing :
+                                          run.provenance["refreeze_thermal_cell_steps"],
+            refreeze_thermal_area_km2 = run === nothing ? missing :
+                                        run.provenance["refreeze_thermal_area_km2"],
+            refreeze_thermal_fraction = run === nothing ? missing :
+                                        run.provenance["refreeze_thermal_fraction"],
             dv_rate_baseline = (run === nothing || i_dt === nothing || i_ps === nothing) ? missing :
                                run.totals[:dv][end, i_dt, i_ps] / years,
             dm_rate_baseline = (run === nothing || i_dt === nothing || i_ps === nothing) ? missing :

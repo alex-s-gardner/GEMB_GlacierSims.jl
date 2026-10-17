@@ -145,6 +145,11 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
         bands_series[v] = [0.5j + i + 10b + 100d + 1000s
                            for i in 1:n_t, b in 1:n_band, d in 1:n_dt, s in 1:n_ps]
     end
+    # GEMB's thermal-solve freezing fired at 3 cell-steps of one interval in band 1, 0.25 kg m-2.
+    bands_series[:refreeze_thermal_count] = zeros(n_t, n_band, n_dt, n_ps)
+    bands_series[:refreeze_thermal] = zeros(n_t, n_band, n_dt, n_ps)
+    bands_series[:refreeze_thermal_count][min(2, n_t), 1, 1, n_ps] = 3.0
+    bands_series[:refreeze_thermal][min(2, n_t), 1, 1, n_ps] = 0.25
     band_areas = [b.area for b in band_tuples]
     totals = Dict{Symbol,Array{Float64,3}}()
     # Cumulative, as `_tile_totals` produces and as the file documents: the per-band series are per
@@ -212,9 +217,12 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
         (lon_min = -142.0, lon_max = -140.0, lat_min = 60.0, lat_max = 62.0),
         335, 716, band_tuples, collect(Float64, deltas), collect(Float64, scalings),
         collect(time), bands_series, totals, profiles, band_provenance, run_provenance, parameters,
-        Dict{String,Any}("spinup_converged" => false,
-                         "climatology_window_start" => DateTime(1990, 1, 1),
-                         "max_dh_residual" => 1.2e-14),
+        merge(Dict{String,Any}("spinup_converged" => false,
+                               "climatology_window_start" => DateTime(1990, 1, 1),
+                               "max_dh_residual" => 1.2e-14),
+              GEMB_GlacierSims._refreeze_thermal_summary(
+                  bands_series[:refreeze_thermal_count], bands_series[:refreeze_thermal],
+                  bands_series[:refreeze], band_areas)),
     )
 end
 

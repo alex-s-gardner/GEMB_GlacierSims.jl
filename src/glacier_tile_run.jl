@@ -28,6 +28,13 @@ const TILE_MASS_VARIABLES = (CELL_MASS_VARIABLES..., :blowing_snow)
 const TILE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual,
                                :firn_air_content)
 
+# GEMB's count of the cell-steps at which its thermal solve froze a wet cell's water itself, and the
+# water frozen there (GEMB's `refreeze_thermal`, `refreeze_thermal_count`). Per-band interval sums
+# like the mass fluxes, but without tile totals: the mass is already part of `refreeze`, and a count
+# has no area-weighted total. The tile reduces them to the `refreeze_thermal_*` attributes of
+# [`_refreeze_thermal_summary`](@ref).
+const TILE_DIAGNOSTIC_VARIABLES = (:refreeze_thermal, :refreeze_thermal_count)
+
 # Largest fraction of a tile's ice, by default, that may go unmodelled before
 # [`gemb_glacier_tile`](@ref) refuses the tile (see its `lost_area_fraction_maximum` keyword).
 const LOST_AREA_FRACTION_MAXIMUM = 0.01
@@ -417,6 +424,14 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         series[:dh_firn] = components.firn
         series[:dh_residual] = components.residual
         series[:firn_air_content] = Vector{Float64}(output[:firn_air_content])
+        for v in TILE_DIAGNOSTIC_VARIABLES
+            # Required rather than defaulted to zero: a zero would report that the branch never
+            # fired when the GEMB in use does not count it.
+            haskey(output, v) ||
+                throw(ErrorException("GEMB output has no `$(v)` layer; this GEMB does not count " *
+                                     "the wet cells its thermal solve freezes"))
+            series[v] = Vector{Float64}(output[v])
+        end
 
         return (; i_band, i_dt, i_ps,
                 time = collect(dims(output, Ti)),
@@ -449,7 +464,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         res === nothing && continue
         if isempty(out_time)
             out_time = res.time
-            for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...)
+            for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES..., TILE_DIAGNOSTIC_VARIABLES...)
                 bands_series[v] = zeros(length(out_time), n_band, n_dt, n_ps)
             end
         elseif res.time != out_time
@@ -489,6 +504,9 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     provenance["forcing_time_step_seconds"] = forcing_step
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
     provenance["max_dh_residual"] = maximum(abs, bands_series[:dh_residual])
+    merge!(provenance, _refreeze_thermal_summary(bands_series[:refreeze_thermal_count],
+                                                 bands_series[:refreeze_thermal],
+                                                 bands_series[:refreeze], band_areas))
     # How much of this tile's forcing was borrowed from a neighbouring cell, because the cell holding
     # the ice falls outside the reanalysis land mask, and from how far away the furthest loan came.
     # `unrecovered` is ice no cell could supply forcing for at all: it is *not* in `glacier_area_km2`,
@@ -757,6 +775,39 @@ end
 # The two are not interchangeable. `dh` carries the firn compaction term, so `dh * density_ice` is not
 # the mass change; and mass alone cannot produce a height, since a column can lose air without losing
 # mass. Keeping the conversions in one place is what stops a caller reaching for the wrong one.
+"""
+    _refreeze_thermal_summary(count, mass, refreeze, band_areas) -> Dict{String,Any}
+
+The tile-level summary of GEMB's thermal-solve freezing (`TILE_DIAGNOSTIC_VARIABLES`), from per-band
+interval series shaped `(time, band, delta_temperature, precipitation_scaling)`:
+
+- `refreeze_thermal_cell_steps`: the cell-steps, over every band, run and output interval, at which the
+  solve froze a wet cell's water itself (the sum of `count`).
+- `refreeze_thermal_area_km2`: the glacier area of the bands where that happened in any run.
+- `max_refreeze_thermal` [kg m-2]: the largest record total of `mass` in any one (band, run).
+- `refreeze_thermal_fraction`: the area-weighted share of `refreeze` that the solve froze, over all
+  bands, runs and intervals; 0 when nothing refroze.
+"""
+function _refreeze_thermal_summary(count::AbstractArray{<:Real,4}, mass::AbstractArray{<:Real,4},
+                                   refreeze::AbstractArray{<:Real,4}, band_areas::AbstractVector)
+    axes(count) == axes(mass) == axes(refreeze) ||
+        throw(DimensionMismatch("count, mass and refreeze must share axes: $(axes(count)), " *
+                                "$(axes(mass)), $(axes(refreeze))"))
+    axes(count, 2) == axes(band_areas, 1) ||
+        throw(DimensionMismatch("band axis $(axes(count, 2)) does not match band_areas " *
+                                "$(axes(band_areas, 1))"))
+    fired = [any(>(0), view(count, :, i, :, :)) for i in axes(count, 2)]
+    weight = reshape(band_areas, 1, :, 1, 1)
+    refrozen_total = sum(refreeze .* weight)
+    return Dict{String,Any}(
+        "refreeze_thermal_cell_steps" => round(Int, sum(count)),
+        "refreeze_thermal_area_km2" => sum(band_areas[i] for i in axes(count, 2) if fired[i];
+                                           init = 0.0),
+        "max_refreeze_thermal" => Float64(maximum(sum(mass; dims = 1); init = 0.0)),
+        "refreeze_thermal_fraction" => refrozen_total > 0 ?
+                                       Float64(sum(mass .* weight) / refrozen_total) : 0.0)
+end
+
 function _tile_totals(bands_series, band_areas)
     totals = Dict{Symbol,Array{Float64,3}}()
     n_t, _, n_dt, n_ps = size(bands_series[:dh])

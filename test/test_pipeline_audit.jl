@@ -415,6 +415,86 @@ end
     end
 end
 
+@testset "pipeline audit: thermal-solve freezing is counted" begin
+    summary = GEMB_GlacierSims._refreeze_thermal_summary
+    @testset "tile summary" begin
+        # Two bands of 10 and 30 km², one temperature, two scalings, three intervals. The solve froze
+        # water at 2 + 1 cell-steps in band 2 (0.4 and 0.1 kg m-2 in one run) and nowhere in band 1;
+        # every band and run refroze 2 kg m-2 per interval.
+        count = zeros(3, 2, 1, 2)
+        mass = zeros(3, 2, 1, 2)
+        count[1, 2, 1, 2], count[3, 2, 1, 2] = 2.0, 1.0
+        mass[1, 2, 1, 2], mass[3, 2, 1, 2] = 0.4, 0.1
+        refreeze = fill(2.0, 3, 2, 1, 2)
+        s = summary(count, mass, refreeze, [10.0, 30.0])
+        @test s["refreeze_thermal_cell_steps"] === 3
+        @test s["refreeze_thermal_area_km2"] == 30.0
+        @test s["max_refreeze_thermal"] ≈ 0.5
+        # (0.5 kg m-2 · 30 km²) / (2 kg m-2 · 3 intervals · 2 runs · 40 km²)
+        @test s["refreeze_thermal_fraction"] ≈ 0.5 * 30 / (2 * 3 * 2 * 40)
+        quiet = summary(zeros(3, 2, 1, 2), zeros(3, 2, 1, 2), zeros(3, 2, 1, 2), [10.0, 30.0])
+        @test quiet == Dict{String,Any}("refreeze_thermal_cell_steps" => 0,
+                                        "refreeze_thermal_area_km2" => 0.0,
+                                        "max_refreeze_thermal" => 0.0,
+                                        "refreeze_thermal_fraction" => 0.0)
+        @test_throws "must share axes" summary(count, mass[1:2, :, :, :], refreeze, [10.0, 30.0])
+        @test_throws "does not match band_areas" summary(count, mass, refreeze, [10.0])
+    end
+
+    @testset "tile file" begin
+        run = _fake_tile_run()
+        path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), run; precision = Float64)
+        NCDatasets.NCDataset(path, "r") do ds
+            @test ds["refreeze_thermal_count"][:, :, :, :] == run.bands_series[:refreeze_thermal_count]
+            @test ds["refreeze_thermal"][:, :, :, :] == run.bands_series[:refreeze_thermal]
+            @test ds["refreeze_thermal_count"].attrib["units"] == "1"
+            @test ds["refreeze_thermal"].attrib["units"] == "kg m-2"
+            @test ds["refreeze_thermal"].attrib["cell_methods"] == "time: sum"
+            # The mass is already part of refreeze and a count has no area total.
+            @test !haskey(ds, "total_refreeze_thermal")
+            @test !haskey(ds, "total_refreeze_thermal_count")
+            @test ds.attrib["refreeze_thermal_cell_steps"] == 3
+            @test ds.attrib["refreeze_thermal_area_km2"] == 12.5
+            @test ds.attrib["max_refreeze_thermal"] == 0.25
+        end
+    end
+
+    @testset "append reduces over the whole record" begin
+        # The first segment fired 3 cell-steps (0.25 kg m-2) in band 1; the continuation fires 3 more
+        # there and 5 (0.5 kg m-2) in band 3, so the record has 11 over 12.5 + 3 km².
+        first_run = _fake_tile_run(; time = [DateTime(2000, 1, 31), DateTime(2000, 2, 29)])
+        later = _fake_tile_run(; time = [DateTime(2000, 3, 31), DateTime(2000, 4, 30)])
+        later.bands_series[:refreeze_thermal_count][1, 3, 2, 1] = 5.0
+        later.bands_series[:refreeze_thermal][1, 3, 2, 1] = 0.5
+        path = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), first_run; precision = Float64)
+        append_glacier_tile_netcdf(path, later)
+        NCDatasets.NCDataset(path, "r") do ds
+            @test ds["refreeze_thermal_count"][3:4, :, :, :] == later.bands_series[:refreeze_thermal_count]
+            @test ds.attrib["refreeze_thermal_cell_steps"] == 11
+            @test ds.attrib["refreeze_thermal_area_km2"] == 12.5 + 3.0
+            # Band 1's run fired in both segments: 0.25 + 0.25 over the record.
+            @test ds.attrib["max_refreeze_thermal"] == 0.5
+            whole = summary(cat(first_run.bands_series[:refreeze_thermal_count],
+                                later.bands_series[:refreeze_thermal_count]; dims = 1),
+                            cat(first_run.bands_series[:refreeze_thermal],
+                                later.bands_series[:refreeze_thermal]; dims = 1),
+                            cat(first_run.bands_series[:refreeze], later.bands_series[:refreeze];
+                                dims = 1),
+                            [b.area for b in first_run.bands])
+            @test ds.attrib["refreeze_thermal_fraction"] ≈ whole["refreeze_thermal_fraction"]
+        end
+    end
+
+    @testset "real GEMB run" begin
+        # The melting tiny tile holds no water against a cold matrix, so the branch never fires; the
+        # series and summary are present and zero.
+        s = TINY_RUN.bands_series
+        @test all(iszero, s[:refreeze_thermal_count]) && all(iszero, s[:refreeze_thermal])
+        @test TINY_RUN.provenance["refreeze_thermal_cell_steps"] === 0
+        @test TINY_RUN.provenance["refreeze_thermal_fraction"] == 0.0
+    end
+end
+
 @testset "pipeline audit: software provenance in every file" begin
     sw = software_provenance()
     @test issetequal(keys(sw), ["software_$(p)_$(f)" for p in ("gemb", "gemb_climateforcing",
