@@ -62,7 +62,7 @@ end
         @test m.model == (; grain_growth_method = :FlannerZender2006,
                           new_snow_method = :vanKampenhout2017, densification_method = :Crocus,
                           destructive_metamorphism = true, blowing_snow_method = :none,
-                          drift_fetch_length = 10.0)
+                          drift_fetch_length = 10.0, new_snow_density = 350.0)
         # D1 is C with Keenan et al. (2021) wind packing at a 10 m fetch, and nothing else.
         d1 = physics_member("D1-kfit-table")
         @test d1.grain === :D1
@@ -77,8 +77,24 @@ end
             @test physics_member("$g-$k-$i").id == "$g-$k-$i"
         end
         @test allequal(keys(v.model) for v in PHYSICS_GRAIN_VARIANTS)
+
+        # The constant-density levels: B or C settling under a constant deposition density, and
+        # otherwise the B or C level.
+        for (g, settling, ρ) in ((:B250, :B, 250.0), (:B300, :B, 300.0), (:C250, :C, 250.0),
+                                 (:C300, :C, 300.0), (:C350, :C, 350.0))
+            lvl = physics_member("$g-kfit-table-w2")
+            @test lvl.grain === g && lvl.wind_scaling === 2.0
+            @test lvl.model == merge(PHYSICS_GRAIN_VARIANTS[settling].model,
+                                     (; new_snow_method = :Constant, new_snow_density = ρ))
+            @test occursin("$(Int(ρ)) kg m-3 fresh snow", lvl.description)
+        end
+        @test physics_member("B300-kfit-table").model.densification_method === :Arthern
+        @test !physics_member("B300-kfit-table").model.destructive_metamorphism
+        @test physics_member("C250-kfit-table").model.densification_method === :Crocus
+        @test physics_member("C250-kfit-table").model.destructive_metamorphism
+        @test_throws "settling must be \"B\" or \"C\", got \"D\"" GEMB_GlacierSims._constant_snow_level("D", 300.0)
         @test_throws "a physics member is \"<grain>-<band decoupling>-<impurity>\"" physics_member("C-kfit")
-        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C, D1" physics_member(
+        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C, D1, B250, B300, C250, C300, C350" physics_member(
             "D-kfit-table")
         @test_throws "unknown band decoupling level \"ks35\" in physics member \"A-ks35-table\"; one of kfit, kshaw" physics_member(
             "A-ks35-table")
@@ -119,6 +135,12 @@ end
             physics_member("D1-kfit-table"); blowing_snow_method = :none)
         mp = physics_model_parameters(physics_member("D1-kfit-table"))
         @test mp.blowing_snow_method === :Keenan2021 && mp.drift_fetch_length == 10.0
+        mp = physics_model_parameters(physics_member("C300-kfit-table"))
+        @test mp.new_snow_method === :Constant && mp.new_snow_density == 300.0
+        @test GEMB.fresh_snow_density(mp, 260.0, 200.0, 5.0) == 300.0
+        # The levels that do not read it hold `new_snow_density` at GEMB's default.
+        @test all(PHYSICS_GRAIN_VARIANTS[g].model.new_snow_density == initialize_parameters().new_snow_density
+                  for g in (:A, :B, :C, :D1))
     end
 
     @testset "band decoupling rule" begin
