@@ -241,7 +241,7 @@ measurements behind this.
   [`derive_decoupling_factor`](@ref) for what the number was chosen against.
 - `downscaling_basis = :fitted`, `lapse_rate_stderr_maximum`, `elevation_spread_minimum`,
   `lapse_rate_window`,
-  `lapse_rate_prior`, `decoupling_factor_prior`: how the fits are turned into the applied parameters
+  `lapse_rate_prior`, `decoupling_factor_prior`, `glacier_correction`: how the fits are turned into the applied parameters
   `elevation_interval_forcing` uses, and only there — the returned fits are untouched by these. All
   forwarded to [`resolve_downscaling`](@ref); see it for what each one accepts or rejects. `:fitted`
   is the default here because this method derives and applies over one window, so every timestep has
@@ -318,6 +318,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                    bare_ice_albedo = nothing,
                                    donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT,
                                    glacier_fraction_form::Symbol = :fraction,
+                                   glacier_correction::Symbol = DEFAULT_GLACIER_CORRECTION,
                                    forcing_loader = climate_forcing)
     glacier_fraction_form in GLACIER_FRACTION_FORMS || throw(ArgumentError(
         "glacier_fraction_form must be one of $(GLACIER_FRACTION_FORMS), got :$glacier_fraction_form"))
@@ -361,7 +362,8 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                   basis = downscaling_basis, min_cells,
                                   spread_minimum = elevation_spread_minimum,
                                   stderr_maximum = lapse_rate_stderr_maximum,
-                                  lapse_rate_window, lapse_rate_prior, decoupling_factor_prior)
+                                  lapse_rate_window, lapse_rate_prior, decoupling_factor_prior,
+                                  glacier_correction)
     # Donors are the region's own cells: a derivation is handed the neighbourhood it should draw on, so
     # there is no wider set to reach into the way a tiled sweep has its buffer.
     interval_forcing = _ElevationIntervalForcing(grid_cells, load, applied,
@@ -543,12 +545,15 @@ whatever it cannot reach is counted rather than skipped.
 
 Per grid cell, per band, forcing is adjusted in three steps (`_cell_forcing_at_interval`):
 
-1. **to ambient** — the reanalysis already runs a fraction `glm` of the cell as ice, and the
-   decoupling fit models its warm excess as `[1 - glm·(1 - k(z))]·E_ambient(z)`. Dividing the
-   observed excess by that factor, with `k` resolved at the cell's own reanalysis elevation, gives
-   its ice-free temperature (`GEMB_ClimateForcing._ambient_forcing`). The donor's `k` is kept inside
-   `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, so the observed excess is multiplied by at most
-   `1/$(_DONOR_DECOUPLING_FACTOR_LIMITS[1])`, and a step at or below melting is left as it is;
+1. **to ambient** — the glacier correction. The reanalysis already runs a fraction `glm` of the
+   cell as ice, and the decoupling fit models its warm excess as
+   `α + β·z + glm·(γ + δ·z) = [1 - glm·(1 - k(z))]·E_ambient(z)`. The correction removes that
+   damping at the cell's own reanalysis elevation (`GEMB_ClimateForcing._ambient_forcing`) in the
+   form the resolution names (`glacier_correction` of [`resolve_downscaling`](@ref)): by default it
+   subtracts the glacier term, `T - glm·(γ + δ·z)`, carrying the cell's residual from the fit
+   unscaled; the multiplicative form divides the observed excess by `1 - glm·(1 - k(z))`, with the
+   donor's `k` kept inside `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, so the excess is multiplied by at
+   most `1/$(_DONOR_DECOUPLING_FACTOR_LIMITS[1])`. A step at or below melting is left as it is;
 2. **lapse** — to the band center, with the applied ambient lapse rate;
 3. **decouple** — with the band's own `k` at the band center, since the band is glacier.
 
@@ -601,7 +606,7 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     # coincidence, but each cell is met once per batching pass, so the memo saves the re-evaluation
     # on every pass after the first.
     donor_decoupling_factor_at::K
-    donor_decoupling_factor::Dict{Float64,Vector{Float64}}
+    donor_decoupling_factor::Dict{Float64,Any}
     # Forcing for donors that have been used, and the coordinates already found unusable. Masked cells
     # cluster, so the second one in a tile usually resolves to a donor already here and costs no I/O;
     # the unusable set stops a rejected candidate from being loaded again by the next masked cell.
@@ -627,7 +632,7 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
                                      applied.lapse_rate_source, elevation_interval_batch,
                                      applied.bands, donor_cells, donor_max_distance_km,
                                      applied.donor_decoupling_factor_at,
-                                     Dict{Float64,Vector{Float64}}(),
+                                     Dict{Float64,Any}(),
                                      Dict{Tuple{Float64,Float64},Any}(),
                                      Set{Tuple{Float64,Float64}}(),
                                      Symbol(get(applied.settings, "downscaling_glacier_fraction_form",
@@ -635,10 +640,11 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
                                      Float64(get(applied.settings, "downscaling_wind_scaling", 1.0)))
 end
 
-# The applied `k` per timestep at the reanalysis elevation `z` of a cell whose glacier fraction is
-# `glm`, for bringing its forcing to the ice-free state. A cell with no glacier fraction is already
-# ambient (`k = 1` leaves it bit for bit), which is the one case a resolution without
-# `donor_decoupling_factor_at` can force.
+# The applied glacier correction per timestep at the reanalysis elevation `z` of a cell whose glacier
+# fraction is `glm`, for bringing its forcing to the ice-free state: a `k` series or an
+# `AdditiveGlacierCorrection`, as `donor_decoupling_factor_at` returns it. A cell with no glacier
+# fraction is already ambient (`k = 1` leaves it bit for bit), which is the one case a resolution
+# without `donor_decoupling_factor_at` can force.
 function _donor_decoupling_factor(ivf::_ElevationIntervalForcing, z::Float64, glm::Float64)
     glm == 0 && return ones(length(ivf.time))
     ivf.donor_decoupling_factor_at === nothing && throw(ArgumentError(

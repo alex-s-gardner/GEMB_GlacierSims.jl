@@ -21,7 +21,9 @@ using GEMB_ClimateForcing: derive_decoupling_factor, derive_lapse_rate,
                            _DONOR_DECOUPLING_FACTOR_LIMITS,
                            _LAPSE_RATE_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE,
                            cloud_transmissivity, cloud_optical_thickness,
-                           _MIN_AMBIENT_EXCESS, _haversine_km
+                           _MIN_AMBIENT_EXCESS, _haversine_km,
+                           _glacier_term_at_elevation, GLACIER_CORRECTIONS,
+                           DEFAULT_GLACIER_CORRECTION, AdditiveGlacierCorrection
 using DimensionalData
 using Rasters
 using DataFrames
@@ -111,6 +113,7 @@ include("downscaling_parameters.jl")
 export derive_downscaling_parameters, grid_cells_in_region, RegionForcingUnavailable
 export elevation_interval_forcing, derive_lapse_rate_uncertainty
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+export GLACIER_CORRECTIONS, DEFAULT_GLACIER_CORRECTION, AdditiveGlacierCorrection
 export GLACIER_FRACTION_FORMS, GLACIER_INDICATOR_THRESHOLD, decoupling_glacier_fraction
 
 include("netcdf_downscaling_parameters.jl")

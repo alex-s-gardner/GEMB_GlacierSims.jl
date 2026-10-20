@@ -36,6 +36,17 @@ import GEMB_GlacierSims
 const DEFAULT_PHYSICS_MEMBER = "B-kfit-table"
 const PHYSICS_MEMBER = GEMB_GlacierSims.physics_member(get(ENV, "PHYSICS_MEMBER", DEFAULT_PHYSICS_MEMBER))
 
+# The form of the glacier correction (`resolve_downscaling`'s `glacier_correction`, one of
+# `GEMB_GlacierSims.GLACIER_CORRECTIONS`): how a glaciated ERA5-Land cell's forcing is taken to its
+# ice-free equivalent before it is lapsed. `GLACIER_CORRECTION` overrides the package default; a run
+# records the form it used as `downscaling_glacier_correction` (absent for `:multiplicative`).
+const GLACIER_CORRECTION = let c = Symbol(get(ENV, "GLACIER_CORRECTION",
+                                              string(GEMB_GlacierSims.DEFAULT_GLACIER_CORRECTION)))
+    c in GEMB_GlacierSims.GLACIER_CORRECTIONS || error(
+        "GLACIER_CORRECTION=$c is not one of $(GEMB_GlacierSims.GLACIER_CORRECTIONS)")
+    c
+end
+
 """
     tile_run_dir(climate_cache) -> String
 
@@ -174,6 +185,11 @@ column_profiles_setting() =
 physics_member_setting() =
     env_setting("physics member", "$(PHYSICS_MEMBER.id) ($(PHYSICS_MEMBER.description))",
                 "PHYSICS_MEMBER")
+
+glacier_correction_setting() =
+    env_setting("glacier correction",
+                PHYSICS_MEMBER.band_rule.rule === :shaw ? "none (no donor conversion under $(PHYSICS_MEMBER.band_decoupling))" :
+                string(GLACIER_CORRECTION), "GLACIER_CORRECTION")
 
 background_black_carbon_setting() =
     setting("background snow black carbon",

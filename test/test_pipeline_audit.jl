@@ -90,7 +90,7 @@ end
     z̄, z_d, z_b = 1000.0, 1800.0, 1050.0
     β = (4.0 - 8.0) / (z_d - z̄)
     α = 8.0 - β * z̄
-    function band_for(k_d)
+    function band_for(k_d; glacier_correction = :multiplicative)
         g_ref, g_d = -4.0, (k_d - 1) * 4.0
         δ = (g_d - g_ref) / (z_d - z̄)
         γ = g_ref - δ * z̄
@@ -101,7 +101,7 @@ end
                lapse_rate = DimStack((lapse_rate = col(6.5), n_cells = DimArray(fill(10, n), ti),
                                       elevation_spread = col(500.0))))
         intervals = [(; lo = 1000, hi = 1100, center = z_b)]
-        applied = resolve_downscaling(fit, intervals, _CP_TIME; basis = :fitted)
+        applied = resolve_downscaling(fit, intervals, _CP_TIME; basis = :fitted, glacier_correction)
         cells = [(lon = 10.0, lat = 46.0, z = z_d, glm = 1.0, bins = [(1050, 5.0)])]
         bands = collect(elevation_interval_forcing(
             _cp_table(cells), applied; climate_model = :synthetic,
@@ -130,6 +130,21 @@ end
     band = only(at_limit.bands)
     @test all(t -> isapprox(t, 273.15 + at_limit.k_band * (2.0 / k_min + lapse_down); atol = 1e-9),
               band.forcing.temperature_air)
+
+    # The additive glacier correction (the default) subtracts the fit's glacier term at the donor,
+    # g = (k_d - 1)·4 K, where k(z_d) is inside the donor limits: at the limit the ambient excess is
+    # the observed 2 K plus 4·(1 - 0.25) = 5 K (8 K under the division). At k_d = 1e-7 the term is
+    # refused as the division's k is, nothing is pooled, and the donor is left as observed.
+    for (k_d, ambient_excess, fitted) in ((1e-7, 2.0, false), (k_min, 2.0 + 4 * (1 - k_min), true))
+        add = band_for(k_d; glacier_correction = :additive)
+        @test add.applied.settings["downscaling_glacier_correction"] == "additive"
+        c = add.applied.donor_decoupling_factor_at(z_d)
+        @test c isa AdditiveGlacierCorrection
+        @test all(==(fitted), c.fitted)
+        @test all(x -> isapprox(x, fitted ? (k_d - 1) * 4.0 : 0.0; atol = 1e-12), c.glacier_term)
+        @test all(t -> isapprox(t, 273.15 + add.k_band * (ambient_excess + lapse_down); atol = 1e-9),
+                  only(add.bands).forcing.temperature_air)
+    end
 end
 
 @testset "pipeline audit: band optical thickness" begin
@@ -272,7 +287,9 @@ end
     @test any(>(0), g_top) && any(<(0), g_top)
 
     fit = (; time = p.time, p.decoupling, p.lapse_rate, p.lapse_rate_uncertainty)
-    applied = resolve_downscaling(fit, hypsometry_intervals(table), run_time; basis = :climatology)
+    # The multiplicative glacier correction with the pooled donor k is exact on this region.
+    applied = resolve_downscaling(fit, hypsometry_intervals(table), run_time; basis = :climatology,
+                                  glacier_correction = :multiplicative)
     # The donor k is the model's k at each hour, from every donor elevation, held or not.
     for zi in (z[1], z[15], z[30])
         @test all(isapprox.(applied.donor_decoupling_factor_at(zi), k_at.(run_time); atol = 1e-12))
@@ -293,6 +310,40 @@ end
         check(collect(elevation_interval_forcing(table[[i], :], applied; climate_model = :synthetic,
                                                  time_range = run_range,
                                                  forcing_loader = loader(run_time, a_run))))
+    end
+
+    # The additive glacier correction (the default) under :climatology has no step with its own fit,
+    # so every warm step takes the smaller warming of the pooled glacier term and the pooled-k
+    # correction. The pooled-k one is exact here, so no band is warmer than the truth, a band whose
+    # every donor is ice-free (glm 0) is exact, and a step where the pooled glacier term warms at
+    # least as much as the exact correction is exact.
+    additive = resolve_downscaling(fit, hypsometry_intervals(table), run_time; basis = :climatology)
+    @test additive.settings["downscaling_glacier_correction"] == "additive"
+    c30 = additive.donor_decoupling_factor_at(z[30])
+    @test c30 isa AdditiveGlacierCorrection && !any(c30.fitted)
+    @test c30.decoupling_factor ≈ k_at.(run_time) atol = 1e-12
+    add_bands = collect(elevation_interval_forcing(table, additive; climate_model = :synthetic,
+                                                   time_range = run_range,
+                                                   forcing_loader = loader(run_time, a_run)))
+    for b in add_bands
+        truth = [T_true(b.center, a_run[i], run_time[i]) for i in eachindex(run_time)]
+        @test all(collect(b.forcing.temperature_air) .<= truth .+ 1e-9)
+    end
+    check(collect(elevation_interval_forcing(table[[1], :], additive; climate_model = :synthetic,
+                                             time_range = run_range,
+                                             forcing_loader = loader(run_time, a_run))))
+    # The glm = 1 donor alone, in its lowest band: exact wherever the pooled glacier term covers the
+    # exact correction.
+    top = first(collect(elevation_interval_forcing(table[[30], :], additive; climate_model = :synthetic,
+                                                    time_range = run_range,
+                                                    forcing_loader = loader(run_time, a_run))))
+    for i in eachindex(run_time)
+        e = E(z[30], a_run[i])
+        e > 0 || continue
+        exact = (1 - k_at(run_time[i])) * e
+        if -c30.glacier_term[i] >= exact
+            @test top.forcing.temperature_air[i] ≈ T_true(top.center, a_run[i], run_time[i]) atol = 1e-9
+        end
     end
 end
 

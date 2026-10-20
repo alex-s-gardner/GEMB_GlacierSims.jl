@@ -203,6 +203,63 @@ end
         @test ind.settings["downscaling_glacier_fraction_form"] == "indicator"
     end
 
+    @testset "the glacier correction option" begin
+        # The fixture's fit: α + βz = 5 K at 1050 m, β = -1 K/km, γ = -3 K, δ = 0, k = 0.4 at the
+        # reference. At a donor at 400 m the ice-free excess is 5.65 K and the glacier term g = -3 K,
+        # so k(400) = 1 - 3/5.65.
+        fit = _physics_fit()
+        rt = fit.time
+        n = length(rt)
+        bands = [(; lo = 1000, hi = 1100, center = 1050.0)]
+        @test DEFAULT_GLACIER_CORRECTION === :additive
+        add = resolve_downscaling(fit, bands, rt; basis = :fitted)
+        mul = resolve_downscaling(fit, bands, rt; basis = :fitted, glacier_correction = :multiplicative)
+        # Recorded only for the additive form; the multiplicative resolution records exactly the
+        # settings of a resolution without the option, so restarts of earlier runs compare equal.
+        @test add.settings["downscaling_glacier_correction"] == "additive"
+        @test !haskey(mul.settings, "downscaling_glacier_correction")
+        @test haskey(run_parameter_differences(add.settings, mul.settings),
+                     "downscaling_glacier_correction")
+        @test sort!(collect(keys(mul.settings))) ==
+              sort!(setdiff(collect(keys(add.settings)), ["downscaling_glacier_correction"]))
+        # Everything but the donor conversion is the same resolution.
+        @test add.lapse_rate == mul.lapse_rate
+        @test add.bands == mul.bands
+        k400 = 1 - 3 / 5.65
+        @test mul.donor_decoupling_factor_at(400.0) ≈ fill(k400, n) atol = 1e-12
+        c = add.donor_decoupling_factor_at(400.0)
+        @test c isa AdditiveGlacierCorrection
+        @test c.glacier_term ≈ fill(-3.0, n) atol = 1e-12
+        @test all(c.fitted)
+        @test c.decoupling_factor == mul.donor_decoupling_factor_at(400.0)
+        @test_throws "glacier_correction must be one of (:additive, :multiplicative), got :ratio" resolve_downscaling(
+            fit, bands, rt; glacier_correction = :ratio)
+        # Under :shaw no donor is converted and the option is neither applied nor recorded.
+        shaw = resolve_downscaling(fit, bands, rt; basis = :fitted,
+                                   band_decoupling = (; rule = :shaw, band_k = [0.7]))
+        @test shaw.donor_decoupling_factor_at(400.0) == ones(n)
+        @test !haskey(shaw.settings, "downscaling_glacier_correction")
+
+        # Fallback tiers. Steps 1-6 have their own fit; steps 7-12 have a reference k out of domain,
+        # so the lapse fit was not corrected there and neither is the donor's own term: under
+        # :fitted they take the month-and-hour median of the accepted glacier term where one exists
+        # (none here: each hour of the day occurs once), then the month median, -3 K, and are not
+        # marked fitted. Under :climatology no step is marked fitted.
+        k_ref = [fill(0.4, 6); fill(1.5, 6)]
+        part = merge(fit, (; decoupling = DimStack(merge(NamedTuple(fit.decoupling),
+            (; decoupling_factor = DimArray(k_ref, dims(fit.decoupling, Ti)))))))
+        cp = resolve_downscaling(part, bands, rt; basis = :fitted).donor_decoupling_factor_at(400.0)
+        @test cp.fitted == [trues(6); falses(6)]
+        @test cp.glacier_term ≈ fill(-3.0, n) atol = 1e-12
+        cc = resolve_downscaling(part, bands, rt; basis = :climatology).donor_decoupling_factor_at(400.0)
+        @test !any(cc.fitted)
+        # No accepted glacier term anywhere (every reference k out of domain): the identity, g = 0.
+        none = merge(fit, (; decoupling = DimStack(merge(NamedTuple(fit.decoupling),
+            (; decoupling_factor = DimArray(fill(1.5, n), dims(fit.decoupling, Ti)))))))
+        c0 = resolve_downscaling(none, bands, rt; basis = :fitted).donor_decoupling_factor_at(400.0)
+        @test c0.glacier_term == zeros(n) && !any(c0.fitted)
+    end
+
     @testset "the Shaw framework bypasses the donor conversion, and only there" begin
         # A reduced form of the exact-model region of the climatology audit: cells at 300-3000 m with
         # glm 0 to 1 whose warm excess is damped by [1 - glm (1 - 0.7)].

@@ -240,6 +240,7 @@ function settings_rows()
                 "$(length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS))"),
         setting("bare-ice albedo", albedo_profile_sample(), "parameter tiles"),
         physics_member_setting(),
+        glacier_correction_setting(),
         setting("spinup climatology", SPINUP_CLIMATOLOGY_WINDOW,
                 haskey(ENV, "SPINUP_CLIMATOLOGY_START") || haskey(ENV, "SPINUP_CLIMATOLOGY_STOP") ?
                 "ENV[SPINUP_CLIMATOLOGY_START/STOP]" : "default"),
@@ -417,7 +418,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
     band_rule = tile_band_decoupling(tile, intervals)
     applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
                                   band_decoupling = band_rule,
-                                  wind_scaling = PHYSICS_MEMBER.wind_scaling)
+                                  wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                  glacier_correction = GLACIER_CORRECTION)
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current
@@ -480,7 +482,8 @@ function run_tile(i, tile, name, path, mp; token, cache)
         applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
                                       basis, decoupling_factor_prior = prior,
                                       band_decoupling = band_rule,
-                                      wind_scaling = PHYSICS_MEMBER.wind_scaling)
+                                      wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                      glacier_correction = GLACIER_CORRECTION)
     end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps

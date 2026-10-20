@@ -130,6 +130,7 @@ function settings_rows()
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
         physics_member_setting(),
+        glacier_correction_setting(),
         background_black_carbon_setting(),
         effective_black_carbon_setting(),
         env_setting("columns per work unit", UNIT_COLUMNS, "UNIT_COLUMNS"),
@@ -275,7 +276,8 @@ function run_native_unit(unit, mp, corrections; token, cache)
     applied = resolve_downscaling(fit, intervals, probe_time; basis,
                                   decoupling_factor_prior = tile_decoupling_factor_prior(tile),
                                   band_decoupling = band_rule,
-                                  wind_scaling = PHYSICS_MEMBER.wind_scaling)
+                                  wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                  glacier_correction = GLACIER_CORRECTION)
     # The reference tile's loading, so every cell runs at the value its tile run was calibrated with.
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
@@ -449,7 +451,8 @@ function run_cell(cell, tile_name, tile_dir, applied, requested, correction, mp;
         applied = resolve_downscaling(fit, intervals, probe_run_time(cell, token, cache, fetch_range);
                                       basis, decoupling_factor_prior = prior,
                                       band_decoupling = band_rule,
-                                      wind_scaling = PHYSICS_MEMBER.wind_scaling)
+                                      wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                      glacier_correction = GLACIER_CORRECTION)
     end
 
     local run
