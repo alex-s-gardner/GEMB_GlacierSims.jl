@@ -3457,6 +3457,8 @@ include("test_pipeline_audit.jl")
 include("test_background_black_carbon.jl")
 
 include("test_physics_members.jl")
+# The slope-dependent wind correction; uses helpers of `runtests.jl` and `test_pipeline_audit.jl`.
+include("test_wind_correction.jl")
 
 include("test_column_profiles.jl")
 

@@ -136,6 +136,19 @@ function tile_band_decoupling(tile, intervals)
 end
 
 """
+    tile_wind_correction(tile, intervals) -> NamedTuple
+
+The `wind_correction` of `resolve_downscaling` for `tile` under `PHYSICS_MEMBER`: `(; rule = :slope,
+band_slope)` with the area-weighted 2 km surface slope of each interval over the tile's core cells
+(`tile_interval_slopes`, which needs the table's `slope2km_*` columns) for a `ws` member, and
+`(; rule = :scaling)` otherwise.
+"""
+function tile_wind_correction(tile, intervals)
+    PHYSICS_MEMBER.wind_correction === :slope || return (; rule = :scaling)
+    return (; rule = :slope, band_slope = GEMB_GlacierSims.tile_interval_slopes(tile.core, intervals))
+end
+
+"""
     tile_decoupling_factor_prior(tile) -> Float64 or nothing
 
 The `decoupling_factor_prior` of `resolve_downscaling` for `tile`: the glacier-area weighted Shaw et al.

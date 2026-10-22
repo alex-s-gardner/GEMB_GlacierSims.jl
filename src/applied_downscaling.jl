@@ -378,6 +378,15 @@ silently reverting to the climatology.
 - `wind_scaling = 1.0`: a factor on every band's wind speed, applied by
   [`elevation_interval_forcing`](@ref) after the band average and before GEMB, and recorded as
   `downscaling_wind_scaling`. It acts on wind alone; at 1 the bands are unchanged bit for bit.
+- `wind_correction = (; rule = :scaling)`: how the band wind is corrected, one of
+  [`WIND_CORRECTIONS`](@ref):
+  - `(; rule = :scaling)`: by `wind_scaling` alone;
+  - `(; rule = :slope, band_slope, [coefficients])`: by [`slope_wind_correction`](@ref), with
+    `band_slope[i]` the 2 km surface slope (degrees) of interval `i` (typically
+    [`tile_interval_slopes`](@ref)) and `coefficients` [`SLOPE_WIND_COEFFICIENTS`](@ref) unless given.
+    `wind_scaling` must then be 1. The rule, the coefficients and the band slopes are recorded as
+    `downscaling_wind_correction*` settings; a `:scaling` resolution records none of them, so it
+    records exactly the settings of a resolution made before the option existed.
 - `glacier_correction = DEFAULT_GLACIER_CORRECTION` (`:additive`): the form of the donors' glacier
   correction, `:additive` or `:multiplicative`, as above. Recorded as
   `downscaling_glacier_correction` when donors are converted additively; a resolution that records
@@ -402,6 +411,7 @@ function resolve_downscaling(fit, intervals, run_time;
                              decoupling_factor_prior = nothing,
                              band_decoupling = (; rule = :fitted),
                              wind_scaling::Real = 1.0,
+                             wind_correction = (; rule = :scaling),
                              glacier_correction::Symbol = DEFAULT_GLACIER_CORRECTION,
                              albedo_ice_default = _DEFAULT_ALBEDO_ICE,
                              albedo_ice_range = GEMB_ALBEDO_ICE_RANGE)
@@ -412,6 +422,9 @@ function resolve_downscaling(fit, intervals, run_time;
     band_rule = band_decoupling_rule(band_decoupling; n_bands = length(intervals))
     (isfinite(wind_scaling) && wind_scaling > 0) ||
         throw(ArgumentError("wind_scaling must be a positive finite factor, got $wind_scaling"))
+    wind_rule = wind_correction_rule(wind_correction; n_bands = length(intervals))
+    wind_rule.rule === :scaling || wind_scaling == 1 || throw(ArgumentError(
+        "wind_correction :$(wind_rule.rule) replaces wind_scaling, which must be 1; got $wind_scaling"))
     run_time = _plain_times(run_time)
     isempty(run_time) && throw(ArgumentError("run_time is empty; there is nothing to resolve onto"))
 
@@ -539,6 +552,15 @@ function resolve_downscaling(fit, intervals, run_time;
     # experiment.
     band_rule.rule === :shaw || glacier_correction === :multiplicative ||
         (settings["downscaling_glacier_correction"] = string(glacier_correction))
+    # Likewise recorded only when the band wind is corrected by slope.
+    if wind_rule.rule === :slope
+        c = wind_rule.coefficients
+        settings["downscaling_wind_correction"] = "slope"
+        settings["downscaling_wind_correction_coefficients"] =
+            [c.m0, c.m1, c.theta_floor, c.u_min_a, c.u_min_b]
+        settings["downscaling_wind_correction_coefficient_names"] = "m0 m1 theta_floor u_min_a u_min_b"
+        settings["downscaling_wind_correction_band_slope"] = wind_rule.band_slope
+    end
 
     return AppliedDownscaling(run_time, lapse_rate, lapse_rate_source, bands, basis, settings,
                               _albedo_provenance(fit, albedo_profile), donor_decoupling_factor_at)

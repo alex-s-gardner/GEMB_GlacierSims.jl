@@ -100,6 +100,9 @@ export read_glacier_cell_parameters, read_glacier_cell_status
 
 # Before `downscaling_parameters.jl`, which dispatches on `AppliedDownscaling` and interpolates this
 # file's thresholds into its docstrings — both of which are resolved when the method is defined.
+include("wind_correction.jl")
+export slope_wind_multiplier, slope_wind_floor, slope_wind_correction, wind_correction_rule
+export tile_interval_slopes, SLOPE_WIND_COEFFICIENTS, BAND_SLOPE_COLUMN_PREFIX, WIND_CORRECTIONS
 include("applied_downscaling.jl")
 export hypsometry_intervals, resolve_downscaling, AppliedDownscaling
 export DOWNSCALING_SOURCES, downscaling_source_counts, decoupling_factor_prior

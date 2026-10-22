@@ -416,9 +416,10 @@ function run_tile(i, tile, name, path, mp; token, cache)
             :fitted : :climatology
     prior = tile_decoupling_factor_prior(tile)
     band_rule = tile_band_decoupling(tile, intervals)
+    wind_rule = tile_wind_correction(tile, intervals)
     applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
                                   band_decoupling = band_rule,
-                                  wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                  wind_scaling = PHYSICS_MEMBER.wind_scaling, wind_correction = wind_rule,
                                   glacier_correction = GLACIER_CORRECTION)
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
@@ -482,7 +483,7 @@ function run_tile(i, tile, name, path, mp; token, cache)
         applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
                                       basis, decoupling_factor_prior = prior,
                                       band_decoupling = band_rule,
-                                      wind_scaling = PHYSICS_MEMBER.wind_scaling,
+                                      wind_scaling = PHYSICS_MEMBER.wind_scaling, wind_correction = wind_rule,
                                       glacier_correction = GLACIER_CORRECTION)
     end
 

@@ -618,6 +618,25 @@ struct _ElevationIntervalForcing{C,L,B,D,K}
     glacier_fraction_form::Symbol
     # The factor on each band's wind speed (`downscaling_wind_scaling`), applied to the band average.
     wind_scaling::Float64
+    # The slope-dependent wind correction (`downscaling_wind_correction` = "slope"): each interval's
+    # 2 km surface slope keyed by its edges, and the correction's coefficients; `nothing` when the
+    # band wind is corrected by `wind_scaling` alone.
+    wind_slope::Union{Nothing,@NamedTuple{band_slope::Dict{Tuple{Int,Int},Float64},
+                                          coefficients::@NamedTuple{m0::Float64, m1::Float64,
+                                              theta_floor::Float64, u_min_a::Float64,
+                                              u_min_b::Float64}}}
+end
+
+# The `wind_slope` field of `_ElevationIntervalForcing` from a resolution's settings.
+function _wind_slope(applied::AppliedDownscaling)
+    get(applied.settings, "downscaling_wind_correction", "scaling") == "slope" || return nothing
+    c = applied.settings["downscaling_wind_correction_coefficients"]
+    θ = applied.settings["downscaling_wind_correction_band_slope"]
+    length(θ) == length(applied.bands) || throw(DimensionMismatch(
+        "$(length(θ)) band slopes recorded for $(length(applied.bands)) bands"))
+    return (; band_slope = Dict((b.lo, b.hi) => Float64(t) for (b, t) in zip(applied.bands, θ)),
+            coefficients = (; m0 = Float64(c[1]), m1 = Float64(c[2]), theta_floor = Float64(c[3]),
+                            u_min_a = Float64(c[4]), u_min_b = Float64(c[5])))
 end
 
 function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling,
@@ -637,7 +656,8 @@ function _ElevationIntervalForcing(grid_cells, load, applied::AppliedDownscaling
                                      Set{Tuple{Float64,Float64}}(),
                                      Symbol(get(applied.settings, "downscaling_glacier_fraction_form",
                                                 "fraction")),
-                                     Float64(get(applied.settings, "downscaling_wind_scaling", 1.0)))
+                                     Float64(get(applied.settings, "downscaling_wind_scaling", 1.0)),
+                                     _wind_slope(applied))
 end
 
 # The applied glacier correction per timestep at the reanalysis elevation `z` of a cell whose glacier
@@ -1138,6 +1158,13 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
     # The wind correction acts on the band's wind alone, after the average; skipped at 1 so the band
     # is then the uncorrected one bit for bit.
     ivf.wind_scaling == 1 || (layers.wind_speed .*= ivf.wind_scaling)
+    # The slope correction likewise acts on the band average, with the band's own slope.
+    wind_slope = ivf.wind_slope === nothing ? nothing :
+                 ivf.wind_slope.band_slope[(interval.lo, interval.hi)]
+    if wind_slope !== nothing
+        c = ivf.wind_slope.coefficients
+        layers.wind_speed .= slope_wind_correction.(layers.wind_speed, wind_slope; coefficients = c)
+    end
 
     # Where `k` actually changed this band's forcing. The decoupling correction scales
     # `max(T - T_ref, 0)`, so at a below-freezing timestep every value of `k` yields bit-identical
@@ -1193,6 +1220,12 @@ function _interval_stack(interval, sums, weight, n_cells, template, ivf, z_max,
         "precipitation_mean" => Statistics.mean(layers.precipitation) * _steps_per_year(time_dim),
         "wind_speed_mean" => Statistics.mean(layers.wind_speed),
         "wind_speed_scaling" => ivf.wind_scaling))
+    if wind_slope !== nothing
+        meta["wind_speed_correction"] = "slope"
+        meta["surface_slope_2km"] = wind_slope
+        meta["wind_speed_slope_multiplier"] = slope_wind_multiplier(wind_slope; coefficients = ivf.wind_slope.coefficients)
+        meta["wind_speed_slope_floor"] = slope_wind_floor(wind_slope; coefficients = ivf.wind_slope.coefficients)
+    end
 
     # The provenance of every applied value, by source, for `k` at this band and for the tile's lapse
     # rate. `*_above_freezing` is the same count over the timesteps where `k` mattered.
