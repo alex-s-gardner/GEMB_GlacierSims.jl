@@ -231,7 +231,7 @@ function assert_corrections_fitted_on(corrections::AbstractString, reference_dir
     differences = String[]
     for key in sort!(collect(keys(recorded)))
         stored = get(reference_parameters, key, nothing)
-        stored !== nothing && _attribute_value(stored) == _attribute_value(recorded[key]) && continue
+        stored !== nothing && isequal(_attribute_value(stored), _attribute_value(recorded[key])) && continue
         push!(differences, "$key: fitted on $(repr(recorded[key])), reference $(repr(stored))")
     end
     isempty(differences) || throw(ArgumentError(

@@ -1004,6 +1004,8 @@ parameter — cannot be shown to agree, so the two are not known to be the same 
 Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
 or `Bool`. A one-element vector and its element compare equal, because NetCDF reads a one-element
 attribute back as a scalar — a per-band setting of a one-band tile would otherwise never match itself.
+Values compare with `isequal`, so a parameter recorded as `NaN` (a setting the run does not read)
+matches itself.
 
 This is what [`gemb_glacier_cell`](@ref) checks a restart against, exposed so a driver can make the
 same comparison up front — before paying for a forcing download — and get the same verdict.
@@ -1012,7 +1014,7 @@ function run_parameter_differences(saved, requested)
     differences = Dict{String,Tuple{Any,Any}}()
     for (key, value) in requested
         haskey(saved, key) || continue
-        _attribute_value(saved[key]) == _attribute_value(value) && continue
+        isequal(_attribute_value(saved[key]), _attribute_value(value)) && continue
         differences[key] = (saved[key], value)
     end
     for key in keys(requested)

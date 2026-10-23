@@ -557,6 +557,14 @@ end
         @test d["model_albedo_ice"] == (0.48, 0.40)
         @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
 
+        # A setting recorded as NaN (one the run does not read) matches itself, and differs from a
+        # finite value.
+        @test isempty(run_parameter_differences(Dict{String,Any}("model_ground_temperature_deep" => NaN),
+                                                Dict{String,Any}("model_ground_temperature_deep" => NaN)))
+        @test haskey(run_parameter_differences(Dict{String,Any}("model_ground_temperature_deep" => NaN),
+                                               Dict{String,Any}("model_ground_temperature_deep" => 270.0)),
+                     "model_ground_temperature_deep")
+
         # NetCDF reads a one-element attribute back as a scalar, so a one-band tile's per-band
         # settings must match their own stored form; a longer vector still has to match exactly.
         one_band = Dict{String,Any}("applied_bare_ice_albedo" => 0.6, "applied_bare_ice_albedo_source" => 4.0)
