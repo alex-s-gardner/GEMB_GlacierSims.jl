@@ -54,6 +54,13 @@ function _physics_fit()
     return (; time = rt, decoupling = dec, lapse_rate = lr)
 end
 
+# `ModelParameters` for hybrid grain growth, constant 350 kg m-3 fresh snow and Arthern densification
+# without destructive metamorphism: the configuration of member level A, stated in full.
+_old_default_parameters(; kwargs...) = initialize_parameters(;
+    densification_method = :Arthern, new_snow_method = :Constant350,
+    grain_growth_method = :hybrid, destructive_metamorphism = false,
+    destructive_metamorphism_density = 175.0, kwargs...)
+
 @testset "physics members" begin
     @testset "the registry" begin
         m = physics_member("C-kshaw-table")
@@ -62,7 +69,8 @@ end
         @test m.model == (; grain_growth_method = :FlannerZender2006,
                           new_snow_method = :vanKampenhout2017, densification_method = :Crocus,
                           destructive_metamorphism = true, blowing_snow_method = :none,
-                          drift_fetch_length = 10.0, new_snow_density = 350.0)
+                          drift_fetch_length = 10.0, new_snow_density = 350.0,
+                          destructive_metamorphism_density = 175.0)
         # D1 is C with Keenan et al. (2021) wind packing at a 10 m fetch, and nothing else.
         d1 = physics_member("D1-kfit-table")
         @test d1.grain === :D1
@@ -77,6 +85,14 @@ end
             @test physics_member("$g-$k-$i").id == "$g-$k-$i"
         end
         @test allequal(keys(v.model) for v in PHYSICS_GRAIN_VARIANTS)
+        # Every level but S keeps the destructive-metamorphism taper of 175 kg m-3 it was run with;
+        # S is GEMB's default snow set, and states each of its settings.
+        for (g, v) in pairs(PHYSICS_GRAIN_VARIANTS)
+            @test v.model.destructive_metamorphism_density == (g === :S ? 100.0 : 175.0)
+        end
+        s = GEMB.initialize_parameters(; PHYSICS_GRAIN_VARIANTS.S.model...)
+        d = GEMB.initialize_parameters()
+        @test all(getfield(s, f) == getfield(d, f) for f in keys(PHYSICS_GRAIN_VARIANTS.S.model))
 
         # The constant-density levels: B or C settling under a constant deposition density, and
         # otherwise the B or C level.
@@ -94,7 +110,7 @@ end
         @test physics_member("C250-kfit-table").model.destructive_metamorphism
         @test_throws "settling must be \"B\" or \"C\", got \"D\"" GEMB_GlacierSims._constant_snow_level("D", 300.0)
         @test_throws "a physics member is \"<grain>-<band decoupling>-<impurity>\"" physics_member("C-kfit")
-        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C, D1, B250, B300, C250, C300, C350" physics_member(
+        @test_throws "unknown grain variant \"D\" in physics member \"D-kfit-table\"; one of A, B, C, D1, S, B250, B300, C250, C300, C350" physics_member(
             "D-kfit-table")
         @test_throws "unknown band decoupling level \"ks35\" in physics member \"A-ks35-table\"; one of kfit, kshaw" physics_member(
             "A-ks35-table")
@@ -126,9 +142,16 @@ end
                 @test getproperty(mp, field) == value
             end
         end
-        # A is the GEMB default snow configuration.
+        # S is the GEMB default snow configuration; A matches `GEMB` run with hybrid grain growth,
+        # constant 350 kg m-3 fresh snow and Arthern densification.
         default = initialize_parameters()
-        @test all(getproperty(default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.A.model))
+        @test all(getproperty(default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.S.model))
+        old_default = initialize_parameters(; densification_method = :Arthern,
+                                            new_snow_method = :Constant350,
+                                            grain_growth_method = :hybrid,
+                                            destructive_metamorphism = false,
+                                            destructive_metamorphism_density = 175.0)
+        @test all(getproperty(old_default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.A.model))
         @test_throws "physics member B-kfit-bc0 sets grain_growth_method; remove it from the keywords" physics_model_parameters(
             physics_member("B-kfit-bc0"); grain_growth_method = :hybrid)
         @test_throws "physics member D1-kfit-table sets blowing_snow_method" physics_model_parameters(
@@ -542,7 +565,7 @@ end
 
         # A run whose settings are not the member's is refused, naming what disagrees.
         @test_throws "physics member C-kshaw-table sets grain_growth_method = :FlannerZender2006, but the run's ModelParameters has :hybrid" tile_run_parameters(
-            initialize_parameters(), shawapplied; spinup_window = window, background_black_carbon = bbc,
+            _old_default_parameters(), shawapplied; spinup_window = window, background_black_carbon = bbc,
             physics_member = m)
         @test_throws "applies band decoupling (rule = \"shaw\", donor_conversion = \"none\"), but the downscaling was resolved with (rule = \"fitted\", donor_conversion = \"fitted\")" tile_run_parameters(
             mp, flat; spinup_window = window, background_black_carbon = bbc, physics_member = m)
@@ -601,7 +624,8 @@ end
     @testset "a tile run records its member and fails before any GEMB run when mislabelled" begin
         forcing = _tiny_band_forcing()
         m = physics_member("A-kfit-bc0")
-        run = _tiny_tile_run([0.48]; forcing, physics_member = m)
+        mp = _old_default_parameters(; output_frequency = :monthly)
+        run = _tiny_tile_run([0.48]; forcing, mp, physics_member = m)
         @test run.parameters["physics_member"] == "A-kfit-bc0"
         written = write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"), run)
         status = read_glacier_tile_status(written)
@@ -610,7 +634,7 @@ end
         # The `_tiny_tile_run` forcing is `:hybrid`; member B would need Flanner & Zender.
         calls = Ref(0)
         @test_throws "physics member B-kfit-bc0 sets grain_growth_method" _tiny_tile_run(
-            [0.48]; forcing, physics_member = physics_member("B-kfit-bc0"),
+            [0.48]; forcing, mp, physics_member = physics_member("B-kfit-bc0"),
             on_output = (o; kw...) -> (calls[] += 1))
         @test calls[] == 0
     end
