@@ -61,7 +61,8 @@ wrap_lon(lon) = lon > 180 ? lon - 360 : lon
 
 """
     forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=$(_DEFAULT_LAPSE_RATE),
-                         precip_scaling_method=nothing, decoupling_factor=nothing)
+                         precip_scaling_method=nothing, decoupling_factor=nothing,
+                         glacier_fraction=0.0)
 
 Lapse-rate-adjust `forcing_data` by `delta_elevation` metres and convert it to a GEMB
 `ClimateForcing`, ready to hand to `initialize_profile` / `gemb`.
@@ -76,18 +77,37 @@ the passed `forcing_data`, so calling this repeatedly with different `delta_elev
 - `lapse_rate`: temperature lapse rate passed through to `climate_adjust_for_elevation` (K/km).
 - `precip_scaling_method`: precipitation scaling passed through to `climate_adjust_for_elevation`
   (`nothing` leaves precipitation unchanged).
-- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`, applied by
-  `climate_adjust_for_glacier` *after* the elevation adjustment — the order that function
-  requires, since `k` scales an ambient temperature already at the glacier's elevation.
-  `nothing` (the default) leaves the forcing ambient.
+- `decoupling_factor`: on-glacier air temperature decoupling factor `k` in `(0, 1]`. The forcing is
+  first brought to the ice-free state with `k` and `glacier_fraction`, then lapsed, then decoupled
+  with `k` by `climate_adjust_for_glacier` — the order the decoupling requires, since `k` scales an
+  ambient temperature already at the glacier's elevation. `nothing` (the default) leaves the
+  forcing ambient.
+- `glacier_fraction`: the fraction `glm` of the reanalysis cell its land-surface scheme already runs
+  as ice, whose warm excess is therefore `[1 - glm·(1 - k)]·E_ambient`. Only read with a
+  `decoupling_factor`; `0` treats the forcing as ambient already.
+
+With one scalar `k` and no regional fit, the ambient excess is read off that mixing model directly,
+`E_ambient = E_obs / (1 - glm·(1 - k))` (`_ambient_forcing`, with `k` at every timestep). The
+division multiplies the observed excess by at most `1/k` (at `glm = 1`), so a cell with
+`glacier_fraction > 0` needs `k` inside `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, the range that bounds
+that factor, and a smaller `k` throws. With `glacier_fraction = 0` there is nothing to undo, and
+any `k` in `(0, 1]` is accepted.
 """
 function forcing_at_elevation(forcing_data, delta_elevation; lapse_rate=_DEFAULT_LAPSE_RATE,
-                              precip_scaling_method=nothing, decoupling_factor=nothing)
-    adjusted = climate_adjust_for_elevation(forcing_data, delta_elevation;
-                                            lapse_rate, precip_scaling_method)
-    decoupling_factor === nothing ||
-        (adjusted = climate_adjust_for_glacier(adjusted, decoupling_factor))
-    return initialize_forcing(adjusted)
+                              precip_scaling_method=nothing, decoupling_factor=nothing,
+                              glacier_fraction=0.0)
+    decoupling_factor === nothing &&
+        return initialize_forcing(climate_adjust_for_elevation(forcing_data, delta_elevation;
+                                                               lapse_rate, precip_scaling_method))
+    k = Float64(decoupling_factor)
+    glm = Float64(glacier_fraction)
+    _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] || throw(ArgumentError(
+        "decoupling_factor must be in (0, 1] (got $(decoupling_factor))"))
+    0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
+    ambient = glm == 0 ? forcing_data :
+              _ambient_forcing(forcing_data, glm, fill(k, length(forcing_data[:temperature_air])))
+    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate, precip_scaling_method)
+    return initialize_forcing(climate_adjust_for_glacier(lapsed, decoupling_factor))
 end
 
 # Rewrap glm (the ERA5-Land invariant grid) to the SAME (-180, 180] convention as the Zarr grid.
@@ -116,20 +136,6 @@ function _row_glm(row)
     g = Float64(v)
     return isfinite(g) ? clamp(g, 0.0, 1.0) : 0.0
 end
-
-# The share of a published decoupling factor `k` a cell still needs, given the ERA5-Land glacier-mask
-# fraction `glm` its land-surface scheme has already accounted for:
-#
-#     k_eff = 1 - (1 - k) * (1 - glm)
-#
-# The full correction where the cell carries no glacier (`glm = 0`) and the identity where it is
-# entirely glacier (`glm = 1`). Defined once because this is the package's single convention for
-# that weighting, applied both per cell ([`cell_decoupling_factor`](@ref), one scalar `k` from the
-# published table) and per elevation interval (`derive_decoupling_factor`, a fitted `k` per
-# timestep) — and it is the same weighting `derive_lapse_rate` folds into its regression sums to
-# undo. Two independent spellings would let those paths disagree about the same cell's forcing
-# while both stayed finite and in-domain, so the drift would be invisible.
-_effective_decoupling_factor(k, glm) = 1 - (1 - k) * (1 - glm)
 
 # How far a cell that carries ice but no forcing of its own may borrow a neighbour's, by default:
 # about four to five ERA5-Land cells (the grid is 0.1°, ~11 km). Loose enough to reach the nearest
@@ -272,18 +278,21 @@ beyond the directory. That is what lets a sweep run as N independent processes t
 other rather than being handed a fixed partition up front, which matters when per-tile cost is not
 predictable in advance.
 
-A claim left behind by a process that died would drop its tile from the sweep silently, so a claim older
-than `stale_after` whose tile still has no output is reclaimed: removed and re-created, the re-creation
-deciding the winner if two callers race. `stale_after` must exceed the longest a single tile can
-legitimately take, because reclaiming a *running* tile would put two writers on one output file — hence
-hours rather than minutes, and hence the output file being checked first. `stale_after <= 0` disables
-reclaiming.
+A claim left behind by a process that died would drop its tile from the sweep silently, so a claim whose
+heartbeat is older than `stale_after` and whose tile still has no output is reclaimed: removed and
+re-created, the re-creation deciding the winner if two callers race. The heartbeat is the modification
+time of the claim's `heartbeat` file, written when the claim is taken and refreshed for as long as the
+owner runs [`start_claim_heartbeat`](@ref); a claim without the file is judged by the directory's own
+modification time. A running tile is therefore never reclaimed however long it takes, provided
+`stale_after` is several heartbeat intervals, and a crashed owner's claim becomes reclaimable
+`stale_after` after its last heartbeat. `stale_after <= 0` disables reclaiming.
 """
 function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
                      output_path::AbstractString; stale_after::Period = Hour(24))
     path = joinpath(claim_dir, tile_name)
     try
         mkdir(path)
+        touch(joinpath(path, CLAIM_HEARTBEAT_FILE))
         return true
     catch err
         err isa Base.IOError || rethrow()
@@ -292,7 +301,7 @@ function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
     stale_after <= Hour(0) && return false
     isfile(output_path) && return false            # finished, not abandoned
     age = try
-        Millisecond(round(Int, (time() - mtime(path)) * 1000))
+        Millisecond(round(Int, (time() - _claim_heartbeat_time(path)) * 1000))
     catch
         return false                               # vanished under us: another caller owns it
     end
@@ -302,10 +311,91 @@ function claim_tile!(claim_dir::AbstractString, tile_name::AbstractString,
     try
         rm(path; force = true, recursive = true)
         mkdir(path)                                # atomic: only one reclaimer wins
+        touch(joinpath(path, CLAIM_HEARTBEAT_FILE))
         return true
     catch err
         err isa Base.IOError || rethrow()
         return false
+    end
+end
+
+# The file inside a claim whose modification time is the owner's heartbeat.
+const CLAIM_HEARTBEAT_FILE = "heartbeat"
+
+function _claim_heartbeat_time(path)
+    beat = joinpath(path, CLAIM_HEARTBEAT_FILE)
+    return isfile(beat) ? mtime(beat) : (isdir(path) ? mtime(path) : error("no claim at $path"))
+end
+
+"""
+    ClaimHeartbeat
+
+A running heartbeat for one claim, from [`start_claim_heartbeat`](@ref). Stop it with
+[`stop_claim_heartbeat!`](@ref).
+"""
+struct ClaimHeartbeat
+    path::String
+    process::Base.Process
+end
+
+"""
+    start_claim_heartbeat(claim_dir, tile_name; interval = Minute(5), owner = getpid())
+        -> ClaimHeartbeat
+
+Refresh the heartbeat of the claim [`claim_tile!`](@ref) took on `tile_name` every `interval` until
+[`stop_claim_heartbeat!`](@ref). The claim is then never stale while its owner runs, however long the
+tile takes, and a claim whose owner died stops beating.
+
+The refresh runs in a separate `sh` process that touches the claim's heartbeat file and exits within
+one `interval` of the process `owner` (by default this one) ending, however it ends. It is a process and not a task because a tile
+run computes for hours without yielding, and a Julia task waiting on a timer would not run until it did.
+"""
+function start_claim_heartbeat(claim_dir::AbstractString, tile_name::AbstractString;
+                               interval::Period = Minute(5), owner::Integer = getpid())
+    seconds = Dates.value(convert(Millisecond, interval)) / 1000
+    seconds > 0 || throw(ArgumentError("interval must be positive, got $interval"))
+    path = joinpath(claim_dir, tile_name, CLAIM_HEARTBEAT_FILE)
+    isdir(dirname(path)) || throw(ArgumentError("no claim for $tile_name under $claim_dir"))
+    # `$1` is the heartbeat path and `$2` the owner's process id.
+    loop = """
+        while kill -0 "\$2" 2>/dev/null; do
+            touch "\$1" || exit 1
+            sleep $(seconds)
+        done
+        """
+    process = run(pipeline(`sh -c $loop claim-heartbeat $path $owner`;
+                           stdout = devnull, stderr = stderr); wait = false)
+    return ClaimHeartbeat(path, process)
+end
+
+"""
+    stop_claim_heartbeat!(heartbeat::ClaimHeartbeat)
+
+Stop refreshing the claim's heartbeat. Throws if the heartbeat had already stopped on its own, since
+the claim may then have gone stale while its owner ran.
+"""
+function stop_claim_heartbeat!(heartbeat::ClaimHeartbeat)
+    p = heartbeat.process
+    running = process_running(p)
+    running && kill(p)
+    wait(p)
+    running || error("the heartbeat of the claim at $(dirname(heartbeat.path)) stopped while its " *
+                     "owner ran (exit code $(p.exitcode)), so the claim may have been reclaimed")
+    return nothing
+end
+
+"""
+    with_claim_heartbeat(f, claim_dir, tile_name; interval = Minute(5))
+
+Run `f()` with the claim's heartbeat refreshed throughout, and stop it however `f` exits.
+"""
+function with_claim_heartbeat(f, claim_dir::AbstractString, tile_name::AbstractString;
+                              interval::Period = Minute(5))
+    heartbeat = start_claim_heartbeat(claim_dir, tile_name; interval)
+    try
+        return f()
+    finally
+        stop_claim_heartbeat!(heartbeat)
     end
 end
 
@@ -369,4 +459,281 @@ function claim_order(weights, block::Int, n_blocks::Int)
     rest = setdiff(eachindex(weights), mine)
     sort!(rest; by = i -> weights[i], rev = true)
     return vcat(collect(mine), rest)
+end
+
+"""
+    software_provenance() -> Dict{String,Any}
+
+The versions and source trees of GEMB, GEMB_ClimateForcing and GEMB_GlacierSims this process runs,
+as `software_<package>_version` and `software_<package>_tree`. Both [`run_parameters`](@ref) and
+[`tile_run_parameters`](@ref) include them, so a run under different code compares as a different
+experiment.
+
+The tree is the git tree hash of the package's `src` directory at `HEAD` when the package is a git
+checkout — with `+dirty:` and a CRC-32C of the uncommitted changes to `src` and `Project.toml`
+(including untracked files under `src`) when there are any — otherwise the `git-tree-sha1` the
+active manifest records for it, and failing both `crc32c:` and a CRC-32C of every file under `src`
+and of `Project.toml`. Computed once per process.
+"""
+function software_provenance()
+    p = lock(_SOFTWARE_PROVENANCE_LOCK) do
+        cached = _SOFTWARE_PROVENANCE[]
+        cached === nothing || return cached
+        p = Dict{String,Any}()
+        for (label, mod) in (("gemb", GEMB), ("gemb_climateforcing", GEMB_ClimateForcing),
+                             ("gemb_glaciersims", @__MODULE__))
+            p["software_$(label)_version"] = string(pkgversion(mod))
+            p["software_$(label)_tree"] = _package_tree(mod)
+        end
+        _SOFTWARE_PROVENANCE[] = p
+    end
+    return copy(p)
+end
+
+# Filled by the first call; the lock keeps concurrent first calls from each running the git queries.
+const _SOFTWARE_PROVENANCE = Ref{Union{Nothing,Dict{String,Any}}}(nothing)
+const _SOFTWARE_PROVENANCE_LOCK = ReentrantLock()
+
+function _package_tree(mod::Module)
+    dir = pkgdir(mod)
+    dir === nothing && throw(ArgumentError("$(mod) has no package directory to identify"))
+    git(args...) = Cmd(`git -C $dir $args`; ignorestatus = true)
+    if isdir(joinpath(dir, ".git")) || isfile(joinpath(dir, ".git"))
+        tree = readchomp(Cmd(`git -C $dir rev-parse HEAD:./src`))
+        dirty = readchomp(git("status", "--porcelain", "--untracked-files=all", "--", "src",
+                              "Project.toml"))
+        isempty(dirty) && return tree
+        untracked = filter(!isempty, split(readchomp(git("ls-files", "--others", "--exclude-standard",
+                                                         "--", "src")), '\n'))
+        crc = _crc_files(dir, untracked, Base._crc32c(read(git("diff", "HEAD", "--", "src", "Project.toml"))))
+        return tree * "+dirty:" * string(crc; base = 16, pad = 8)
+    end
+    uuid = string(Base.PkgId(mod).uuid)
+    for env in Base.load_path()
+        manifest = Base.project_file_manifest_path(env)
+        (manifest === nothing || !isfile(manifest)) && continue
+        deps = get(Base.parsed_toml(manifest), "deps", Dict{String,Any}())
+        for entry in get(deps, string(nameof(mod)), [])
+            get(entry, "uuid", "") == uuid || continue
+            haskey(entry, "git-tree-sha1") && return entry["git-tree-sha1"]
+        end
+    end
+    # A plain directory, such as a `dev`ed copy outside git: identify it by its contents.
+    files = [relpath(joinpath(root, f), dir) for (root, _, fs) in walkdir(joinpath(dir, "src")) for f in fs]
+    crc = _crc_files(dir, sort!(push!(files, "Project.toml")), UInt32(0))
+    return "crc32c:" * string(crc; base = 16, pad = 8)
+end
+
+# CRC-32C over each file's path (relative to `dir`) and contents, continuing from `crc`.
+function _crc_files(dir, files, crc::UInt32)
+    for f in files
+        crc = Base._crc32c(f, crc)
+        crc = Base._crc32c(read(joinpath(dir, f)), crc)
+    end
+    return crc
+end
+
+"""
+    era5_land_record_span(cache_path) -> (; start, stop)
+
+The first and last hourly stamps of the ERA5-Land record held in the disk cache at `cache_path`, the
+`cache_path` passed to `climate_forcing`, read as `climate_forcing` reads it: the time axis of the
+cached `sfc-2m-temperature` group, the only group whose time axis it reads, checked against the
+record length of every (lon, lat, time) variable of every group in the cached consolidated metadata.
+
+The cache is only read: nothing is fetched and nothing is written. `climate_forcing` serves a cached
+record as it was when the cache was first filled and refuses any request past its end, so this is the
+latest end a run against the cache can ask for. Throws when a variable group has no cached
+consolidated metadata, when the time axis cannot be read in full, when it is not strictly increasing
+in whole hours, or when a variable's record length differs from it: each of those is a cache
+`climate_forcing` would also refuse.
+"""
+function era5_land_record_span(cache_path::AbstractString)
+    isdir(cache_path) || throw(ArgumentError("no ERA5-Land disk cache at $cache_path"))
+    groups = Dict(group => _open_cached_group(joinpath(cache_path, group))
+                  for group in keys(GEMB_ClimateForcing.ERA5_LAND_STORES))
+    dir = joinpath(cache_path, "sfc-2m-temperature")
+    temperature = groups["sfc-2m-temperature"]
+    haskey(temperature.arrays, "time") || throw(ArgumentError("the cached group $dir has no time axis"))
+    t = temperature["time"]
+    units = get(t.attrs, "units", "")
+    m = match(r"hours since (\d{4}-\d{2}-\d{2})", units)
+    m === nothing && throw(ArgumentError(
+        "the time axis of $dir is in \"$units\", not hours since a date"))
+    epoch = DateTime(m.captures[1])
+    hours = try
+        collect(Float64, t[:])
+    catch e
+        e isa InterruptException && rethrow()
+        throw(ArgumentError("the time axis of $dir cannot be read in full from the cache " *
+                            "($(sprint(showerror, e)))"))
+    end
+    isempty(hours) && throw(ArgumentError("the time axis of $dir is empty"))
+    all(isfinite, hours) && all(isinteger, hours) && all(>(0), diff(hours)) || throw(ArgumentError(
+        "the time axis of $dir is not strictly increasing in whole hours"))
+    start = epoch + Hour(Int(first(hours)))
+    stop = epoch + Hour(Int(last(hours)))
+    variables = [a for g in values(groups) for a in values(g.arrays) if ndims(a) == 3]
+    GEMB_ClimateForcing._check_cached_record(cache_path, hours, epoch, (start, stop), variables)
+    return (; start, stop)
+end
+
+# One variable group of the ERA5-Land disk cache, read-only. `climate_forcing` reaches the cache
+# through `Zarr.CachingStore`, which stores only the keys it read: the group's `.zmetadata` and the
+# chunks read, with no `.zgroup` or `.zarray` for Zarr's format detection to find. ClimateForcing
+# declares its own stores Zarr v2 instead of detecting the format, and this store does the same (Zarr
+# detects the format of a consolidated group from the store under it, whatever `zopen` is told). It
+# serves only what is on disk and refuses writes, so reading the record fetches and writes nothing.
+struct _CachedGroupStore <: Zarr.AbstractStore
+    dir::Zarr.DirectoryStore
+end
+Base.getindex(s::_CachedGroupStore, k::String) = s.dir[k]
+Base.setindex!(::_CachedGroupStore, v, k::String) =
+    throw(ArgumentError("the ERA5-Land disk cache is read here, not written; refusing to write $k"))
+Zarr.subdirs(s::_CachedGroupStore, p) = Zarr.subdirs(s.dir, p)
+Zarr.subkeys(s::_CachedGroupStore, p) = Zarr.subkeys(s.dir, p)
+Zarr.storagesize(s::_CachedGroupStore, p) = Zarr.storagesize(s.dir, p)
+Zarr.ZarrFormat(::_CachedGroupStore, path) = Zarr.ZarrFormat(2)
+
+function _open_cached_group(dir)
+    isfile(joinpath(dir, ".zmetadata")) || throw(ArgumentError(
+        "the ERA5-Land cache has no consolidated metadata at $dir; load forcing through " *
+        "`climate_forcing` with this cache_path once to fill it"))
+    return Zarr.zopen(_CachedGroupStore(Zarr.DirectoryStore(dir)); consolidated = true,
+                      fill_as_missing = false)
+end
+
+"""
+    run_time_range(args, record) -> (; time_range, source)
+
+The `(start, stop)` a run script covers, from its command-line `args` and the forcing `record`
+(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns). `args[1]` is the start and `args[2]`
+the end, each a year (that year's 1 January, 00:00), an ISO date-time such as `2026-08-14T23:00:00`,
+or `record-start` / `record-end` for the record's own first / last step. A missing start or end is
+the record's. Throws when the range is empty, starts before the record or ends after it, naming the
+record, so a run refuses at start-up rather than in every tile: the cached ERA5-Land record starts at
+1950-01-02T00:00, so the year 1950 is refused. `source` says where each end came from, for the
+settings table.
+"""
+function run_time_range(args, record)
+    start = length(args) >= 1 ? _parse_run_time(args[1], "record-start", record.start) : record.start
+    stop = length(args) >= 2 ? _parse_run_time(args[2], "record-end", record.stop) : record.stop
+    start < stop || throw(ArgumentError("the run starts at $start, not before its end $stop"))
+    record.start <= start || throw(ArgumentError(
+        "the run starts at $start, before the cached ERA5-Land record, which starts at " *
+        "$(record.start); start at or after it, or pass `record-start`"))
+    stop <= record.stop || throw(ArgumentError(
+        "the run $start to $stop reaches outside the cached ERA5-Land record, which runs from " *
+        "$(record.start) to $(record.stop); end the run at or before $(record.stop), or refresh " *
+        "the cache"))
+    from_record(i, token) = length(args) < i || args[i] == token
+    source = (from_record(1, "record-start") ? "start of the cached record" : "start from ARGS") *
+             ", " * (from_record(2, "record-end") ? "end of the cached record" : "end from ARGS")
+    return (; time_range = (start, stop), source)
+end
+
+"""
+    spinup_window_range(start, stop, record, time_range; last_year, minimum_years = 1,
+                        step = Hour(1)) -> (start, stop)
+
+The window a run script's spinup climatology is drawn from, as whole calendar years. GEMB's
+climatology keeps only complete years, so a window of whole years names exactly the years the
+climatology uses, and that is the window a run records. `record` is the cached forcing record
+(`(; start, stop)`, as [`era5_land_record_span`](@ref) returns), `time_range` the run's, and `step` the
+forcing's time step (ERA5-Land is hourly). The window must lie inside both the record and the run:
+a run fetches no forcing outside its own range.
+
+With `start` and `stop` `nothing`, the window is the whole calendar years inside
+[max(record start, run start), min(31 December `last_year`, record end, run end)]. For the cached
+ERA5-Land record, which starts 1950-01-02T00:00, a full-record run and `last_year = 1980`, that is
+1951-01-01T00:00 .. 1980-12-31T23:00. Either end can be given instead: `start` as a year (its
+1 January, 00:00) or an ISO date-time at 1 January, 00:00; `stop` as a year (the last `step` of its
+31 December) or an ISO date-time at that instant.
+
+Throws, naming the bound, when a given end is not a calendar-year boundary, when the window starts
+before the record or the run or ends after them, when the default interval holds no whole year, or
+when the window holds fewer than `minimum_years` years.
+"""
+function spinup_window_range(start, stop, record, time_range; last_year::Integer,
+                             minimum_years::Integer = 1, step = Hour(1))
+    lo = max(record.start, first(time_range))
+    hi = min(record.stop, last(time_range))
+    cap = min(hi, DateTime(last_year + 1) - step)
+    default = _whole_year_window(lo, cap, step)
+    default === nothing && (start === nothing || stop === nothing) && throw(ArgumentError(
+        "the spinup climatology window defaults to the whole calendar years inside $lo .. $cap " *
+        "(the cached ERA5-Land record and the run, through 31 December $last_year), and that " *
+        "interval holds none; give the window's start and stop explicitly"))
+    t0 = start === nothing ? default[1] : _spinup_window_start(start)
+    t1 = stop === nothing ? default[2] : _spinup_window_stop(stop, step)
+    t0 < t1 || throw(ArgumentError("the spinup climatology window starts at $t0, not before its end $t1"))
+    record.start <= t0 || throw(ArgumentError(
+        "the spinup climatology window starts at $t0, before the cached ERA5-Land record, which " *
+        "starts at $(record.start); start it on 1 January of a later year"))
+    first(time_range) <= t0 || throw(ArgumentError(
+        "the spinup climatology window starts at $t0, before the run, which starts at " *
+        "$(first(time_range)) and fetches no forcing before it; start the run at or before $t0, " *
+        "or start the window on 1 January of a year at or after $(first(time_range))"))
+    t1 <= record.stop || throw(ArgumentError(
+        "the spinup climatology window ends at $t1, after the cached ERA5-Land record, which ends " *
+        "at $(record.stop); end it on 31 December of an earlier year"))
+    t1 <= last(time_range) || throw(ArgumentError(
+        "the spinup climatology window ends at $t1, after the run, which ends at " *
+        "$(last(time_range)) and fetches no forcing after it; end the run at or after $t1, or end " *
+        "the window on 31 December of a year at or before $(last(time_range))"))
+    n = _whole_years((t0, t1))
+    n >= minimum_years || throw(ArgumentError(
+        "the spinup climatology window $t0 .. $t1 holds $n whole calendar year(s); the spinup " *
+        "climatology needs at least $minimum_years"))
+    return (t0, t1)
+end
+
+function _spinup_window_start(s::AbstractString)
+    t = occursin(r"^\d{4}$", s) ? DateTime(parse(Int, s)) : tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year nor an ISO date-time (examples: 1951, 1951-01-01T00:00:00)"))
+    t == DateTime(year(t)) || throw(ArgumentError(
+        "the spinup climatology window must start on 1 January, 00:00 of a year, not at $t: " *
+        "the climatology keeps only whole calendar years"))
+    return t
+end
+
+function _spinup_window_stop(s::AbstractString, step)
+    occursin(r"^\d{4}$", s) && return DateTime(parse(Int, s) + 1) - step
+    t = tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year nor an ISO date-time (examples: 1980, 1980-12-31T23:00:00)"))
+    t == DateTime(year(t) + 1) - step || throw(ArgumentError(
+        "the spinup climatology window must end at the last step of 31 December of a year " *
+        "($(DateTime(year(t) + 1) - step) for this $(step) forcing), not at $t: the climatology " *
+        "keeps only whole calendar years"))
+    return t
+end
+
+# The whole calendar years inside `[lo, hi]` on a time grid of `step`: from 1 January 00:00 of the first
+# year starting at or after `lo` to the last step (one `step` before the next 1 January) of the last year
+# ending by `hi`. `nothing` when no whole year fits.
+function _whole_year_window(lo::DateTime, hi::DateTime, step)
+    y0 = lo == DateTime(year(lo)) ? year(lo) : year(lo) + 1
+    y1 = hi >= DateTime(year(hi) + 1) - step ? year(hi) : year(hi) - 1
+    y0 <= y1 || return nothing
+    return (DateTime(y0), DateTime(y1 + 1) - step)
+end
+
+# Whether `window` is whole calendar years on a time grid of `step`.
+_is_whole_year_window(window, step) =
+    window[1] == DateTime(year(window[1])) && window[2] == DateTime(year(window[2]) + 1) - step &&
+    window[1] < window[2]
+
+_whole_years(window) = year(window[2]) - year(window[1]) + 1
+
+# `s` as a year, an ISO date-time, or `token`, which stands for `record_time`.
+function _parse_run_time(s::AbstractString, token, record_time)
+    s == token && return record_time
+    occursin(r"^\d{4}$", s) && return DateTime(parse(Int, s), 1, 1)
+    t = tryparse(DateTime, s)
+    t === nothing && throw(ArgumentError(
+        "\"$s\" is neither a year, an ISO date-time nor `$token` (examples: 1951, " *
+        "2026-08-14T23:00:00, $token)"))
+    return t
 end

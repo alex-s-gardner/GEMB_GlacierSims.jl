@@ -13,7 +13,8 @@
 #   bare_ice_albedo_bins_<tile>.parquet    one row per (cell, elevation bin): albedo beside area
 #   bare_ice_albedo_<tile>.png             the tile's albedo-elevation profile and two maps
 #
-# Needs network for the Copernicus DEM (GDAL /vsicurl), but **not** for the albedo: that is read
+# Needs network for the Copernicus DEM (GDAL /vsicurl) unless COPERNICUS_DEM_ARCHIVE names a local
+# mirror, and never for the albedo: that is read
 # from the pooled tables vendored in GEMB_ClimateForcing's `data/`, so no MODIS granule is
 # downloaded and no Earthdata token is needed.
 #
@@ -69,6 +70,10 @@ const OUTPUT_DIR = joinpath(CLIMATE_CACHE, "bare_ice_albedo")
 # which is where the default resolves. GLO-30 tiles are 19–40 MB each.
 const DEM_CACHE = joinpath(CLIMATE_CACHE, "invariant", "copernicus_dem_30m")
 
+# A local mirror of the copernicus-dem-30m bucket to read the DEM from instead of the network
+# (`copernicus_dem_archive`); unset, tiles are fetched and cached under DEM_CACHE.
+const DEM_ARCHIVE = get(ENV, "COPERNICUS_DEM_ARCHIVE", nothing)
+
 tile_name = isempty(ARGS) ? DEFAULT_TILE : (endswith(ARGS[1], ".nc") ? ARGS[1] : ARGS[1] * ".nc")
 stem = replace(tile_name, ".nc" => "")
 
@@ -113,8 +118,10 @@ tile_extent = Extents.Extent(X = (tile.bounds.lon_min - 0.1, tile.bounds.lon_max
 # `cache_tiles` keeps whole 1° DEM tiles, so a re-run or a neighbouring tile touches no network.
 # Bounded only because an `extent` is given: on the global mosaic it would fetch every published
 # tile. The path must be durable or the call throws rather than write tiles the OS will reap.
-dem = climate_model_invariant(model = :copernicus_dem_30m, extent = tile_extent,
-                              cache_path = DEM_CACHE, cache_tiles = true, verbose = false)
+dem = DEM_ARCHIVE === nothing ?
+    climate_model_invariant(model = :copernicus_dem_30m, extent = tile_extent,
+                            cache_path = DEM_CACHE, cache_tiles = true, verbose = false) :
+    copernicus_dem_archive(DEM_ARCHIVE, tile_extent)
 
 out = bare_ice_albedo_tile(tile, dem; bins, sky = SKY, min_cells = MIN_CELLS,
                            extrapolate = EXTRAPOLATE)
@@ -122,7 +129,8 @@ out = bare_ice_albedo_tile(tile, dem; bins, sky = SKY, min_cells = MIN_CELLS,
 # The tile-level profile the downscaling sweep stores: pooled over the *buffered* cells, so
 # neighbouring tiles overlap by half their window. This is what GEMB actually reads.
 pooled = derive_bare_ice_albedo(tile.buffered; bins, sky = SKY, min_cells = MIN_CELLS,
-                                dem_cache_path = DEM_CACHE, label = stem, verbose = false)
+                                dem_cache_path = DEM_CACHE, dem_archive = DEM_ARCHIVE,
+                                label = stem, verbose = false)
 
 # --------------------------------------------------------------------------------- output
 

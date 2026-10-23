@@ -28,6 +28,27 @@ const TILE_MASS_VARIABLES = (CELL_MASS_VARIABLES..., :blowing_snow)
 const TILE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual,
                                :firn_air_content)
 
+# GEMB's count of the cell-steps at which its thermal solve froze a wet cell's water itself, and the
+# water frozen there (GEMB's `refreeze_thermal`, `refreeze_thermal_count`). Per-band interval sums
+# like the mass fluxes, but without tile totals: the mass is already part of `refreeze`, and a count
+# has no area-weighted total. The tile reduces them to the `refreeze_thermal_*` attributes of
+# [`_refreeze_thermal_summary`](@ref).
+const TILE_DIAGNOSTIC_VARIABLES = (:refreeze_thermal, :refreeze_thermal_count)
+
+# Largest fraction of a tile's ice, by default, that may go unmodelled before
+# [`gemb_glacier_tile`](@ref) refuses the tile (see its `lost_area_fraction_maximum` keyword).
+const LOST_AREA_FRACTION_MAXIMUM = 0.01
+
+# Why an elevation interval holding ice was not modelled, as stored in a tile file's
+# `dropped_band_causes`. The codes are what the file holds; the meanings are written beside them.
+const DROPPED_BAND_CAUSES = (:without_forcing, :failed_validation, :not_modelled)
+function dropped_band_cause_code(cause::Symbol)
+    code = findfirst(==(cause), DROPPED_BAND_CAUSES)
+    code === nothing && throw(ArgumentError(
+        "unknown dropped-band cause :$cause; expected one of $(DROPPED_BAND_CAUSES)"))
+    return code
+end
+
 """
     GlacierTileRun
 
@@ -122,11 +143,12 @@ Per (band, delta, scaling) the forcing chain is
 
     cf = initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta), scaling))
 
-and nothing else. The band forcing has already been lapsed to the band center and decoupled with the
-band's own `k`, so re-applying either would double-count: lapsing again would move the forcing off the
-band it is defined at, and `climate_adjust_for_glacier` would damp the warm excess a second time. Both
-adjustments act on the raw band stack and are exact identities at `delta = 0` / `scaling = 1`, so the
-unperturbed run is bit-for-bit the plain band forcing.
+with the forcing's `black_carbon_snow` and `black_carbon_ice` set to the run's `ModelParameters`
+values, which `gemb` requires, and nothing else. The band forcing has already been lapsed to the band
+center and decoupled with the band's own `k`, so re-applying either would double-count: lapsing again
+would move the forcing off the band it is defined at, and `climate_adjust_for_glacier` would damp the
+warm excess a second time. Both adjustments act on the raw band stack and are exact identities at
+`delta = 0` / `scaling = 1`, so the unperturbed run is bit-for-bit the plain band forcing.
 
 `precipitation_adjust` scales **total** precipitation, and GEMB partitions phase downstream against
 `mp.rain_temperature_threshold`, so a scaling above 1 raises rain as well as snow. Where the scaling
@@ -137,9 +159,9 @@ published 2° products exclude rain from their aggregates.
 - `delta_temperatures = [0.0]`, `precipitation_scalings = [1.0]`: the perturbation grid.
 - `spinup_window`: `(start, stop)` the repeating spinup cycle is built from, by
   `SPINUP_CLIMATOLOGY_METHOD` (`:representative`, a block of `SPINUP_CLIMATOLOGY_N_YEARS` real years).
-  Defaults to the first 30 complete years of the band forcing, but a sweep should fix it: tying it to the
-  record means extending the record changes the spinup, and an appended segment then does not continue
-  the record it is appended to.
+  Whole calendar years; defaults to the first 30 whole calendar years of the band forcing, but a sweep
+  should fix it: tying it to the record means extending the record changes the spinup, and an appended
+  segment then does not continue the record it is appended to.
 - `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to
   `gemb_spinup`, which divides by the measured cycle length to get its own cycle ceiling.
 - `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
@@ -159,6 +181,11 @@ published 2° products exclude rain from their aggregates.
   parameters. It changes nothing here — the substitution happens in
   [`elevation_interval_forcing`](@ref), and these bands no longer know which cells borrowed — but two
   runs under different caps rest on different forcing and must not compare as the same experiment.
+- `validation_grid = nothing`: `(delta_temperatures, precipitation_scalings)` a band's forcing must
+  also be perturbable to, beyond this run's own grid. A band is run only if every perturbation of
+  both grids passes the forcing validator, so a run at a few points of a wider grid — a
+  native-resolution run at its calibrated correction — keeps exactly the bands a run over the wider
+  grid keeps.
 - `restart = nothing`: the value [`read_glacier_tile_restart`](@ref) returns, or `nothing`. Each run
   inherits its saved column and the spinup is skipped; the forcing is trimmed to the steps after the
   saved time, so pass only the new forcing rather than refetching the record. Throws
@@ -166,9 +193,52 @@ published 2° products exclude rain from their aggregates.
   `RestartParameterMismatch` when the saved run parameters disagree with this call's.
 - `force_restart = false`: append even across a run-parameter disagreement, warning instead of throwing.
   The record before the seam then does not reflect the new parameters.
+- `spinup_seed = nothing`: `i_band -> profile` (or `nothing` to decline), a starting column for the
+  cold-spinup branch only -- a band with a `restart` profile uses that and never calls this. Unlike
+  `restart`, the seed's own parameters need not match this run's: `gemb_spinup` still runs its full
+  convergence loop against the same criteria, so a seed from a different `(ΔT, pscale)` only shortens
+  or lengthens the number of cycles to convergence, never changes what it converges to. A band the
+  function returns `nothing` for falls back to `initialize_profile`.
 - `on_output = nothing`: called as `on_output(output; band, delta, pscale)` with each simulation's full
   output stack, for inspection. Called from inside the task, so with `threaded = true` it runs
   concurrently and in an unspecified order.
+- `modelled_intervals = nothing`: the `(lo, hi)` edges of the elevation intervals this run may model,
+  or `nothing` for every interval of `applied.bands`. A band outside the set is not run, and its
+  interval's ice is counted as dropped (cause `:not_modelled`). A native-resolution run passes the
+  bands its reference tile run modelled, so the two runs drop the same intervals.
+- `lost_area_fraction_maximum = $(LOST_AREA_FRACTION_MAXIMUM)`: the largest fraction of the tile's
+  ice (the hypsometry area of `tile.core` over `applied.bands`) that may go unmodelled. Above it the
+  tile throws an `ErrorException` before any GEMB run; at or below it the losses are recorded and
+  the run proceeds. Every kind of loss counts toward it (see below).
+- `background_black_carbon = nothing`: a regional background snow impurity loading as
+  [`background_black_carbon`](@ref) returns it, or `nothing` to run at `mp.black_carbon_snow`. When
+  given, every run of the tile uses its `black_carbon_snow` [ppmw] in place of `mp`'s, and the run
+  parameters record the region shares, basis, optics, measured loading and source beside
+  `model_black_carbon_snow`.
+- `effective_black_carbon = nothing`: an effective loading as [`effective_black_carbon`](@ref)
+  returns it, used in place of `mp.black_carbon_snow` as `background_black_carbon` is, with its
+  variant, region values and table checksum recorded. At most one of the two may be given.
+- `physics_member = nothing`: the [`physics_member`](@ref) this run is, or `nothing`. When given,
+  the run parameters name it (`physics_*`), and the tile throws before any GEMB run unless `mp`, the
+  band decoupling rule `applied` was resolved with, and the impurity loading are the ones it names.
+
+Every glacier area of the tile's hypsometry ends up in exactly one of `glacier_area_km2` (modelled),
+`dropped_area_km2` and `unrecovered_area_km2`, so `hypsometry_area_km2 = glacier_area_km2 +
+dropped_area_km2 + unrecovered_area_km2` up to rounding, and `lost_area_km2 = dropped_area_km2 +
+unrecovered_area_km2` is what the threshold is applied to. Dropped ice is a whole interval's ice:
+
+- `:without_forcing`: an interval holding ice that `band_forcing` has no band for, which
+  [`elevation_interval_forcing`](@ref) dropped because none of its cells had usable forcing or a
+  cell could not be adjusted to it within the range `climate_forcing` validates
+  (`intervals_without_forcing_area_km2`);
+- `:failed_validation`: a band whose forcing could not be perturbed to every point of the
+  perturbation and validation grids (`validation_dropped_area_km2`), counted with the ice inside it
+  that no cell could supply forcing for;
+- `:not_modelled`: an interval outside `modelled_intervals` (`excluded_area_km2`).
+
+`unrecovered_area_km2` is the ice inside a modelled band that no cell could supply forcing for. The
+dropped intervals are listed in the provenance as `dropped_band_centers`, `dropped_band_areas` and
+`dropped_band_causes` (codes into `DROPPED_BAND_CAUSES`).
 
 A band whose run produces no output is dropped from the aggregation with a warning rather than
 poisoning the tile's totals; a tile where no band produced output throws.
@@ -182,9 +252,22 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            drift_window::Int = SPINUP_DRIFT_WINDOW,
                            threaded::Bool = true,
                            donor_max_distance_km = nothing,
+                           validation_grid = nothing,
                            restart = nothing,
                            force_restart::Bool = false,
-                           on_output = nothing)
+                           spinup_seed = nothing,
+                           on_output = nothing,
+                           modelled_intervals = nothing,
+                           lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM,
+                           background_black_carbon = nothing,
+                           effective_black_carbon = nothing,
+                           physics_member = nothing)
+    mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
+                                                         background_black_carbon,
+                                                         effective_black_carbon)
+    0 <= lost_area_fraction_maximum <= 1 || throw(ArgumentError(
+        "lost_area_fraction_maximum must be in [0, 1], got $(lost_area_fraction_maximum)"))
     delta_temperatures = collect(Float64, delta_temperatures)
     precipitation_scalings = collect(Float64, precipitation_scalings)
     isempty(delta_temperatures) && throw(ArgumentError("delta_temperatures is empty"))
@@ -204,11 +287,28 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             "elevation); a NaN in an applied downscaling parameter is the usual cause"))
     end
 
-    bands, dropped = _runnable_bands(bands, delta_temperatures, precipitation_scalings)
+    # Every loss of ice is counted before any GEMB run, so a tile missing more of its ice than the
+    # stated fraction fails before it costs a spinup.
+    interval_area = _tile_interval_areas(tile, applied)
+    tile_ice_area = sum(interval_area; init = 0.0)
+    excluded, bands = _exclude_unmodelled(applied, interval_area, bands, modelled_intervals)
+    interval_drops = _intervals_without_bands(applied, interval_area, bands, modelled_intervals)
+
+    union_grid(axis, extra) = sort!(unique!(vcat(axis, collect(Float64, extra))))
+    validation_deltas, validation_scalings = validation_grid === nothing ?
+        (delta_temperatures, precipitation_scalings) :
+        (union_grid(delta_temperatures, validation_grid[1]),
+         union_grid(precipitation_scalings, validation_grid[2]))
+    bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings)
     isempty(bands) && throw(ForcingUnavailable(
         "no band of this tile could be perturbed into forcing GEMB accepts; the highest bands are " *
         "lapse extrapolations far above every contributing reanalysis surface, and a cold " *
         "perturbation of one can fall outside the range `climate_forcing`'s validator allows"))
+
+    accounting = _lost_area_accounting(bands, excluded, interval_drops, dropped, tile_ice_area)
+    if accounting.lost_area_km2 > lost_area_fraction_maximum * tile_ice_area
+        error(_lost_area_message(tile, accounting, lost_area_fraction_maximum))
+    end
 
     n_band = length(bands)
     n_dt = length(delta_temperatures)
@@ -219,7 +319,9 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     parameters = tile_run_parameters(mp, applied; spinup_window = window, simulation_years_maximum,
                                      convergence_drift_fac, drift_window, donor_max_distance_km,
                                      climatology_method = SPINUP_CLIMATOLOGY_METHOD,
-                                     climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS)
+                                     climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS,
+                                     background_black_carbon, effective_black_carbon,
+                                     physics_member)
 
     # Resuming: keep only forcing newer than the saved state, and let each run inherit its saved column
     # instead of spinning up again. The saved time is the last *output* time, and every forcing step up to
@@ -241,6 +343,12 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         @info "Resuming tile from saved profiles" restart_time=restart.time new_steps=n_new bands=n_band
     end
 
+    # The span of forcing this run integrates: from its first step to one step past its last, which is
+    # what every cumulative series in the output accumulates over (see `record_years`).
+    run_time = lookup(first(bands).forcing, Ti)
+    forcing_start = first(run_time)
+    forcing_step = Dates.value(Millisecond(run_time[2] - run_time[1])) / 1000
+
     profiles = Array{Union{Nothing,DimStack}}(nothing, n_band, n_dt, n_ps)
 
     # One flat task list rather than nested threaded loops: bands per tile range from a handful to
@@ -257,9 +365,10 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
 
         # No elevation or glacier adjustment: the band forcing is already at the band center and
         # already decoupled. Rebuilt per task rather than shared across perturbations, so concurrent
-        # tasks never hand each other the same object.
-        adjusted = precipitation_adjust(temperature_adjust(band.forcing, delta), pscale)
-        cf = initialize_forcing(adjusted)
+        # tasks never hand each other the same object. The impurity metadata is the run's own, which
+        # `gemb` requires the forcing's impurity layers to equal.
+        cf = initialize_forcing(_with_impurity_metadata(_perturbed_forcing(band.forcing, delta, pscale),
+                                                        mp))
 
         # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
         # task, so concurrent tasks never share it, and used for the spinup as well as the run: a
@@ -278,7 +387,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
             cf_spinup = _spinup_climatology(cf, window, mp_band)
             # The depth is fixed by the initial profile, so the firn-air tolerance can only be converted
             # into the density one `gemb_spinup` tests once that profile exists.
-            initial = initialize_profile(mp_band, cf_spinup)
+            initial = spinup_seed === nothing ? nothing : spinup_seed(i_band)
+            initial === nothing && (initial = initialize_profile(mp_band, cf_spinup))
             # The FAC trend is the *only* convergence criterion. `convergence_delta_density` is passed
             # explicitly as `nothing` rather than left out, so that the single-criterion design is visible
             # here and not mistaken for an omission: a step between consecutive cycles both passes a column
@@ -300,18 +410,28 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # Extracted here so `output` goes out of scope with the task. Held for every task at once it
         # would be n_band*n_dt*n_ps profile stacks of (Z x Ti), which for a 60-band tile over decades
         # is far more than the machine has.
-        components = height_change_components(output)
+        # Referenced to the column this run started from, so `dh` and its terms share one epoch and
+        # `dh == dh_mass + dh_water + dh_firn + dh_residual` at every output time.
+        components = height_change_components(output; initial_profile = profile)
         series = Dict{Symbol,Vector{Float64}}()
         for v in TILE_MASS_VARIABLES
             series[v] = haskey(output, v) ? Vector{Float64}(output[v]) :
                         zeros(Float64, length(dims(output, Ti)))
         end
-        series[:dh] = surface_height_change(output)
+        series[:dh] = components.total
         series[:dh_mass] = components.mass
         series[:dh_water] = components.water
         series[:dh_firn] = components.firn
         series[:dh_residual] = components.residual
         series[:firn_air_content] = Vector{Float64}(output[:firn_air_content])
+        for v in TILE_DIAGNOSTIC_VARIABLES
+            # Required rather than defaulted to zero: a zero would report that the branch never
+            # fired when the GEMB in use does not count it.
+            haskey(output, v) ||
+                throw(ErrorException("GEMB output has no `$(v)` layer; this GEMB does not count " *
+                                     "the wet cells its thermal solve freezes"))
+            series[v] = Vector{Float64}(output[v])
+        end
 
         return (; i_band, i_dt, i_ps,
                 time = collect(dims(output, Ti)),
@@ -344,7 +464,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         res === nothing && continue
         if isempty(out_time)
             out_time = res.time
-            for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES...)
+            for v in (TILE_MASS_VARIABLES..., TILE_HEIGHT_VARIABLES..., TILE_DIAGNOSTIC_VARIABLES...)
                 bands_series[v] = zeros(length(out_time), n_band, n_dt, n_ps)
             end
         elseif res.time != out_time
@@ -380,30 +500,51 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
     # match. Merged here and not into `parameters` for exactly that reason.
     merge!(provenance, applied.provenance)
     provenance["n_bands"] = n_band
-    provenance["glacier_area_km2"] = sum(band_areas)
+    provenance["time_coverage_start"] = forcing_start
+    provenance["forcing_time_step_seconds"] = forcing_step
     provenance["mie2cubickm"] = mie2cubickm(band_areas)
     provenance["max_dh_residual"] = maximum(abs, bands_series[:dh_residual])
+    merge!(provenance, _refreeze_thermal_summary(bands_series[:refreeze_thermal_count],
+                                                 bands_series[:refreeze_thermal],
+                                                 bands_series[:refreeze], band_areas))
     # How much of this tile's forcing was borrowed from a neighbouring cell, because the cell holding
     # the ice falls outside the reanalysis land mask, and from how far away the furthest loan came.
     # `unrecovered` is ice no cell could supply forcing for at all: it is *not* in `glacier_area_km2`,
     # so a total computed from this tile understates its hypsometry by that much.
     provenance["n_cells_substituted"] = sum(Int(b.n_cells_substituted) for b in bands)
     provenance["substituted_area_km2"] = sum(Float64(b.area_substituted) for b in bands)
-    provenance["unrecovered_area_km2"] = sum(Float64(b.area_unrecovered) for b in bands)
     provenance["max_donor_distance_km"] = maximum(Float64(b.max_donor_distance_km) for b in bands)
-    # Ice this tile holds but did not model, so the gap between the tile's totals and its hypsometry is
-    # a recorded number rather than something a reader has to notice. Zero on a tile whose every band
-    # was runnable, which is the common case.
-    provenance["n_bands_dropped"] = length(dropped)
-    provenance["dropped_area_km2"] = isempty(dropped) ? 0.0 : sum(d.area for d in dropped)
+    # Ice this tile holds but did not model, by cause, so the gap between the tile's totals and its
+    # hypsometry is a recorded number rather than something a reader has to notice. All zero on a tile
+    # whose every band was runnable, which is the common case.
+    merge!(provenance, accounting.provenance)
+    provenance["lost_area_fraction_maximum"] = Float64(lost_area_fraction_maximum)
+    provenance["band_validation_delta_temperatures"] = validation_deltas
+    provenance["band_validation_precipitation_scalings"] = validation_scalings
     # One tile-level convergence verdict, and the only spinup outcome reduced to a scalar: a tile is
     # settled when every one of its columns is, so this is `all` and not a sample. The per-run detail is
     # in `run_provenance["spinup_converged"]`, which is where a reader finds *which* column failed. A
     # `NaN` slot is a run that produced no output rather than one that failed to settle — those are
     # counted by `n_bands_dropped` — so it does not make the tile unconverged.
+    #
+    # An unconverged spinup is kept, not refused: its column still carries a firn-air trend into the
+    # transient, so how much ice that affects is recorded — the number of columns, and the glacier
+    # area of the bands with any such column — and reported once for the tile.
     if haskey(run_provenance, "spinup_converged")
         flags = run_provenance["spinup_converged"]
         provenance["spinup_converged"] = all(f -> isnan(f) || f == 1.0, flags)
+        unsettled = flags .== 0.0
+        unsettled_bands = [any(view(unsettled, i, :, :)) for i in axes(unsettled, 1)]
+        provenance["spinup_n_unconverged"] = count(unsettled)
+        provenance["spinup_unconverged_area_km2"] = sum(band_areas[unsettled_bands]; init = 0.0)
+        any(unsettled) && @warn("Spinup did not converge for some columns of this tile; they enter " *
+                                "the transient with a residual firn-air trend",
+                                tile = tile.name, n_unconverged = count(unsettled),
+                                n_columns = count(!isnan, flags),
+                                bands = [bands[i].center for i in findall(unsettled_bands)],
+                                unconverged_area_km2 = round(provenance["spinup_unconverged_area_km2"];
+                                                             digits = 2),
+                                simulation_years_maximum)
     end
 
     return GlacierTileRun(
@@ -413,6 +554,20 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         delta_temperatures, precipitation_scalings, out_time,
         bands_series, totals, profiles, band_provenance, run_provenance, parameters, provenance,
     )
+end
+
+"""
+    record_years(run::GlacierTileRun) -> Float64
+
+The span, in years of 365.25 days, that the cumulative series of `run` accumulate over: from the
+first forcing step to the end of the last one, `last(run.time) + step - time_coverage_start`. Each
+output time stamps the last forcing step of its interval, so this covers every interval including the
+first. A record-mean rate is `run.totals[name][end, i_dt, i_ps] / record_years(run)`.
+"""
+function record_years(run::GlacierTileRun)
+    start = run.provenance["time_coverage_start"]
+    step = Millisecond(round(Int, 1000 * run.provenance["forcing_time_step_seconds"]))
+    return _decimal_years(last(run.time) + step - start)
 end
 
 # Sort one run's `spinup_*`/`climatology_*` provenance into the per-run arrays and the tile-level
@@ -450,6 +605,11 @@ function _collect_run_provenance!(run_provenance, provenance, res, parameters, d
     return nothing
 end
 
+# A band's forcing at one perturbation point: the temperature offset, then the precipitation scaling.
+# The one definition the band validation and the run share, so a band validated is the band run.
+_perturbed_forcing(forcing, delta, pscale) =
+    precipitation_adjust(temperature_adjust(forcing, delta), pscale)
+
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
 #
 # The high bands of a tile are lapse extrapolations well above every contributing reanalysis surface —
@@ -474,8 +634,7 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
         failure = nothing
         for pscale in precipitation_scalings, delta in delta_temperatures
             try
-                initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta),
-                                                        pscale))
+                initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
             catch e
                 e isa InterruptException && rethrow()
                 is_caller_error(e) && rethrow()
@@ -486,7 +645,8 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
         if failure === nothing
             push!(keep, band)
         else
-            push!(dropped, (; band.lo, band.hi, band.center, band.area, failure...))
+            push!(dropped, (; band.lo, band.hi, band.center, band.area, band.area_unrecovered,
+                            failure...))
         end
     end
 
@@ -505,11 +665,149 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
     return keep, dropped
 end
 
+# The ice of `tile.core` in each interval of `applied.bands`, in km², summed over cells in table order
+# as `elevation_interval_forcing` sums a band's area and its unrecovered area.
+function _tile_interval_areas(tile, applied)
+    area = zeros(length(applied.bands))
+    for row in eachrow(tile.core)
+        area .+= _interval_areas(row, applied.bands)
+    end
+    return area
+end
+
+# A band or interval is identified by its edges, the identity `elevation_interval_forcing` gives it;
+# `modelled_intervals` may give them as `(lo, hi)` tuples.
+_interval_key(b) = (Float64(b.lo), Float64(b.hi))
+_interval_key(edges::Tuple{Real,Real}) = (Float64(edges[1]), Float64(edges[2]))
+
+# The intervals holding ice that lie outside `modelled_intervals`, each `(; lo, hi, center, area)`
+# with the interval's whole ice, and the bands that remain. Everything is modelled when
+# `modelled_intervals` is `nothing`.
+function _exclude_unmodelled(applied, interval_area, bands, modelled_intervals)
+    modelled_intervals === nothing && return NamedTuple[], bands
+    allowed = Set(_interval_key(iv) for iv in modelled_intervals)
+    known = Set(_interval_key(iv) for iv in applied.bands)
+    unknown = setdiff(allowed, known)
+    isempty(unknown) || throw(ArgumentError(
+        "modelled_intervals holds interval(s) $(sort!(collect(unknown))) that are not elevation " *
+        "intervals of this downscaling, so the two describe different hypsometries"))
+    excluded = [_interval_drop(applied.bands[i], interval_area[i])
+                for i in eachindex(applied.bands, interval_area)
+                if interval_area[i] > 0 && !(_interval_key(applied.bands[i]) in allowed)]
+    return excluded, filter(b -> _interval_key(b) in allowed, bands)
+end
+
+# The elevation intervals of `applied.bands` holding ice that `bands` has no band for, each
+# `(; lo, hi, center, area)` with the interval's whole ice in km². Intervals outside
+# `modelled_intervals` are counted by `_exclude_unmodelled` instead.
+function _intervals_without_bands(applied, interval_area, bands, modelled_intervals)
+    present = Set(_interval_key(b) for b in bands)
+    allowed = modelled_intervals === nothing ? nothing :
+              Set(_interval_key(iv) for iv in modelled_intervals)
+    return [_interval_drop(applied.bands[i], interval_area[i])
+            for i in eachindex(applied.bands, interval_area)
+            if interval_area[i] > 0 && !(_interval_key(applied.bands[i]) in present) &&
+               (allowed === nothing || _interval_key(applied.bands[i]) in allowed)]
+end
+
+_interval_drop(iv, area) = (; lo = iv.lo, hi = iv.hi, center = Float64(iv.center), area)
+
+# Where the tile's ice went: modelled in a kept band, dropped with a whole interval, or unrecovered
+# inside a kept band. A band that failed validation is dropped with the ice no cell could supply
+# forcing for, since that ice is in the same interval. Returns the totals and the provenance keys.
+function _lost_area_accounting(bands, excluded, interval_drops, validation_drops, tile_ice_area)
+    modelled = sum(Float64(b.area) for b in bands; init = 0.0)
+    unrecovered = sum(Float64(b.area_unrecovered) for b in bands; init = 0.0)
+    validation = [(; d.lo, d.hi, d.center, area = Float64(d.area) + Float64(d.area_unrecovered))
+                  for d in validation_drops]
+    by_cause = ((:without_forcing, interval_drops), (:failed_validation, validation),
+                (:not_modelled, excluded))
+    drops = sort!([(; center = Float64(d.center), area = Float64(d.area),
+                    cause = dropped_band_cause_code(cause))
+                   for (cause, list) in by_cause for d in list]; by = d -> d.center)
+    area_of(list) = sum(Float64(d.area) for d in list; init = 0.0)
+    dropped = area_of(drops)
+    provenance = Dict{String,Any}(
+        "glacier_area_km2" => modelled,
+        "hypsometry_area_km2" => tile_ice_area,
+        "unrecovered_area_km2" => unrecovered,
+        "n_bands_dropped" => length(drops),
+        "dropped_area_km2" => dropped,
+        "n_intervals_without_forcing" => length(interval_drops),
+        "intervals_without_forcing_area_km2" => area_of(interval_drops),
+        "n_bands_failed_validation" => length(validation),
+        "validation_dropped_area_km2" => area_of(validation),
+        "n_bands_excluded" => length(excluded),
+        "excluded_area_km2" => area_of(excluded),
+        "lost_area_km2" => dropped + unrecovered)
+    # NetCDF holds no empty attribute, so the list is written only when there is something in it; an
+    # absent list reads back as no drops.
+    if !isempty(drops)
+        provenance["dropped_band_centers"] = [d.center for d in drops]
+        provenance["dropped_band_areas"] = [d.area for d in drops]
+        provenance["dropped_band_causes"] = [Float64(d.cause) for d in drops]
+        provenance["dropped_band_cause_meanings"] = join(string.(DROPPED_BAND_CAUSES), " ")
+    end
+    return (; modelled, unrecovered, dropped, lost_area_km2 = dropped + unrecovered,
+            interval_drops, validation, excluded, provenance)
+end
+
+function _lost_area_message(tile, a, fraction_maximum)
+    r(x) = round(x; digits = 2)
+    total = a.provenance["hypsometry_area_km2"]
+    parts = String[]
+    for (label, list) in (("no band forcing", a.interval_drops),
+                          ("failed perturbation validation", a.validation),
+                          ("not modelled by the reference run", a.excluded))
+        isempty(list) || push!(parts, "$label: $(r(sum(d.area for d in list))) km² at " *
+                                      "$(join([d.center for d in list], ", ")) m")
+    end
+    a.unrecovered > 0 && push!(parts, "unrecovered inside modelled bands: $(r(a.unrecovered)) km²")
+    return "tile $(tile.name) would leave $(r(a.lost_area_km2)) km² of its $(r(total)) km² of ice " *
+           "unmodelled ($(r(100 * a.lost_area_km2 / total)) %), above the " *
+           "$(100 * fraction_maximum) % allowed by `lost_area_fraction_maximum`: " *
+           join(parts, "; ") * ". `elevation_interval_forcing` and the band validation log why " *
+           "each interval was dropped."
+end
+
 # Per-tile totals from the per-band series: volume from the height change, mass from the fluxes.
 #
 # The two are not interchangeable. `dh` carries the firn compaction term, so `dh * density_ice` is not
 # the mass change; and mass alone cannot produce a height, since a column can lose air without losing
 # mass. Keeping the conversions in one place is what stops a caller reaching for the wrong one.
+"""
+    _refreeze_thermal_summary(count, mass, refreeze, band_areas) -> Dict{String,Any}
+
+The tile-level summary of GEMB's thermal-solve freezing (`TILE_DIAGNOSTIC_VARIABLES`), from per-band
+interval series shaped `(time, band, delta_temperature, precipitation_scaling)`:
+
+- `refreeze_thermal_cell_steps`: the cell-steps, over every band, run and output interval, at which the
+  solve froze a wet cell's water itself (the sum of `count`).
+- `refreeze_thermal_area_km2`: the glacier area of the bands where that happened in any run.
+- `max_refreeze_thermal` [kg m-2]: the largest record total of `mass` in any one (band, run).
+- `refreeze_thermal_fraction`: the area-weighted share of `refreeze` that the solve froze, over all
+  bands, runs and intervals; 0 when nothing refroze.
+"""
+function _refreeze_thermal_summary(count::AbstractArray{<:Real,4}, mass::AbstractArray{<:Real,4},
+                                   refreeze::AbstractArray{<:Real,4}, band_areas::AbstractVector)
+    axes(count) == axes(mass) == axes(refreeze) ||
+        throw(DimensionMismatch("count, mass and refreeze must share axes: $(axes(count)), " *
+                                "$(axes(mass)), $(axes(refreeze))"))
+    axes(count, 2) == axes(band_areas, 1) ||
+        throw(DimensionMismatch("band axis $(axes(count, 2)) does not match band_areas " *
+                                "$(axes(band_areas, 1))"))
+    fired = [any(>(0), view(count, :, i, :, :)) for i in axes(count, 2)]
+    weight = reshape(band_areas, 1, :, 1, 1)
+    refrozen_total = sum(refreeze .* weight)
+    return Dict{String,Any}(
+        "refreeze_thermal_cell_steps" => round(Int, sum(count)),
+        "refreeze_thermal_area_km2" => sum(band_areas[i] for i in axes(count, 2) if fired[i];
+                                           init = 0.0),
+        "max_refreeze_thermal" => Float64(maximum(sum(mass; dims = 1); init = 0.0)),
+        "refreeze_thermal_fraction" => refrozen_total > 0 ?
+                                       Float64(sum(mass .* weight) / refrozen_total) : 0.0)
+end
+
 function _tile_totals(bands_series, band_areas)
     totals = Dict{Symbol,Array{Float64,3}}()
     n_t, _, n_dt, n_ps = size(bands_series[:dh])
@@ -588,16 +886,34 @@ The settings that define *how* a tile was run, as netCDF global attributes.
 These are exactly the values that must be identical for a continuation to be a continuation rather than
 a different experiment spliced onto an old record, so they are what a restart is checked against. Every
 `ModelParameters` field is included, prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` —
-the fields `gemb` computes from the forcing and overwrites whatever it is handed.
+the fields `gemb` computes from the forcing and overwrites whatever it is handed. The package versions
+and source trees ([`software_provenance`](@ref)) are included too.
 
 The downscaling settings from `applied` are included for the same reason: two runs of one tile that
 resolved their lapse rate differently are different experiments, and a file that recorded only the
 model parameters could not tell them apart.
+
+`background_black_carbon`, as [`gemb_glacier_tile`](@ref) takes it, replaces `mp.black_carbon_snow`
+before the parameters are recorded and adds `background_black_carbon_*` keys: the largest region and
+every region's share, the basis and optics, the proxy region, the measured BC, dust and non-BC
+loadings, the reference albedo reduction and its grain radius and zenith angle (converted loadings
+only), and the source. Without it no such key is written. `effective_black_carbon` does the same
+for an effective loading ([`effective_black_carbon`](@ref)), with `effective_black_carbon_*` keys; at
+most one of the two may be given.
+
+`physics_member`, a [`physics_member`](@ref), adds the `physics_*` keys that name it, after checking
+that `mp`, `applied` and the loading are the configuration it names.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
                              simulation_years_maximum = nothing, convergence_drift_fac = nothing,
                              drift_window = nothing, donor_max_distance_km = nothing,
-                             climatology_method = nothing, climatology_n_years = nothing)
+                             climatology_method = nothing, climatology_n_years = nothing,
+                             background_black_carbon = nothing, effective_black_carbon = nothing,
+                             physics_member = nothing)
+    mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
+                                                         background_black_carbon,
+                                                         effective_black_carbon)
     params = Dict{String,Any}("spinup_window_start" => string(spinup_window[1]),
                               "spinup_window_stop" => string(spinup_window[2]))
     # How the columns were settled. Two runs that spun up to different tolerances, or under different
@@ -621,6 +937,14 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     donor_max_distance_km === nothing ||
         (params["forcing_donor_max_distance_km"] = Float64(donor_max_distance_km))
     merge!(params, applied.settings)
+    merge!(params, software_provenance())
+    # Only when a background loading was applied, so a tile written without one still compares as
+    # current; the loading itself is `model_black_carbon_snow` below either way.
+    background_black_carbon === nothing ||
+        _record_background_black_carbon!(params, background_black_carbon)
+    effective_black_carbon === nothing ||
+        _record_effective_black_carbon!(params, effective_black_carbon)
+    physics_member === nothing || merge!(params, physics_member_parameters(physics_member))
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)
@@ -637,4 +961,13 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
                                           for b in applied.bands])
     end
     return params
+end
+
+# `mp` at the snow impurity loading a tile runs under: the background or the effective loading when
+# one is given, `mp.black_carbon_snow` otherwise.
+function _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
+    background_black_carbon === nothing || effective_black_carbon === nothing || throw(ArgumentError(
+        "give a background loading or an effective loading, not both"))
+    loading = background_black_carbon === nothing ? effective_black_carbon : background_black_carbon
+    return loading === nothing ? mp : _with_black_carbon_snow(mp, loading.black_carbon_snow)
 end

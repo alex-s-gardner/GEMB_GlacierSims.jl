@@ -50,12 +50,18 @@ function surface_height_change(output)
 end
 
 """
-    height_change_components(output) -> (; total, mass, water, firn, strain, residual)
+    height_change_components(output; initial_profile = nothing)
+        -> (; total, mass, water, firn, strain, residual)
 
-Surface elevation change (m) over a `gemb` run, split into the terms that produce it. Every series is
-an anomaly referenced to the **first output time**, so all six are zero at element 1 and
+Surface elevation change (m) over a `gemb` run, split into the terms that produce it, with
 
     total == mass + water + firn + strain + residual
+
+**The reference epoch.** Given the column the run started from as `initial_profile` (the profile
+handed to `gemb`), every series is referenced to the **start of the run**: `total` is
+[`surface_height_change`](@ref) itself, the flux sums accumulate from the first step, and the two
+state terms are differences from `initial_profile`. Without it every series is an anomaly referenced
+to the **first output time**, and all six are zero at element 1.
 
 - `total`: `-cumsum(ice_flux)`, re-referenced. The quantity an altimeter measures.
 - `mass`: cumulative surface mass balance divided by `density_ice`.
@@ -67,16 +73,16 @@ an anomaly referenced to the **first output time**, so all six are zero at eleme
   at the rounding floor — a growing residual means the column's base is no longer at ice density (see
   [`column_reaches_ice_density`](@ref)) and the height series is under-counting compaction.
 
-Referencing to the first output time is what makes the closure exact rather than approximate. The
-alternative — comparing raw `-cumsum(ice_flux)` against `firn_air_content .- firn_air_content[1]` —
-compares a quantity accumulated from the run start against one differenced from the first output time,
-which leaves a half-interval offset that has to be tolerated instead of checked.
+Every term shares one epoch, which is what makes the closure exact rather than approximate: raw
+`-cumsum(ice_flux)` against `firn_air_content .- firn_air_content[1]` compares a quantity accumulated
+from the run start with one differenced from the first output time, and leaves a whole interval's
+change in the residual.
 
 Firn air content is recomputed here from the instantaneous `dz`/`density` profile rather than read from
 the `firn_air_content` layer, which GEMB reports as an interval **mean** while `ice_flux` is an interval
 **sum**. Mixing the two reductions is the other half of that same offset.
 """
-function height_change_components(output)
+function height_change_components(output; initial_profile = nothing)
     density_ice = _output_density_ice(output)
 
     flux = _height_layer(output, :ice_flux)
@@ -103,19 +109,42 @@ function height_change_components(output)
           _optional_height_layer(output, :blowing_snow, flux) .-
           _height_layer(output, :runoff)
 
-    total = _anomaly(-cumsum(flux))
-    mass = _anomaly(cumsum(smb)) ./ density_ice
-    liquid = -_anomaly(stored) ./ density_ice
-    firn = _anomaly(fac)
-    strain = -_anomaly(cumsum(_optional_height_layer(output, :strain_thinning, flux)))
+    strain_sum = cumsum(_optional_height_layer(output, :strain_thinning, flux))
+    if initial_profile === nothing
+        total = _anomaly(-cumsum(flux))
+        mass = _anomaly(cumsum(smb)) ./ density_ice
+        liquid = -_anomaly(stored) ./ density_ice
+        firn = _anomaly(fac)
+        strain = -_anomaly(strain_sum)
+    else
+        fac_start = firn_air_content(_profile_column(initial_profile, :dz),
+                                     _profile_column(initial_profile, :density), density_ice)
+        stored_start = sum(_profile_column(initial_profile, :water))
+        total = -cumsum(flux)
+        mass = cumsum(smb) ./ density_ice
+        liquid = -(stored .- stored_start) ./ density_ice
+        firn = fac .- fac_start
+        strain = -strain_sum
+    end
     residual = total .- mass .- liquid .- firn .- strain
 
     return (; total, mass, water = liquid, firn, strain, residual)
 end
 
-# A series re-referenced to its first element, which is the convention every component of
-# `height_change_components` is reported on.
+# A series re-referenced to its first element: the epoch `height_change_components` reports on when it
+# is not given the starting column.
 _anomaly(v) = v .- first(v)
+
+# One layer of a single firn column (a `Z`-only profile stack, as `gemb` starts from), as a plain vector.
+function _profile_column(profile, name::Symbol)
+    haskey(profile, name) || throw(ArgumentError(
+        "the initial profile carries no `$name` layer, which the height budget needs to reference its " *
+        "state terms to the start of the run"))
+    layer = parent(profile[name])
+    ndims(layer) == 1 || throw(ArgumentError(
+        "the initial profile's `$name` has $(ndims(layer)) dimension(s); expected one column"))
+    return layer
+end
 
 """
     column_reaches_ice_density(output; tolerance = 1.0) -> Bool

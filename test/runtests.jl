@@ -9,6 +9,7 @@ import GeoInterface
 import GEMB
 using GEMB: Z, DimStack, DimArray, initialize_parameters
 using GEMB_ClimateForcing: climate_adjust_for_elevation
+import GEMB_ClimateForcing
 using NCDatasets
 
 # One-row glacier elevation-class table from bin-center => area (km²) pairs, using the same
@@ -34,17 +35,21 @@ end
 
 const _CP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
-# Synthetic climate forcing shaped exactly like `climate_forcing` output: the seven layers on a `Ti`
-# axis, with the metadata keys `forcing_is_complete` and the elevation interval pass reads.
-function _cp_forcing(lat, lon, elevation, temperature)
+# Synthetic climate forcing shaped exactly like `climate_forcing` output: the ten layers on a `Ti`
+# axis, with the metadata keys `forcing_is_complete` and the elevation interval pass reads. Keywords
+# replace a constant layer by name, with a scalar or a series.
+function _cp_forcing(lat, lon, elevation, temperature; overrides...)
     n = length(temperature)
     ti = Ti(_CP_TIME[1:n])
-    const_layers = (pressure_air = 8e4, vapor_pressure = 300.0, wind_speed = 3.0,
-                    precipitation = 0.1, shortwave_downward = 100.0, longwave_downward = 250.0)
+    const_layers = merge((pressure_air = 8e4, vapor_pressure = 300.0, wind_speed = 3.0,
+                          precipitation = 0.1, shortwave_downward = 100.0, longwave_downward = 250.0,
+                          solar_zenith_angle = 60.0, shortwave_downward_diffuse = 30.0,
+                          cloud_optical_thickness = 2.0), NamedTuple(overrides))
     layers = merge(
         (temperature_air = DimArray(collect(Float64, temperature), (ti,);
                                     metadata = Dict("units" => "K")),),
-        NamedTuple(v => DimArray(fill(Float64(x), n), (ti,)) for (v, x) in pairs(const_layers)))
+        NamedTuple(v => DimArray(x isa AbstractVector ? collect(Float64, x) : fill(Float64(x), n),
+                                 (ti,)) for (v, x) in pairs(const_layers)))
     return DimStack(layers; metadata = Dict{String,Any}(
         "latitude" => Float64(lat), "longitude" => Float64(lon),
         "elevation" => Float64(elevation), "dataset" => "synthetic",
@@ -140,6 +145,11 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
         bands_series[v] = [0.5j + i + 10b + 100d + 1000s
                            for i in 1:n_t, b in 1:n_band, d in 1:n_dt, s in 1:n_ps]
     end
+    # GEMB's thermal-solve freezing fired at 3 cell-steps of one interval in band 1, 0.25 kg m-2.
+    bands_series[:refreeze_thermal_count] = zeros(n_t, n_band, n_dt, n_ps)
+    bands_series[:refreeze_thermal] = zeros(n_t, n_band, n_dt, n_ps)
+    bands_series[:refreeze_thermal_count][min(2, n_t), 1, 1, n_ps] = 3.0
+    bands_series[:refreeze_thermal][min(2, n_t), 1, 1, n_ps] = 0.25
     band_areas = [b.area for b in band_tuples]
     totals = Dict{Symbol,Array{Float64,3}}()
     # Cumulative, as `_tile_totals` produces and as the file documents: the per-band series are per
@@ -207,9 +217,12 @@ function _fake_tile_run(; time = collect(DateTime(2000, 1, 1):Month(1):DateTime(
         (lon_min = -142.0, lon_max = -140.0, lat_min = 60.0, lat_max = 62.0),
         335, 716, band_tuples, collect(Float64, deltas), collect(Float64, scalings),
         collect(time), bands_series, totals, profiles, band_provenance, run_provenance, parameters,
-        Dict{String,Any}("spinup_converged" => false,
-                         "climatology_window_start" => DateTime(1990, 1, 1),
-                         "max_dh_residual" => 1.2e-14),
+        merge(Dict{String,Any}("spinup_converged" => false,
+                               "climatology_window_start" => DateTime(1990, 1, 1),
+                               "max_dh_residual" => 1.2e-14),
+              GEMB_GlacierSims._refreeze_thermal_summary(
+                  bands_series[:refreeze_thermal_count], bands_series[:refreeze_thermal],
+                  bands_series[:refreeze], band_areas)),
     )
 end
 
@@ -247,24 +260,22 @@ end
         full = cell_decoupling_factor(cell(7.53, 45.97, 0.0))
         @test full.rgi_id == "RGI60-11.02810"
         @test full.distance < 1.0
-        # A cell ERA5-Land treats as ice-free gets the published k unweighted.
+        # `k` is the published on-glacier factor whatever the cell's glacier fraction; the fraction
+        # is returned beside it and applied where the forcing is brought to the ice-free state.
         @test full.decoupling_factor == full.decoupling_factor_published
         @test 0 < full.decoupling_factor < 1
 
         k_pub = full.decoupling_factor_published
-
-        # The weighting is linear in the non-glacier fraction and exact at both ends: no glacier
-        # in the cell is the full correction, an all-glacier cell is the identity.
-        @test cell_decoupling_factor(cell(7.53, 45.97, 1.0)).decoupling_factor == 1.0
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.5)).decoupling_factor ≈
-              1 - (1 - k_pub) * 0.5
-        @test cell_decoupling_factor(cell(7.53, 45.97, 0.25)).decoupling_factor ≈
-              1 - (1 - k_pub) * 0.75
+        for g in (1.0, 0.5, 0.25)
+            found = cell_decoupling_factor(cell(7.53, 45.97, g))
+            @test found.decoupling_factor == k_pub
+            @test found.glm == g
+        end
 
         # A `missing` or `NaN` glm is a real data gap, so it falls back to the uncorrected
-        # reanalysis assumption (glm = 0) and gets the full correction.
-        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).decoupling_factor == k_pub
-        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).decoupling_factor == k_pub
+        # reanalysis assumption (glm = 0).
+        @test cell_decoupling_factor(cell(7.53, 45.97, missing)).glm == 0.0
+        @test cell_decoupling_factor(cell(7.53, 45.97, NaN)).glm == 0.0
 
         # A table with no `:glm` column at all is schema drift, not a data gap: it cannot weight
         # the correction, and silently applying the unweighted factor to every cell in a sweep is
@@ -294,15 +305,12 @@ end
             geometry = [GeoDataFrames.GeoInterface.Point(7.53, 45.97)], glm = [glm])))
         resolve = resolve_decoupling_factor
 
-        # `false` skips the lookup entirely; `true` looks k up and weights it by 1 - glm.
+        # `false` skips the lookup entirely; `true` looks the published k up, whatever the glm.
         @test resolve(cell(0.0), false) === nothing
         @test resolve(cell(0.0), true) == cell_decoupling_factor(cell(0.0)).decoupling_factor
+        @test resolve(cell(1.0), true) == resolve(cell(0.0), true)
 
-        # An entirely glaciated cell weights to exactly 1.0 — the identity — so the adjustment
-        # is skipped rather than run as a no-op pass over the whole forcing record.
-        @test resolve(cell(1.0), true) === nothing
-
-        # A prescribed `k` bypasses both the table and the glm weighting.
+        # A prescribed `k` bypasses the table.
         @test resolve(cell(1.0), 0.6) === 0.6
 
         # A cell with no published k is run on ambient forcing.
@@ -479,7 +487,10 @@ end
         for field in GEMB.DERIVED_PARAMETERS
             @test !haskey(p, "model_" * string(field))
         end
-        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3
+        # The three cell settings, the model fields, and a version and tree per package.
+        @test length(p) == length(propertynames(mp)) - length(GEMB.DERIVED_PARAMETERS) + 3 + 6
+        @test p["software_gemb_version"] == string(pkgversion(GEMB))
+        @test haskey(p, "software_gemb_glaciersims_tree")
 
         # A monthly cycle is stored as the 12-element vector, not flattened to a scalar or a
         # string: NetCDF holds a numeric attribute vector natively, so the restart check compares
@@ -532,14 +543,37 @@ end
                              "model_densification_method" => :Arthern,
                              "model_shortwave_subsurface_absorption" => false)))
 
-        # Only keys present in both are compared: a file written by an older `run_parameters`
-        # carries fewer of them, which is a gap rather than a disagreement.
-        @test isempty(run_parameter_differences(saved, Dict{String,Any}("brand_new_key" => 1.0)))
+        # A key on one side only is a difference, with `nothing` for the side that lacks it: a run
+        # that records a setting the other did not cannot be shown to be the same experiment.
+        one_sided = run_parameter_differences(saved, merge(
+            Dict{String,Any}("brand_new_key" => 1.0, "model_albedo_ice" => 0.48,
+                             "model_densification_method" => :Arthern)))
+        @test one_sided["brand_new_key"] == (nothing, 1.0)
+        @test one_sided["model_shortwave_subsurface_absorption"] == ("false", nothing)
+        @test length(one_sided) == 2
 
         d = run_parameter_differences(saved, Dict{String,Any}("model_albedo_ice" => 0.40,
                                                              "model_densification_method" => :Ligtenberg))
         @test d["model_albedo_ice"] == (0.48, 0.40)
         @test d["model_densification_method"] == ("Arthern", :Ligtenberg)
+
+        # A setting recorded as NaN (one the run does not read) matches itself, and differs from a
+        # finite value.
+        @test isempty(run_parameter_differences(Dict{String,Any}("model_ground_temperature_deep" => NaN),
+                                                Dict{String,Any}("model_ground_temperature_deep" => NaN)))
+        @test haskey(run_parameter_differences(Dict{String,Any}("model_ground_temperature_deep" => NaN),
+                                               Dict{String,Any}("model_ground_temperature_deep" => 270.0)),
+                     "model_ground_temperature_deep")
+
+        # NetCDF reads a one-element attribute back as a scalar, so a one-band tile's per-band
+        # settings must match their own stored form; a longer vector still has to match exactly.
+        one_band = Dict{String,Any}("applied_bare_ice_albedo" => 0.6, "applied_bare_ice_albedo_source" => 4.0)
+        @test isempty(run_parameter_differences(one_band,
+            Dict{String,Any}("applied_bare_ice_albedo" => [0.6], "applied_bare_ice_albedo_source" => [4])))
+        @test haskey(run_parameter_differences(one_band,
+            Dict{String,Any}("applied_bare_ice_albedo" => [0.7])), "applied_bare_ice_albedo")
+        @test haskey(run_parameter_differences(Dict{String,Any}("v" => [0.6, 0.5]),
+            Dict{String,Any}("v" => [0.6, 0.4])), "v")
 
         # A monthly lapse-rate cycle compares elementwise, so a stored integer cycle matches the
         # float form and a single changed month is a disagreement. Without vector encoding these
@@ -627,11 +661,13 @@ end
         restart = read_glacier_cell_restart(path)
         @test restart.parameters["model_albedo_ice"] == 0.48
 
-        # An identical parameter set validates silently. Keys the file does not carry are
-        # reported as unverified, not as a mismatch, so the full set can be passed as-is.
-        matching = run_parameters(initialize_parameters(); coverage = 0.95, lapse_rate = 6.5)
+        # An identical parameter set validates silently. One carrying keys the file does not is a
+        # different experiment as far as the file can show, so it is refused.
         @test GEMB_GlacierSims._validate_restart_parameters(
-            restart, matching; force_restart = false) === nothing
+            restart, restart.parameters; force_restart = false) === nothing
+        matching = run_parameters(initialize_parameters(); coverage = 0.95, lapse_rate = 6.5)
+        @test_throws RestartParameterMismatch GEMB_GlacierSims._validate_restart_parameters(
+            restart, matching; force_restart = false)
 
         # A changed parameter is refused, and the exception names the offender and both values.
         changed = Dict{String,Any}("model_albedo_ice" => 0.40)
@@ -842,11 +878,24 @@ end
     end
 
     @testset "spinup window inheritance" begin
-        # A cold start derives the window from the record: the first 30 complete years.
+        # A cold start derives the window from the record: its first 30 whole calendar years, from
+        # 1 January 00:00 to the last step of a 31 December (here daily).
         t = collect(DateTime(1960, 1, 1):Day(1):DateTime(1994, 12, 31))
         cold = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
         @test GEMB_GlacierSims._default_spinup_window(cold) ==
               (DateTime(1960, 1, 1), DateTime(1989, 12, 31))
+        # An hourly ERA5-Land record starts at 1950-01-02T00, so its first whole year is 1951, and a
+        # record of fewer than 30 whole years gives all of them.
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1953, 12, 31, 23))
+        era5 = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test GEMB_GlacierSims._default_spinup_window(era5) ==
+              (DateTime(1951, 1, 1), DateTime(1953, 12, 31, 23))
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1951, 12, 31, 22))
+        short = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test_throws "the forcing 1950-01-02T00:00:00 .. 1951-12-31T22:00:00 holds no whole calendar year" GEMB_GlacierSims._default_spinup_window(short)
+        t = [DateTime(1951, 1, 1), DateTime(1951, 1, 1, 1), DateTime(1951, 1, 1, 3)]
+        uneven = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        @test_throws "time steps are not uniform" GEMB_GlacierSims._default_spinup_window(uneven)
 
         # A continuation inherits the window its record was spun up on, parsed back from the
         # strings NetCDF stored (it has no date attribute type). This is the whole point: a
@@ -895,12 +944,89 @@ end
         # The message names the window to fetch, since that is the remedy.
         @test occursin("1960-01-01T00:00:00", sprint(showerror, err))
 
-        # A partial year is refused too, and this is why the test is a span rather than a count:
-        # `forcing_climatology` calls whichever years hold the most steps "complete", so six
-        # months of daily data would average into a 182-step "climatological year" without
-        # complaint.
+        # A window that is not whole calendar years is refused: `forcing_climatology` keeps only the
+        # complete years of what it selects, so six months of daily data would leave nothing, and a
+        # window ending at 00:00 on 31 December of an hourly record would lose that year.
         partial = (DateTime(1995, 1, 1), DateTime(1995, 6, 30))
-        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
+        @test_throws "the spinup window 1995-01-01T00:00:00 .. 1995-06-30T00:00:00 is not whole calendar years on this forcing's 1 day grid" GEMB_GlacierSims._spinup_climatology(cf, partial, mp)
+        th = collect(DateTime(1951, 1, 1):Hour(1):DateTime(1954, 12, 31, 23))
+        hourly = DimStack((x = DimArray(zeros(length(th)), (Ti(th),)),))
+        @test_throws "(such as 1953-12-31T23:00:00)" GEMB_GlacierSims._spinup_climatology(
+            hourly, (DateTime(1951, 1, 1), DateTime(1953, 12, 31)), mp)
+        # Whole years, but fewer than the `:representative` block needs: `n_years` would otherwise be
+        # clamped to the two years found.
+        @test_throws "the spinup window 1995-01-01T00:00:00 .. 1996-12-31T00:00:00 holds 2 whole calendar year(s); the :representative climatology needs 3" GEMB_GlacierSims._spinup_climatology(
+            cf, (DateTime(1995, 1, 1), DateTime(1996, 12, 31)), mp)
+        # Whole years ending after the forcing: the last year would be dropped.
+        late = (DateTime(1995, 1, 1), DateTime(2000, 12, 31))
+        @test_throws SpinupWindowUnavailable GEMB_GlacierSims._spinup_climatology(cf, late, mp)
+
+        # A window starting before the forcing is refused even though the rest of it is supplied:
+        # the climatology keeps complete years only, so it would drop the partial first year and
+        # come from later years than the window it records.
+        t = collect(DateTime(1950, 1, 2):Day(1):DateTime(1955, 12, 31))
+        cf = DimStack((x = DimArray(zeros(length(t)), (Ti(t),)),))
+        early = (DateTime(1950, 1, 1), DateTime(1953, 12, 31))
+        err = try
+            GEMB_GlacierSims._spinup_climatology(cf, early, mp)
+            nothing
+        catch e
+            e
+        end
+        @test err isa SpinupWindowUnavailable
+        @test err.extent == (first(t), last(t))
+        @test occursin("the spinup window 1950-01-01T00:00:00 .. 1953-12-31T00:00:00 is not inside " *
+                       "the forcing supplied (1950-01-02T00:00:00 .. 1955-12-31T00:00:00)",
+                       sprint(showerror, err))
+    end
+
+    @testset "the whole-year spinup window gives the same climatology" begin
+        # The production record starts 1950-01-02T00. The window that named the record start,
+        # 1950-01-02T00 .. 31 December 00:00 of a leap year, and the whole-year window from the next
+        # 1 January select the same complete years (the partial first year and the leap day are
+        # dropped either way), so the climatology is bit-identical and only the recorded window
+        # changes. Hourly synthetic forcing whose years differ, so the representative block is chosen
+        # among distinct candidates.
+        t = collect(DateTime(1950, 1, 2):Hour(1):DateTime(1956, 12, 31, 23))
+        n = length(t)
+        doy = Dates.dayofyear.(t)
+        hod = Dates.hour.(t)
+        yr = Dates.year.(t)
+        temperature = @. 262.0 + 12.0 * sin(2π * (doy - 110) / 365) + 3.0 * sin(2π * hod / 24) +
+                         1.5 * sin(1.7 * yr)
+        shortwave = @. max(0.0, 600.0 * sin(2π * (hod - 6) / 24))
+        layer(x) = DimArray(x isa AbstractVector ? x : fill(Float64(x), n), (Ti(t),))
+        stack = DimStack((temperature_air = layer(temperature), pressure_air = layer(8e4),
+                          vapor_pressure = layer(@. 200.0 + 2.0 * (temperature - 262.0)),
+                          wind_speed = layer(3.0),
+                          precipitation = layer(@. 1e-4 * (1 + sin(0.37 * doy + yr))),
+                          shortwave_downward = layer(shortwave),
+                          longwave_downward = layer(@. 0.8 * 5.670374419e-8 * temperature^4),
+                          solar_zenith_angle = layer(60.0),
+                          shortwave_downward_diffuse = layer(0.3 .* shortwave),
+                          cloud_optical_thickness = layer(2.0));
+                         metadata = Dict{String,Any}(
+                             "latitude" => 61.0, "longitude" => -140.0, "elevation" => 1500.0,
+                             "dataset" => "synthetic", "temperature_observation_height" => 2.0,
+                             "wind_observation_height" => 10.0,
+                             "temperature_air_mean" => sum(temperature) / n, "wind_speed_mean" => 3.0,
+                             "precipitation_mean" => 1e-4))
+        cf = GEMB.initialize_forcing(stack)
+        mp = GEMB.initialize_parameters()
+        named = (DateTime(1950, 1, 2), DateTime(1956, 12, 31))
+        whole = GEMB_GlacierSims._default_spinup_window(cf)
+        @test whole == (DateTime(1951, 1, 1), DateTime(1956, 12, 31, 23))
+        layers(c) = [getfield(c, f) for f in fieldnames(typeof(c)) if getfield(c, f) isa AbstractDimArray]
+        for method in (:average, :representative)
+            before = GEMB.forcing_climatology(cf, named; method, model_parameters = mp, n_years = 3,
+                                              verbose = false)
+            after = GEMB_GlacierSims._spinup_climatology(cf, whole, mp; method)
+            @test lookup(before.temperature_air, Ti) == lookup(after.temperature_air, Ti)
+            @test all(isequal.(parent.(layers(before)), parent.(layers(after))))
+            @test before.climatology_n_years == after.climatology_n_years
+            @test after.climatology_window_start == DateTime(1951, 1, 1)
+            @test after.climatology_window_stop == DateTime(1956, 12, 31, 23)
+        end
     end
 
     @testset "NetCDF append" begin
@@ -1071,10 +1197,9 @@ end
         end
 
         @testset "lapse rate" begin
-            # The ON-GLACIER lapse rate, which is not the ambient one. Above melting the decoupling
-            # maps T -> 273.15 + k(T - 273.15), so it compresses the profile and the on-glacier
-            # slope is k*Γ.
-            @test all(g -> isapprox(g, k_true * gamma_true, atol = 1e-8), p.lapse_rate.lapse_rate)
+            # The AMBIENT lapse rate: the fit brings every cell to the ice-free state before taking
+            # the slope, which is the slope the band forcing is lapsed with before it is decoupled.
+            @test all(g -> isapprox(g, gamma_true, atol = 1e-8), p.lapse_rate.lapse_rate)
             @test p.lapse_rate isa DimStack
             @test collect(dims(p.lapse_rate, Ti)) == p.time
             @test DimensionalData.metadata(p.lapse_rate)["n_fitted"] == length(_CP_TIME)
@@ -1090,7 +1215,7 @@ end
             by_month = groupby(p.lapse_rate, Ti => month)
             @test length(by_month) == 1
             @test Statistics.median(filter(isfinite, only(by_month).lapse_rate)) ≈
-                  k_true * gamma_true atol = 1e-8
+                  gamma_true atol = 1e-8
             by_hour = groupby(p.decoupling, Ti => hour)
             @test length(by_hour) == length(_CP_TIME)
             @test all(g -> isapprox(Statistics.median(filter(isfinite, g.decoupling_factor)),
@@ -1110,11 +1235,13 @@ end
             zs = [c.z for c in cells]
             gs = [c.glm for c in cells]
             kk = collect(p.decoupling.decoupling_factor)[1]
-            a, b = collect(p.decoupling.coef_alpha)[1], collect(p.decoupling.coef_beta)[1]
+            γc, δc = collect(p.decoupling.coef_gamma)[1], collect(p.decoupling.coef_delta)[1]
             usable = isfinite(kk) && 0 < kk <= 1
             raw = [observed(c)[1] for c in cells]
+            # The ice-free temperature of a cell above melting, `T - glm·(γ + δz)`.
             corrected = usable ?
-                [raw[i] + (kk - 1) * (1 - gs[i]) * (a + b * zs[i]) for i in eachindex(raw)] : copy(raw)
+                [raw[i] - (raw[i] > 273.15 ? gs[i] * (γc + δc * zs[i]) : 0.0) for i in eachindex(raw)] :
+                copy(raw)
             Szz = sum((zs .- mean(zs)) .^ 2)
             SzT = sum((zs .- mean(zs)) .* (corrected .- mean(corrected)))
             STT = sum((corrected .- mean(corrected)) .^ 2)
@@ -1140,31 +1267,39 @@ end
 
             # The realistic case: cells that do *not* fall exactly on a line, which is what the
             # diagnostic exists to measure. Here the sums must reproduce a from-scratch regression
-            # tightly, not just to a floor.
-            scatter = [0.0, 0.4, -0.3, 0.25, -0.15, 0.05][1:length(cells)]
-            noisy(c) = (i = findfirst(x -> x.lat == c.lat && x.lon == c.lon, cells);
+            # tightly, not just to a floor. Six cells, because the four-term decoupling fit
+            # interpolates four cells exactly and its ice-free correction would then remove any
+            # scatter they carry.
+            cells6 = [cells; [(lon = 10.4, lat = 46.0, z = 1200.0, glm = 0.7, bins = [(1250, 5.0)]),
+                              (lon = 10.45, lat = 46.0, z = 2200.0, glm = 0.1, bins = [(2250, 5.0)])]]
+            zs6 = [c.z for c in cells6]
+            gs6 = [c.glm for c in cells6]
+            Szz6 = sum((zs6 .- mean(zs6)) .^ 2)
+            scatter = [0.0, 0.4, -0.3, 0.25, -0.15, 0.05]
+            noisy(c) = (i = findfirst(x -> x.lat == c.lat && x.lon == c.lon, cells6);
                         observed(c) .+ scatter[i])
-            pn = derive_downscaling_parameters(:synthetic, time_range, table, region;
+            pn = derive_downscaling_parameters(:synthetic, time_range, _cp_table(cells6), region;
                                                token = nothing, cache_path = nothing, min_cells = 4,
-                                               forcing_loader = _cp_loader(cells, noisy))
+                                               forcing_loader = _cp_loader(cells6, noisy))
             kn = collect(pn.decoupling.decoupling_factor)[1]
-            an, bn = collect(pn.decoupling.coef_alpha)[1], collect(pn.decoupling.coef_beta)[1]
-            rawn = [noisy(c)[1] for c in cells]
+            γn, δn = collect(pn.decoupling.coef_gamma)[1], collect(pn.decoupling.coef_delta)[1]
+            rawn = [noisy(c)[1] for c in cells6]
             corrn = (isfinite(kn) && 0 < kn <= 1) ?
-                [rawn[i] + (kn - 1) * (1 - gs[i]) * (an + bn * zs[i]) for i in eachindex(rawn)] :
+                [rawn[i] - (rawn[i] > 273.15 ? gs6[i] * (γn + δn * zs6[i]) : 0.0)
+                 for i in eachindex(rawn)] :
                 copy(rawn)
-            SzTn = sum((zs .- mean(zs)) .* (corrn .- mean(corrn)))
+            SzTn = sum((zs6 .- mean(zs6)) .* (corrn .- mean(corrn)))
             STTn = sum((corrn .- mean(corrn)) .^ 2)
-            rssn = STTn - SzTn^2 / Szz
+            rssn = STTn - SzTn^2 / Szz6
             @test rssn > 1e-6                       # genuinely scattered, so the check has teeth
             @test collect(pn.lapse_rate_uncertainty.residual_sd)[1] ≈
-                  sqrt(rssn / (length(zs) - 2)) rtol = 1e-6
+                  sqrt(rssn / (length(zs6) - 2)) rtol = 1e-6
             @test collect(pn.lapse_rate_uncertainty.lapse_rate_stderr)[1] ≈
-                  1000 * sqrt(rssn / (length(zs) - 2)) / sqrt(Szz) rtol = 1e-6
+                  1000 * sqrt(rssn / (length(zs6) - 2)) / sqrt(Szz6) rtol = 1e-6
             @test collect(pn.lapse_rate_uncertainty.lapse_rate_r2)[1] ≈
                   1 - rssn / STTn rtol = 1e-6
             # And the slope the error belongs to is still upstream's, unchanged by any of this.
-            @test collect(pn.lapse_rate.lapse_rate)[1] ≈ -1000 * SzTn / Szz rtol = 1e-8
+            @test collect(pn.lapse_rate.lapse_rate)[1] ≈ -1000 * SzTn / Szz6 rtol = 1e-8
         end
 
         @testset "elevation interval forcing" begin
@@ -1223,17 +1358,42 @@ end
             # Interval temperature decreases with elevation.
             @test issorted([mean(iv.forcing[:temperature_air]) for iv in intervals], rev = true)
 
-            # Each interval here draws on exactly one cell whose own elevation is 50 m below the
-            # center, so its temperature is that cell's forcing lapsed 50 m and then given the
-            # decoupling it still needs — a value that can be written out by hand.
-            for (iv, c) in zip(intervals, cells)
-                lapsed = observed(c)[1] - k_true * gamma_true * (iv.center - c.z) / 1000.0
-                still_needed = 1 - (1 - k_true) * (1 - c.glm)
-                expected = lapsed + (still_needed - 1) * max(lapsed - 273.15, 0.0)
+            # The analytic on-glacier temperature `T_ref + k(z)·E_ambient(z)` at each band's center. The
+            # fixture follows the mixing model with one `k` at every elevation, so the band
+            # temperature depends on neither the contributing cell's `glm` nor its elevation.
+            for iv in intervals
+                expected = 273.15 + k_true * (t0 - gamma_true * iv.center / 1000 - 273.15)
                 @test mean(iv.forcing[:temperature_air]) ≈ expected atol = 1e-8
                 # Precipitation is area-averaged unadjusted: the downstream sweep solves for its
                 # correction factor, which is the whole point of producing this forcing.
                 @test all(≈(0.1), iv.forcing[:precipitation])
+            end
+
+            @testset "far above donors of different glm" begin
+                # Bands 1050 to 2550 m above the cells that force them, with glacier fractions from
+                # 0 to 0.9 and one band drawn from three of them. Each cell's forcing is the mixing
+                # model's observed temperature, so the only value every cell can agree on at a band is
+                # `T_ref + k·E_ambient(z_band)`.
+                far = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(2050, 3.0), (3550, 5.0)]),
+                       (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.9, bins = [(3550, 7.0)]),
+                       (lon = 10.2, lat = 46.0, z = 2000.0, glm = 0.3, bins = [(3050, 2.0)]),
+                       (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.6, bins = [(3550, 4.0)])]
+                t_far = 300.0
+                ambient_far(z) = t_far - gamma_true * z / 1000
+                observed_far(c) = fill(273.15 + (1 - c.glm * (1 - k_true)) * (ambient_far(c.z) - 273.15),
+                                       length(_CP_TIME))
+                pf = derive_downscaling_parameters(:synthetic, time_range, _cp_table(far), region;
+                                                   token = nothing, cache_path = nothing,
+                                                   min_cells = 4,
+                                                   forcing_loader = _cp_loader(far, observed_far))
+                bands_far = collect(pf.elevation_interval_forcing)
+                @test [b.center for b in bands_far] == [2050.0, 3050.0, 3550.0]
+                @test only(filter(b -> b.center == 3550.0, bands_far)).n_cells == 3
+                for b in bands_far
+                    @test DimensionalData.metadata(b.forcing)["extrapolation_above_reanalysis"] >= 1000
+                    expected = 273.15 + k_true * (ambient_far(b.center) - 273.15)
+                    @test all(T -> isapprox(T, expected, atol = 1e-8), b.forcing[:temperature_air])
+                end
             end
         end
 
@@ -1281,7 +1441,7 @@ end
             @test p.provenance["n_grid_cells_in_region"] == 4
             @test p.provenance["n_grid_cells_used"] == 4
             @test p.provenance["n_elevation_intervals"] == 4
-            @test p.provenance["adjustment_order"] == "lapse_then_decouple"
+            @test p.provenance["adjustment_order"] == "ambient_lapse_decouple"
             # How much of each fit is measurement rather than absence — the count, not a verdict.
             @test p.provenance["n_timesteps"] == length(_CP_TIME)
             @test p.provenance["n_decoupling_factor_fitted"] == length(_CP_TIME)
@@ -2572,14 +2732,15 @@ end
             # untouched between these two tables, so a dependence on it could not show up here.
             #
             # Two conditions have to hold for `glm` to be observable at all, and both are asserted
-            # below rather than assumed: `k` must not be the identity, since
-            # `_effective_decoupling_factor(1, glm)` is 1 whatever `glm` is, and the band must be above
-            # freezing, since the correction scales `max(T - 273.15, 0)`.
+            # below rather than assumed: the donor's `k` must not be 1, since the ice-free correction
+            # divides by `1 - glm·(1 - k)`, and the band must be above freezing, since the correction
+            # acts only on the excess above 273.15 K.
             half = [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
                     for b in applied.bands]
             applied_k = GEMB_GlacierSims.AppliedDownscaling(
                 applied.time, applied.lapse_rate, applied.lapse_rate_source, half,
-                applied.basis, applied.settings)
+                applied.basis, applied.settings, Dict{String,Any}(),
+                z -> fill(0.6, length(applied.time)))
             hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
             hot_hole(c) = c.lon == 10.1 ? masked(c) : hot(c)
 
@@ -2717,6 +2878,15 @@ end
                 @test ds["dh"].attrib["units"] == "m"
                 @test size(ds["total_dv"]) == (length(run.time), length(run.delta_temperatures),
                                                length(run.precipitation_scalings))
+                # Chunked over many time steps and the whole of every other axis, not one element
+                # at a time, whose chunk index would outweigh the data.
+                n_t = length(run.time)
+                @test NCDatasets.chunking(ds["dh"]) ==
+                      (:chunked, (n_t, length(run.bands), length(run.delta_temperatures),
+                                  length(run.precipitation_scalings)))
+                @test NCDatasets.chunking(ds["total_dv"]) ==
+                      (:chunked, (n_t, length(run.delta_temperatures),
+                                  length(run.precipitation_scalings)))
                 @test ds["total_dv"].attrib["units"] == "km3"
                 @test ds["total_dm"].attrib["units"] == "Gt"
                 # A per-band flux and its tile total share a name, so the total is prefixed; both must
@@ -3136,9 +3306,170 @@ end
         end
     end
 
+    @testset "native resolution run" begin
+        @testset "forcing corrections" begin
+            GI = GeoDataFrames.GeoInterface
+            box(lon, lat) = GI.Polygon([GI.LinearRing([(lon, lat), (lon + 2, lat), (lon + 2, lat + 2),
+                                                       (lon, lat + 2), (lon, lat)])])
+            function corrections_file(rows)
+                path = joinpath(mktempdir(), "fit_gembfit.arrow")
+                GeoDataFrames.write(path, DataFrame(rows))
+                return path
+            end
+            good = [(; geometry = box(-142, 60), id = "lat[+60+62]lon[-142-140]", group = 7,
+                       pscale = 1.6, ΔT = 2.2, rgi = 1, area_km2 = 100.0),
+                    (; geometry = box(-140, 60), id = "lat[+60+62]lon[-140-138]", group = 7,
+                       pscale = 1.6, ΔT = 2.2, rgi = 1, area_km2 = 50.0),
+                    (; geometry = box(-138, 58), id = "lat[+58+60]lon[-138-136]", group = 9,
+                       pscale = 0.9, ΔT = -0.5, rgi = 1, area_km2 = 20.0)]
+            c = read_forcing_corrections(corrections_file(good))
+            @test length(c) == 3
+            @test c["lat[+58+60]lon[-138-136]"] == (; pscale = 0.9, ΔT = -0.5, group = 9)
+
+            own = forcing_correction("lat[+60+62]lon[-142-140]", c)
+            @test (own.pscale, own.ΔT, own.group) == (1.6, 2.2, 7)
+            @test own.donor == "lat[+60+62]lon[-142-140]"
+            @test own.distance_km == 0.0
+
+            # An unfitted geotile borrows the nearest fitted center. At 59°N two degrees of longitude
+            # (114 km) are nearer than two of latitude (222 km), so lat[+58+60]lon[-140-138] takes the
+            # tile east of it, not the one north.
+            near = forcing_correction("lat[+58+60]lon[-140-138]", c)
+            @test near.donor == "lat[+58+60]lon[-138-136]"
+            @test near.distance_km ≈ GEMB_GlacierSims._haversine_km(59.0, -139.0, 59.0, -137.0)
+            @test (near.pscale, near.ΔT, near.group) == (0.9, -0.5, 9)
+            @test_throws "beyond the 1000 km cap" forcing_correction("lat[-46-44]lon[+168+170]", c)
+            @test_throws "not a geotile id" forcing_correction("N60_W142", c)
+
+            # The id a cell's tile produces is the key the calibration writes, including at the
+            # antimeridian, where the native 0-360 longitude has to be wrapped first.
+            @test geotile_id(tile_index(wrap_lon(219.95), 60.05; tile_size = 2), 2) ==
+                  "lat[+60+62]lon[-142-140]"
+            @test geotile_id(tile_index(wrap_lon(180.0), -16.5; tile_size = 2), 2) ==
+                  "lat[-18-16]lon[-180-178]"
+
+            bad(f) = corrections_file([f(good[1])])
+            @test_throws "lacks column(s) ΔT" read_forcing_corrections(corrections_file(
+                [(; geometry = box(-142, 60), id = "lat[+60+62]lon[-142-140]", group = 7, pscale = 1.6)]))
+            @test_throws "a scaling must be positive and finite" read_forcing_corrections(
+                bad(r -> merge(r, (; pscale = 0.0))))
+            @test_throws "an offset must be finite" read_forcing_corrections(
+                bad(r -> merge(r, (; ΔT = NaN))))
+            @test_throws "appears twice" read_forcing_corrections(corrections_file(
+                [good[1], merge(good[1], (; ΔT = 3.0))]))
+            @test_throws "no forcing-correction file" read_forcing_corrections("/nonexistent.arrow")
+        end
+
+        # Three cells sharing the 1550 m band, at different reanalysis surfaces and glm, so the per-cell
+        # adjustments differ and the band mean is a real average.
+        cells = [(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0, bins = [(1050, 10.0), (1550, 2.0)]),
+                 (lon = 10.1, lat = 46.0, z = 1500.0, glm = 0.5, bins = [(1550, 5.0)]),
+                 (lon = 10.2, lat = 46.0, z = 2000.0, glm = 1.0, bins = [(1550, 3.0), (2050, 6.0)]),
+                 (lon = 10.3, lat = 46.0, z = 2500.0, glm = 0.25, bins = [(2550, 1.0)])]
+        table = _cp_table(cells)
+        time_range = (_CP_TIME[1], _CP_TIME[end])
+        hot(c) = fill(295.0 - 5.0 * c.z / 1000.0, length(_CP_TIME))
+        # Shortwave and cloud optical thickness differ between cells, so the band's shortwave-weighted
+        # layers are real averages rather than copies of one cell.
+        sw_cell = Dict(10.0 => 300.0, 10.1 => 120.0, 10.2 => 60.0, 10.3 => 250.0)
+        τ_cell = Dict(10.0 => 0.0, 10.1 => 5.0, 10.2 => 17.0, 10.3 => 1.0)
+        loader = function (_model, lat, lon; kwargs...)
+            c = cells[findfirst(c -> c.lat == lat && c.lon == lon, cells)]
+            _cp_forcing(lat, lon, c.z, hot(c); shortwave_downward = sw_cell[lon],
+                        shortwave_downward_diffuse = 0.3 * sw_cell[lon],
+                        cloud_optical_thickness = τ_cell[lon])
+        end
+        applied0 = derive_downscaling_parameters(:synthetic, time_range, table; token = nothing,
+                                                 cache_path = nothing, min_cells = 4,
+                                                 forcing_loader = loader).applied
+        # A decoupling factor that is not the identity, so glm moves the adjusted temperature.
+        applied = GEMB_GlacierSims.AppliedDownscaling(
+            applied0.time, applied0.lapse_rate, applied0.lapse_rate_source,
+            [merge(b, (; decoupling_factor = fill(0.5, length(b.decoupling_factor))))
+             for b in applied0.bands],
+            applied0.basis, applied0.settings, applied0.provenance,
+            applied0.donor_decoupling_factor_at)
+        tile = only(downscaling_tiles(table; tile_size = 2, buffer = 1))
+
+        @testset "native_cells splits a tile into one-cell tiles" begin
+            nc = native_cells(tile)
+            @test length(nc) == nrow(tile.core)
+            @test all(nrow(c.core) == 1 for c in nc)
+            # The tile's own bounds, so each cell reports the geotile it lies in.
+            @test all(geotile_id(c.bounds) == geotile_id(tile.bounds) for c in nc)
+            @test [c.name for c in nc] == [cell_output_name(r.latitude, r.longitude)
+                                           for r in eachrow(tile.core)]
+            @test all(c.buffered === tile.buffered for c in nc)
+        end
+
+        @testset "the tile band forcing is the area-weighted mean of the native cell forcing" begin
+            band_forcing(cells_table) = collect(elevation_interval_forcing(
+                cells_table, applied; climate_model = :synthetic, time_range, token = nothing,
+                cache_path = nothing, elevation_interval_batch = 0, forcing_loader = loader,
+                donor_cells = tile.buffered))
+            tile_bands = band_forcing(tile.core)
+            native = [band_forcing(c.core) for c in native_cells(tile)]
+            @test sum(b.area for b in tile_bands) ≈ sum(b.area for n in native for b in n)
+            for tb in tile_bands
+                parts = [b for n in native for b in n if b.center == tb.center]
+                @test sum(b.area for b in parts) ≈ tb.area
+                # Area means, except the two layers that follow the shortwave: the zenith angle is
+                # the angle of the shortwave-weighted mean cosine, and the optical thickness is the
+                # shortwave-weighted mean τ (the τ of the band's mean transmissivity).
+                w_sw = [b.area .* collect(b.forcing[:shortwave_downward]) for b in parts]
+                for v in GEMB_GlacierSims._FORCING_VARIABLES
+                    tile_v = collect(tb.forcing[v])
+                    if v === :solar_zenith_angle
+                        c = sum(w .* cosd.(collect(b.forcing[v])) for (w, b) in zip(w_sw, parts))
+                        @test acosd.(c ./ sum(w_sw)) ≈ tile_v rtol = 1e-12
+                    elseif v === :cloud_optical_thickness
+                        τw = sum(w .* collect(b.forcing[v]) for (w, b) in zip(w_sw, parts))
+                        @test τw ./ sum(w_sw) ≈ tile_v rtol = 1e-12
+                    else
+                        mean_v = sum(b.area .* collect(b.forcing[v]) for b in parts) ./ tb.area
+                        @test mean_v ≈ tile_v rtol = 1e-12
+                    end
+                end
+            end
+            # The shared band is where the per-cell forcing actually differs, so the parity above is
+            # an average of distinct series and not three copies of one.
+            shared = [only(filter(b -> b.center == 1550.0, n)) for n in native if
+                      any(b -> b.center == 1550.0, n)]
+            @test length(shared) == 3
+            @test length(unique(collect(b.forcing.temperature_air) for b in shared)) == 3
+        end
+
+        @testset "gemb_native_cell refuses what it cannot run" begin
+            mp = initialize_parameters()
+            correction = (; pscale = 1.0, ΔT = 0.0, group = 1, donor = "x", distance_km = 0.0)
+            @test_throws "exactly one grid cell" gemb_native_cell(tile, applied, mp; correction,
+                                                                  climate_model = :synthetic,
+                                                                  time_range)
+            empty_cell = merge(first(native_cells(tile)),
+                               (; core = _cp_table([(lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.0,
+                                                     bins = [(4050, 1.0)])])))
+            @test_throws "holds no ice in any elevation band" gemb_native_cell(
+                empty_cell, applied, mp; correction, climate_model = :synthetic, time_range)
+        end
+    end
+
     # Note: end-to-end simulation tests need CDS API credentials and network access to the
     # Copernicus DEM, so the runfile builder, `gemb_glacier_cell`, `gemb_glacier_tile` and
     # `bare_ice_albedo_tile` are exercised by `src/era5_example.jl`,
     # `scripts/derive_downscaling_parameters_e2e.jl`, `scripts/gemb_tile_e2e.jl` and
     # `scripts/derive_bare_ice_albedo_tile.jl` rather than here.
 end
+
+include("test_pipeline_audit.jl")
+
+include("test_background_black_carbon.jl")
+
+include("test_physics_members.jl")
+# The slope-dependent wind correction; uses helpers of `runtests.jl` and `test_pipeline_audit.jl`.
+include("test_wind_correction.jl")
+
+include("test_column_profiles.jl")
+
+include("test_dem_archive.jl")
+
+include("test_run_launch.jl")

@@ -16,18 +16,25 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and the parameter tiles. Forcing is read
 # from the shared Zarr cache under `CLIMATE_CACHE`, so tiles are visited in chunk order.
 #
-# Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start_year] [end_year]
-# Run the sweep:  scripts/run_tile_sweep.sh [start_year] [end_year]
+# Run one block:  julia --project=. -t 1 scripts/gemb_tile_sweep.jl [start] [end]
+# Run the sweep:  scripts/run_tile_sweep.sh [start] [end]
+#
+# `start` and `end` are each a year (its 1 January, 00:00), an ISO date-time, or `record-start` /
+# `record-end`. They default to the first and last steps of the cached ERA5-Land record, which is read
+# at start-up; a range reaching outside the cached record is refused then, before any tile is claimed.
+# The record starts at 1950-01-02T00:00, so `1950` is refused. The process exits with status 1 when any
+# tile it claimed failed.
 #
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
-# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, PHYSICS_MEMBER (see run_settings.jl),
+# EFFECTIVE_LOADING_TABLE (for a `cvis` member), COLUMN_PROFILES (see run_settings.jl)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
-# Sizing: a 60-band tile over the 10x7 grid is 4,200 simulations, and one simulation is the spinup plus
+# Sizing: a 60-band tile over the 10x10 grid is 6,000 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
 # full ERA5-Land record is eleven times longer with a `:representative` spinup costing about 2.2x the
 # model-years of an averaged one. Measure with a TILE_LIMIT or TILE_NAMES subset before committing to a
@@ -51,7 +58,9 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", s
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 # Overridable so a timing probe on a reduced perturbation grid can share the forcing cache without
 # writing files the production sweep would then have to recognise as a different experiment and rebuild.
-const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "tile_runs"))
+# The default is the directory the native run takes as its reference: the physics member's under
+# `TILE_RUN_DIR` (`tile_run_dir`).
+const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", tile_run_dir(CLIMATE_CACHE))
 
 # Must match the gridding the parameter tiles were derived on, or a tile's parameters describe a
 # different neighbourhood than its cells. The parameter files record their own `tile_size`/`tile_buffer`,
@@ -59,13 +68,17 @@ const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "tile_runs"))
 const TILE_SIZE = 2
 const BUFFER = 1
 
-const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 1950
-const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2027
-const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
+# `climate_forcing` refuses a request outside the cached record, so the run spans that record unless
+# told otherwise, and a range the cache cannot serve fails here rather than in every tile.
+const FORCING_RECORD = era5_land_record_span(joinpath(CLIMATE_CACHE, "cache"))
+const RUN_TIME = run_time_range(ARGS, FORCING_RECORD)
+const TIME_RANGE = RUN_TIME.time_range
 
 # The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
 # at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
-# far points exist to bracket it and to show the response is monotonic.
+# far points exist to bracket it and to show the response is monotonic. The fit interpolates linearly
+# between nodes across a concave response, and most fitted scalings land between 1.5 and 4, so that
+# span carries nodes at every 0.5.
 #
 # `1.0` and `0.0` must be present, except under `SUPPLEMENTARY`. They are the baseline the reports and
 # the reference discharge locate with `findfirst`, and a grid without them silently loses both.
@@ -74,21 +87,26 @@ const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
 # they are what a re-run reproduces, and they are in git.
 const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
     parse.(Float64, split(ENV["PRECIPITATION_SCALINGS"], ",")) :
-    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 4.0]
+    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
 const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
     [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
 
 # Ceiling on the spinup, not the convergence test: bands exit on the drift criterion well inside this on
-# glacier firn, so the ceiling only binds on an outlier.
+# glacier firn, so the ceiling only binds on an outlier. A column that reaches it is kept and counted
+# (`spinup_n_unconverged`, `spinup_unconverged_area_km2`), not refused.
+#
+# Sized on the slowest tiles: on N82_W048, S78_E168, N66_W156 and N62_W142, at 0 and -3 K, every column
+# converged, the area-weighted mean within 100 years and the slowest at 285 (N82_W048, 250 m band, 0 K).
+# 500 years leaves that column room by a factor of 1.75.
 #
 # A span of simulated years rather than a cycle count, because a cycle count means a different amount of
 # spinup on a different climatology. `gemb_spinup` divides by the measured cycle length to get its own
 # ceiling: under `SPINUP_CLIMATOLOGY_METHOD = :representative` a cycle is `SPINUP_CLIMATOLOGY_N_YEARS`
-# years, so 100 years is about 34 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
-# can judge a slope, so the ceiling has to leave room for that — 34 does, 10 would not.
+# years, so 500 years is 167 cycles. `SPINUP_DRIFT_WINDOW` cycles must run before the drift criterion
+# can judge a slope, so the ceiling has to leave room for that.
 const SPINUP_SIMULATION_YEARS_MAXIMUM =
-    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "100"))
+    parse(Float64, get(ENV, "SPINUP_SIMULATION_YEARS_MAXIMUM", "500"))
 # Spinup exits when the FAC trend flattens; see `SPINUP_DRIFT_FAC` in `glacier_run.jl`, including why this
 # value is too loose for an ice-sheet plateau. Stated per **year** and scaled to the cycle by
 # `_spinup_drift_tolerance`, so 1e-2 is 1 cm of firn air per year whatever the cycle length.
@@ -98,11 +116,16 @@ const SPINUP_DRIFT_FAC = 1e-2
 # makes an appended update defensible: were it tied to the record, extending the record would change the
 # spinup and the new segment would not continue the old one. 1950-1980 is the earliest three decades
 # ERA5-Land offers, so it is the closest this forcing comes to a pre-industrial reference. It must span at
-# least `SPINUP_CLIMATOLOGY_N_YEARS`, which `_spinup_climatology` checks.
-const SPINUP_CLIMATOLOGY_WINDOW = (
-    DateTime(parse(Int, get(ENV, "SPINUP_CLIMATOLOGY_START", "1950")), 1, 1),
-    DateTime(parse(Int, get(ENV, "SPINUP_CLIMATOLOGY_STOP", "1980")), 12, 31),
-)
+# least `SPINUP_CLIMATOLOGY_N_YEARS` years. The window is whole calendar years, the years the climatology
+# keeps, so the window a tile records names exactly the years its spinup used: by default the whole years
+# of the cached record and the run through `SPINUP_CLIMATOLOGY_LAST_YEAR`, 1951-01-01T00:00 ..
+# 1980-12-31T23:00 for a full-record run (ERA5-Land starts 1950-01-02T00:00). SPINUP_CLIMATOLOGY_START
+# and _STOP override either end with a year or an ISO date-time on a calendar-year boundary;
+# `spinup_window_range` refuses any other window, and one outside the record or the run.
+const SPINUP_CLIMATOLOGY_WINDOW = spinup_window_range(
+    get(ENV, "SPINUP_CLIMATOLOGY_START", nothing), get(ENV, "SPINUP_CLIMATOLOGY_STOP", nothing),
+    FORCING_RECORD, TIME_RANGE; last_year = SPINUP_CLIMATOLOGY_LAST_YEAR,
+    minimum_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
 
 # How far a cell that carries ice but falls outside ERA5-Land's land mask may borrow forcing from; see
 # `elevation_interval_forcing`. Donors are drawn from the tile's *buffered* neighbourhood rather than its
@@ -113,7 +136,7 @@ const DONOR_MAX_DISTANCE_KM = parse(Float64, get(ENV, "DONOR_MAX_DISTANCE_KM", "
 # How often the transient is sampled. Weekly resolves the melt season, which monthly averages across:
 # ablation is concentrated in a few weeks and a monthly mean spreads it over the whole month, so a
 # comparison against altimetry binned finer than a month cannot see it. `output_period_bound` must know
-# the period of whatever is chosen here.
+# the period of whatever is chosen here, and the pre-flight checks that it does.
 #
 # The cost is series size, not simulation time: the timestep is the forcing's either way, so this only
 # changes how much of it is written — about 4.4x more steps than monthly over the full record.
@@ -128,11 +151,13 @@ const RESTART_FETCH_OVERLAP = Day(1)
 # shares the filesystem of the file it guards — a claim on a different mount could outlive an output the
 # sweep can no longer see.
 #
-# The bound has to exceed the longest a single tile can legitimately take: reclaiming a running tile would
-# put two processes on one netCDF. A 63-band tile over the 10x7 grid and the full record is the worst case,
-# so this is deliberately generous. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
+# A worker's claim carries a heartbeat refreshed every `CLAIM_HEARTBEAT` while the tile runs
+# (`with_claim_heartbeat`), so a running tile is never reclaimed however long it takes, and a claim is
+# stale once its heartbeat is `CLAIM_STALE_AFTER` old: its worker has died. The bound only has to cover
+# several missed heartbeats. Set `CLAIM_STALE_HOURS=0` to disable reclaiming entirely.
 const CLAIM_SUBDIR = "claims"
-const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "24")))
+const CLAIM_STALE_AFTER = Hour(parse(Int, get(ENV, "CLAIM_STALE_HOURS", "1")))
+const CLAIM_HEARTBEAT = Minute(5)
 
 const TILE_LIMIT = haskey(ENV, "TILE_LIMIT") ? parse(Int, ENV["TILE_LIMIT"]) : typemax(Int)
 const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? split(ENV["TILE_NAMES"], ",") : String[]
@@ -205,7 +230,7 @@ end
 # What this run is configured to do, for the log and for the terminal that launched it.
 function settings_rows()
     return [
-        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         env_setting("output frequency", OUTPUT_FREQUENCY, "OUTPUT_FREQUENCY"),
         env_setting("temperature offsets (K)", DELTA_TEMPERATURES, "DELTA_TEMPERATURES"),
@@ -214,6 +239,8 @@ function settings_rows()
                 "$(length(DELTA_TEMPERATURES)) × $(length(PRECIPITATION_SCALINGS)) = " *
                 "$(length(DELTA_TEMPERATURES) * length(PRECIPITATION_SCALINGS))"),
         setting("bare-ice albedo", albedo_profile_sample(), "parameter tiles"),
+        physics_member_setting(),
+        glacier_correction_setting(),
         setting("spinup climatology", SPINUP_CLIMATOLOGY_WINDOW,
                 haskey(ENV, "SPINUP_CLIMATOLOGY_START") || haskey(ENV, "SPINUP_CLIMATOLOGY_STOP") ?
                 "ENV[SPINUP_CLIMATOLOGY_START/STOP]" : "default"),
@@ -221,6 +248,9 @@ function settings_rows()
                     "SPINUP_SIMULATION_YEARS_MAXIMUM"),
         setting("spinup drift tolerance", "$(SPINUP_DRIFT_FAC) m firn air / year"),
         env_setting("masked-cell donor range", "$(DONOR_MAX_DISTANCE_KM) km", "DONOR_MAX_DISTANCE_KM"),
+        background_black_carbon_setting(),
+        effective_black_carbon_setting(),
+        column_profiles_setting(),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         # From JLOptions, not ENV: this is the value the collector acts on, so a hint lost on its way to
         # the worker shows up here as "none" instead of being reported as if it had taken effect.
@@ -229,7 +259,9 @@ function settings_rows()
                 setting("GC heap hint", "none (target sized from physical memory)") :
                 setting("GC heap hint", "$(round(hint / 2^30; digits = 1)) GiB", "--heap-size-hint")
         end,
-        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
+        env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h without a heartbeat",
+                    "CLAIM_STALE_HOURS"),
+        setting("claim heartbeat", "every $(Dates.value(CLAIM_HEARTBEAT)) min"),
         env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
         env_setting("tiles", isempty(TILE_NAMES) ? "all" : join(TILE_NAMES, ", "), "TILE_NAMES"),
         env_setting("force rebuild of current tiles", FORCE, "FORCE"),
@@ -269,6 +301,8 @@ function main()
     end
     all(>=(0), PRECIPITATION_SCALINGS) || error(
         "a negative precipitation scaling is not a scenario; got " * string(PRECIPITATION_SCALINGS))
+    # The skip test needs the output period; an unknown frequency throws here, not per tile.
+    output_period_bound(OUTPUT_FREQUENCY)
 
     isfile(PARQUET) || error("no glacier elevation-class table at $PARQUET")
     isdir(PARAMETER_DIR) || error("no downscaling parameters at $PARAMETER_DIR; run " *
@@ -303,7 +337,7 @@ function main()
     mkpath(OUTPUT_DIR)
     claim_dir = joinpath(OUTPUT_DIR, CLAIM_SUBDIR)
     mkpath(claim_dir)
-    mp = GEMB.initialize_parameters(output_frequency = OUTPUT_FREQUENCY)
+    mp = physics_model_parameters(output_frequency = OUTPUT_FREQUENCY)
 
     @info "GEMB tile sweep" candidates=length(order) of=length(tiles) block="$TILE_BLOCK/$TILE_BLOCKS" time_range=TIME_RANGE output_frequency=OUTPUT_FREQUENCY perturbations="$(length(DELTA_TEMPERATURES))x$(length(PRECIPITATION_SCALINGS))" threads=Threads.nthreads() output=OUTPUT_DIR
 
@@ -317,7 +351,9 @@ function main()
         claim_tile!(claim_dir, tile.name, path; stale_after = CLAIM_STALE_AFTER) || continue
         t0 = time()
         try
-            push!(rows, run_tile(i, tile, name, path, mp; token, cache))
+            push!(rows, with_claim_heartbeat(claim_dir, tile.name; interval = CLAIM_HEARTBEAT) do
+                run_tile(i, tile, name, path, mp; token, cache)
+            end)
         catch e
             e isa InterruptException && rethrow()
             # A broken caller fails identically for every tile, so it must not be recorded as a
@@ -347,6 +383,7 @@ function main()
     done = summary[in.(summary.status, Ref(("written", "extended"))), :]
     if !isempty(done)
         @info "Closure across written tiles" max_dh_residual=maximum(done.max_dh_residual) worst_tile=done.name[argmax(done.max_dh_residual)]
+        @info "GEMB thermal-solve freezing across written tiles" tiles=count(>(0), done.refreeze_thermal_cell_steps) cell_steps=sum(done.refreeze_thermal_cell_steps) max_fraction=maximum(done.refreeze_thermal_fraction)
         @info "Volume change rate across written tiles (baseline, km3 i.e./yr)" median=round(median(skipmissing(done.dv_rate_baseline)); digits = 4) min=round(minimum(skipmissing(done.dv_rate_baseline)); digits = 4) max=round(maximum(skipmissing(done.dv_rate_baseline)); digits = 4)
     end
     return summary
@@ -377,8 +414,15 @@ function run_tile(i, tile, name, path, mp; token, cache)
     probe_time = probe_run_time(tile, token, cache)
     basis = length(fit.time) == length(probe_time) && collect(fit.time) == probe_time ?
             :fitted : :climatology
-    prior = decoupling_factor_prior(tile.core)
-    applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior)
+    prior = tile_decoupling_factor_prior(tile)
+    band_rule = tile_band_decoupling(tile, intervals)
+    wind_rule = tile_wind_correction(tile, intervals)
+    applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
+                                  band_decoupling = band_rule,
+                                  wind_scaling = PHYSICS_MEMBER.wind_scaling, wind_correction = wind_rule,
+                                  glacier_correction = GLACIER_CORRECTION)
+    black_carbon = tile_background_black_carbon(tile.core)
+    effective = tile_effective_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current
     # against another and the change never takes effect. `run_parameter_differences` only compares keys
     # present in *both* dicts, so a setting omitted here is a setting the skip test cannot notice —
@@ -387,13 +431,20 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    spinup_window = SPINUP_CLIMATOLOGY_WINDOW,
                                    simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                    convergence_drift_fac = SPINUP_DRIFT_FAC,
+                                   drift_window = GEMB_GlacierSims.SPINUP_DRIFT_WINDOW,
                                    donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
                                    climatology_method = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_METHOD,
-                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS)
+                                   climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
+                                   background_black_carbon = black_carbon,
+                                   effective_black_carbon = effective,
+                                   physics_member = PHYSICS_MEMBER)
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :
-                  tile_run_disposition(status, requested, probe_time, intervals, mp)
+                  tile_run_disposition(status, requested, probe_time, intervals;
+                                       delta_temperatures = DELTA_TEMPERATURES,
+                                       precipitation_scalings = PRECIPITATION_SCALINGS,
+                                       output_frequency = mp.output_frequency)
     if disposition === :current
         @info "Tile already covers the request; skipping" tile=i name last_time=status.time
         return summary_row(tile, name, :skipped, time() - t0)
@@ -401,6 +452,18 @@ function run_tile(i, tile, name, path, mp; token, cache)
 
     # An extendable file is only extendable if it actually carries a firn state; one written before the
     # restart group existed has to be rebuilt.
+    # A `:fitted` resolution applies each timestep's own fit, which covers the whole record and cannot
+    # be resolved onto an appended segment alone; such a tile is rebuilt.
+    if disposition === :extendable && basis === :fitted
+        @info "Tile was run on per-timestep fits; rebuilding instead of appending" tile=i name
+        disposition = :rebuild
+    end
+    # Column profiles at past dates cannot come from an appended segment.
+    profiles = tile_column_profiles(name, intervals)
+    if disposition === :extendable && profiles !== nothing
+        @info "Tile records column profiles; rebuilding instead of appending" tile=i name
+        disposition = :rebuild
+    end
     restart = disposition === :extendable ? read_glacier_tile_restart(path) : nothing
     appending = restart !== nothing && restart.time !== nothing
     if disposition === :extendable && !appending
@@ -414,6 +477,15 @@ function run_tile(i, tile, name, path, mp; token, cache)
     fetch_range = appending ?
                   (max(first(TIME_RANGE), restart.time - RESTART_FETCH_OVERLAP), last(TIME_RANGE)) :
                   TIME_RANGE
+    # The band forcing is built on the fetched steps, so the applied parameters must be resolved onto
+    # the same axis. Under `:climatology` this changes no setting the run records.
+    if appending
+        applied = resolve_downscaling(fit, intervals, probe_run_time(tile, token, cache, fetch_range);
+                                      basis, decoupling_factor_prior = prior,
+                                      band_decoupling = band_rule,
+                                      wind_scaling = PHYSICS_MEMBER.wind_scaling, wind_correction = wind_rule,
+                                      glacier_correction = GLACIER_CORRECTION)
+    end
 
     # Area comes from the core cells, donors from the buffered neighbourhood: a masked core cell keeps
     # its ice by borrowing a neighbour's forcing, and the neighbour contributes no area of its own, so
@@ -435,6 +507,10 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                 simulation_years_maximum = SPINUP_SIMULATION_YEARS_MAXIMUM,
                                 convergence_drift_fac = SPINUP_DRIFT_FAC,
                                 donor_max_distance_km = DONOR_MAX_DISTANCE_KM,
+                                background_black_carbon = black_carbon,
+                                effective_black_carbon = effective,
+                                physics_member = PHYSICS_MEMBER,
+                                on_output = profiles,
                                 restart = appending ? restart : nothing)
     catch err
         # The record grew by less than one usable step. Not a failure: the file already says everything
@@ -450,6 +526,12 @@ function run_tile(i, tile, name, path, mp; token, cache)
     else
         write_glacier_tile_netcdf(path, run; institution = "NASA Jet Propulsion Laboratory")
     end
+    # In a subdirectory, so a reader of the directory's tile files never meets one.
+    profiles === nothing ||
+        GEMB_GlacierSims.write_column_profiles_netcdf(
+            joinpath(mkpath(joinpath(OUTPUT_DIR, "column_profiles")), tile.name), profiles;
+            tile_name = name, delta_temperatures = DELTA_TEMPERATURES,
+            precipitation_scalings = PRECIPITATION_SCALINGS)
 
     @info(appending ? "Extended tile" : "Wrote tile", tile=i, name, bands=length(run.bands), simulations=length(run.bands)*length(DELTA_TEMPERATURES)*length(PRECIPITATION_SCALINGS), steps=length(run.time), forcing_s=round(t_forcing; digits = 1), gemb_s=round(t_gemb; digits = 1), basis, substituted_area_km2=round(run.provenance["substituted_area_km2"]; digits = 2), unrecovered_area_km2=round(run.provenance["unrecovered_area_km2"]; digits = 2))
     return summary_row(tile, name, appending ? :extended : :written, time() - t0;
@@ -458,77 +540,18 @@ end
 
 # The authoritative run time axis, from one cell's forcing rather than assumed to be hourly. Also the
 # earliest point a wrong token or a cold cache surfaces, which is worth paying before a tile-wide pass.
-function probe_run_time(tile, token, cache)
+function probe_run_time(tile, token, cache, time_range = TIME_RANGE)
     row = first(tile.core)
     fd = climate_forcing(CLIMATE_MODEL, row.latitude, row.longitude;
-                         time_range = TIME_RANGE, token, cache_path = cache)
+                         time_range, token, cache_path = cache)
     return collect(dims(fd, Ti))
-end
-
-# The longest span one output period can cover. An upper bound is the safe direction for the window test
-# below: understating it would declare a complete file short and re-run it, which is the failure this
-# exists to prevent.
-#
-# `nothing` is reserved for `:all`, where every output step *is* a forcing step and the window end compares
-# exactly. Any coarser frequency must name its period here: a frequency that falls through to `nothing`
-# would be compared exactly against the last forcing step, which a coarser grid never reaches, so every
-# such file would read as short and be re-run or re-appended forever.
-function output_period_bound(mp)
-    f = mp.output_frequency
-    f === :monthly && return Day(31)
-    f === :weekly && return Day(7)
-    f === :daily && return Day(1)
-    f === :all && return nothing
-    # `:last` leaves a single step and is only used inside the spinup, never for a tile run; anything else
-    # is a frequency added to GEMB without a period given here, and silently comparing it exactly is the
-    # bug described above.
-    error("output_period_bound: no period known for output_frequency = :$f; add one before using it " *
-          "for a tile run, or the skip test will treat every file as short")
-end
-
-# What an existing tile file is worth to this request:
-#
-#   `:current`    — it already covers the record; nothing to do.
-#   `:extendable` — the same experiment, but the record has grown since. Resume from its firn state and
-#                   append, rather than repeating a spinup and a whole transient to add a few months.
-#   `:rebuild`    — a different experiment, or nothing usable.
-#
-# Decided from the file's coordinates and attributes only: the point of the check is to avoid the forcing
-# pass, so it must not read one. Splitting `:extendable` out from `:rebuild` is what makes an update
-# cheap; before, both were "not current" and both rebuilt.
-function tile_run_disposition(status, requested, run_time, intervals, mp)
-    status === nothing && return :rebuild
-    status.n_timesteps == 0 && return :rebuild
-    status.time === nothing && return :rebuild
-    # The run grid: a changed band set or perturbation grid means the stored arrays describe something
-    # else entirely, and no seam could join them.
-    status.band_centers == [x.center for x in intervals] || return :rebuild
-    status.delta_temperatures == DELTA_TEMPERATURES || return :rebuild
-    status.precipitation_scalings == PRECIPITATION_SCALINGS || return :rebuild
-    # The settings: a changed model parameter or downscaling policy makes it a different experiment, which
-    # must not be spliced onto an old record.
-    isempty(status.parameters) && return :rebuild
-    isempty(run_parameter_differences(status.parameters, requested)) || return :rebuild
-
-    # Same experiment. Does it already reach the end of the record? The stored time is the last *output*
-    # sample while `run_time` is the last *forcing* step, and a coarser output grid never reaches the
-    # forcing's final step — monthly output for a window ending 2023-01-01T00:00 lands on
-    # 2022-12-31T23:00. Comparing the two directly is what made every file look stale.
-    #
-    # The tolerance means a record extended by less than one output period counts as covered: such an
-    # extension spans no further output interval, so re-running would reproduce the same series.
-    period = output_period_bound(mp)
-    covered = period === nothing ? status.time >= last(run_time) :
-              status.time + period >= last(run_time)
-    return covered ? :current : :extendable
 end
 
 function summary_row(tile, name, status, seconds; run = nothing,
                      t_forcing = missing, t_gemb = missing, basis = missing, error = "")
     i_dt = findfirst(==(0.0), DELTA_TEMPERATURES)
     i_ps = findfirst(==(1.0), PRECIPITATION_SCALINGS)
-    years = run === nothing ? missing :
-            (last(run.time) - first(run.time)).value / (365.25 * 86_400_000)
+    years = run === nothing ? missing : GEMB_GlacierSims.record_years(run)
     return (; name,
             geotile_id = geotile_id(tile.bounds),
             index_lon = tile.index[1], index_lat = tile.index[2],
@@ -545,11 +568,21 @@ function summary_row(tile, name, status, seconds; run = nothing,
                                    run.provenance["substituted_area_km2"],
             unrecovered_area_km2 = run === nothing ? 0.0 :
                                    run.provenance["unrecovered_area_km2"],
+            # Every loss the 1 % rule counts: dropped intervals and unrecovered ice.
+            lost_area_km2 = run === nothing ? missing : run.provenance["lost_area_km2"],
             max_donor_distance_km = run === nothing ? 0.0 :
                                     run.provenance["max_donor_distance_km"],
             n_timesteps = run === nothing ? 0 : length(run.time),
             basis = basis === missing ? "" : string(basis),
             max_dh_residual = run === nothing ? 0.0 : run.provenance["max_dh_residual"],
+            # How often GEMB's thermal solve froze a wet cell's water itself, over this pass's run
+            # (an extended tile's new segment); the tile file's attributes hold the record values.
+            refreeze_thermal_cell_steps = run === nothing ? missing :
+                                          run.provenance["refreeze_thermal_cell_steps"],
+            refreeze_thermal_area_km2 = run === nothing ? missing :
+                                        run.provenance["refreeze_thermal_area_km2"],
+            refreeze_thermal_fraction = run === nothing ? missing :
+                                        run.provenance["refreeze_thermal_fraction"],
             dv_rate_baseline = (run === nothing || i_dt === nothing || i_ps === nothing) ? missing :
                                run.totals[:dv][end, i_dt, i_ps] / years,
             dm_rate_baseline = (run === nothing || i_dt === nothing || i_ps === nothing) ? missing :
@@ -564,4 +597,4 @@ function summary_row(tile, name, status, seconds; run = nothing,
             error)
 end
 
-main()
+exit_on_failures(main(), "tiles")

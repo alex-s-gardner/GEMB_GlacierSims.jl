@@ -112,7 +112,9 @@ rather than a different experiment spliced onto an old record, so they are what
 [`gemb_glacier_cell`](@ref) checks a restart against. Every `ModelParameters` field is included,
 prefixed `model_`, except those in `GEMB.DERIVED_PARAMETERS` — the fields `gemb` computes from
 the forcing and overwrites whatever it is handed, so they say nothing about how a run was
-configured and would compare unequal for reasons the caller never chose.
+configured and would compare unequal for reasons the caller never chose. The package versions
+and source trees ([`software_provenance`](@ref)) are included too, so a run under different code is
+a different experiment.
 
 Deliberately *excluded* is everything that is not a setting: the output time axis, `history`, the
 `institution`/`references` labels, and the `spinup_*`/`climatology_*` provenance — which describes
@@ -137,6 +139,7 @@ function run_parameters(mp::ModelParameters; coverage::Real, lapse_rate,
         params["model_" * string(field)] = getproperty(mp, field)
     end
     bare_ice_albedo === nothing || _record_bare_ice_albedo!(params, bare_ice_albedo)
+    merge!(params, software_provenance())
     return params
 end
 
@@ -320,21 +323,17 @@ end
 """
     cell_decoupling_factor(row; max_distance = 10.0)
 
-Effective on-glacier air temperature decoupling factor `k` for a glacier grid cell, or `nothing`
-when the cell has no published `k`.
+On-glacier air temperature decoupling factor `k` for a glacier grid cell, with the cell's
+glacier-mask fraction, or `nothing` when the cell has no published `k`.
 
 `k` comes from the Shaw et al. (2025) per-glacier table via `GEMB_ClimateForcing.glacier_decoupling`,
 looked up by nearest glacier centroid to the cell center (within `max_distance` km). It corrects an
-*ambient* (off-glacier) temperature to on-glacier conditions, so it only applies to the part of the
-reanalysis cell that is not already glacier: ERA5-Land's `:glm` glacier mask says what fraction of
-the cell its land-surface scheme already treats as ice, and that fraction needs no correction.
-The published `k` is therefore weighted by the non-glacier fraction `1 - glm`,
-
-    k_eff = 1 - (1 - k) * (1 - glm)
-
-which is the full correction where the cell carries no glacier (`glm = 0`) and the identity where
-the cell is entirely glacier (`glm = 1`). A cell with no `:glm` column, or a `missing` value, is
-treated as `glm = 0` — the uncorrected reanalysis assumption, hence the full correction.
+*ambient* (off-glacier) temperature to on-glacier conditions. ERA5-Land's `:glm` glacier mask says
+what fraction of the cell its land-surface scheme already runs as ice, so the cell's warm excess is
+`[1 - glm·(1 - k)]·E_ambient` rather than ambient. [`gemb_glacier_cell`](@ref) therefore brings the
+forcing to the ice-free state with `k` and `glm`, lapses it, and decouples it with `k`
+([`forcing_at_elevation`](@ref)). A `missing` or `NaN` glm is treated as `glm = 0`, the uncorrected
+reanalysis assumption.
 
 Returns `(; decoupling_factor, decoupling_factor_published, glm, rgi_id, distance)`, or `nothing`
 when the table has no glacier within `max_distance` — RGI regions 05 (Greenland periphery) and 19
@@ -363,9 +362,7 @@ function cell_decoupling_factor(row; max_distance::Real = 10.0)
         return nothing
     end
 
-    # Weighted toward the identity as the cell becomes more glaciated; exact at both ends.
-    return (; decoupling_factor = _effective_decoupling_factor(found.k, glm),
-            decoupling_factor_published = found.k, glm,
+    return (; decoupling_factor = Float64(found.k), decoupling_factor_published = found.k, glm,
             rgi_id = found.rgi_id, distance = found.distance)
 end
 
@@ -417,10 +414,14 @@ Base.showerror(io::IO, e::ForcingUnavailable) = print(io, "ForcingUnavailable: "
 """
     SpinupWindowUnavailable(window, n_selected, extent)
 
-Thrown by [`gemb_glacier_cell`](@ref) when the spinup window selects too little of the supplied
-forcing to average a climatological year. `window` is the `(start, stop)` that was asked for,
+Thrown by [`gemb_glacier_cell`](@ref) when the spinup window is not inside the supplied forcing: it
+starts before the forcing or ends after it. `window` is the `(start, stop)` that was asked for,
 `n_selected` how many steps fell inside it, and `extent` the `(first, last)` time of the forcing
 actually supplied.
+
+A window only partly covered is refused too. The climatology keeps only complete years, so it would
+come from fewer years than the window names, while the window recorded as provenance still names
+them.
 
 Its usual cause is a continuation: the window is inherited from the record being extended, but the
 caller fetched only forcing from near the saved time, so those years are absent. Unlike
@@ -435,12 +436,13 @@ struct SpinupWindowUnavailable <: Exception
 end
 
 Base.showerror(io::IO, e::SpinupWindowUnavailable) = print(io,
-    "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) selects " *
-    "$(e.n_selected) forcing step(s) of those supplied ($(e.extent[1]) .. $(e.extent[2])), " *
-    "too few to average a climatological year. On a continuation this window is the one the " *
-    "existing record was spun up on, so reproducing it needs forcing from those years: fetch " *
-    "from $(e.window[1]) rather than from near the saved time, or pass `spinup_window` to spin " *
-    "this run up on a different climatology than the record it extends.")
+    "SpinupWindowUnavailable: the spinup window $(e.window[1]) .. $(e.window[2]) is not inside " *
+    "the forcing supplied ($(e.extent[1]) .. $(e.extent[2])); $(e.n_selected) forcing step(s) fall " *
+    "inside it. The climatology keeps only complete years, so it would come from fewer years than " *
+    "the window names. On a continuation this window is the one the existing record was spun up " *
+    "on, so reproducing it needs forcing from those years: fetch from $(e.window[1]) to " *
+    "$(e.window[2]) rather than from near the saved time, or pass `spinup_window` to spin this run " *
+    "up on a different climatology than the record it extends.")
 
 """
     forcing_is_complete(forcing_data) -> Bool
@@ -492,19 +494,21 @@ or perturbations.
   accepts is rejected here: its length tracks the forcing record, so it cannot be recorded as a
   run parameter a continuation could match (see [`run_parameters`](@ref)).
 - `glacier_decoupling = true`: correct ambient air temperature to on-glacier conditions with the
-  Shaw et al. (2025) factor `k`, weighted by the cell's non-glacier fraction `1 - glm`
-  ([`cell_decoupling_factor`](@ref)). Applied after the elevation adjustment, as that correction
-  requires. A cell with no `k` in the table (RGI regions 05 and 19 are not covered) is run on
-  ambient forcing with no correction at all. Set `false` to skip the lookup entirely; pass a
-  `Real` to prescribe `k` directly, bypassing both the table and the `glm` weighting.
+  Shaw et al. (2025) factor `k` ([`cell_decoupling_factor`](@ref)): the forcing is brought to the
+  ice-free state with `k` and the cell's `glm`, lapsed to the bin, then decoupled with `k`. A cell
+  with no `k` in the table (RGI regions 05 and 19 are not covered) is run on ambient forcing with no
+  correction at all. Set `false` to skip the lookup entirely; pass a `Real` to prescribe `k`
+  directly, bypassing the table.
 - `spinup_window`: `(start, stop)` DateTime range averaged into the repeating climatological
   year used for spinup. When not given, a continuation inherits the window its saved record was
-  spun up on (from the restart's stored provenance) and a cold start takes the first 30 complete
-  years of `forcing_data`. Inheriting matters because a restart does not re-spin up: a bin with no
-  saved profile must be spun up on the same climatology as the rest of the file, not on whatever
-  slice of forcing the continuation happened to fetch. If that window's years are outside the
-  supplied forcing, [`SpinupWindowUnavailable`](@ref) says so rather than substituting a different
-  climate — fetch the wider window, or pass `spinup_window` to choose one deliberately.
+  spun up on (from the restart's stored provenance) and a cold start takes the first 30 whole
+  calendar years of `forcing_data`. Inheriting matters because a restart does not re-spin up: a bin
+  with no saved profile must be spun up on the same climatology as the rest of the file, not on
+  whatever slice of forcing the continuation happened to fetch. The window must be whole calendar
+  years (1 January 00:00 to the last step of a 31 December), since the climatology keeps only
+  complete years. If it is not inside the supplied forcing, [`SpinupWindowUnavailable`](@ref) says so
+  rather than substituting a different climate — fetch the wider window, or pass `spinup_window` to
+  choose one deliberately.
 - `simulation_years_maximum`: ceiling on the spinup as a span of simulated years, passed to
   `gemb_spinup`, which divides by the cycle length to get its own cycle ceiling.
 - `convergence_drift_fac = $(SPINUP_DRIFT_FAC)`, `drift_window = $(SPINUP_DRIFT_WINDOW)`: spinup exits
@@ -561,6 +565,8 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
     # One lookup per cell, not per (bin x delta x scaling): `k` is a property of the glacier, not
     # of the perturbation or the elevation interval. `nothing` here means every run stays ambient.
     decoupling_factor = resolve_decoupling_factor(row, glacier_decoupling)
+    # Only read when there is a `k` to apply: an ambient run needs no glacier fraction.
+    glacier_fraction = decoupling_factor === nothing ? 0.0 : _row_glm(row)
 
     cov = glacier_hypsometry_coverage(row; coverage)
     isempty(cov.modeled) &&
@@ -669,7 +675,7 @@ function gemb_glacier_cell(row, forcing_data, mp::ModelParameters;
         # concurrent tasks.
         at_bin(f) = forcing_at_elevation(
             precipitation_adjust(temperature_adjust(f, delta), pscale),
-            bin.center - forcing_elevation; lapse_rate, decoupling_factor)
+            bin.center - forcing_elevation; lapse_rate, decoupling_factor, glacier_fraction)
 
         cf = at_bin(forcing_data)
 
@@ -783,9 +789,9 @@ end
 
 Resolve the `glacier_decoupling` keyword of [`gemb_glacier_cell`](@ref) to the `k` handed to every
 run of this cell, or `nothing` for ambient forcing. `false` skips the lookup; a `Real` is taken as
-`k` verbatim (no `glm` weighting — the caller has prescribed the effective factor); `true` looks
-`k` up and weights it by the cell's non-glacier fraction ([`cell_decoupling_factor`](@ref)). A cell
-absent from the table gets no correction at all, which is why this is not an error.
+`k` verbatim; `true` looks the published `k` up ([`cell_decoupling_factor`](@ref)). Either way the
+cell's `glm` is applied separately, when the forcing is brought to the ice-free state. A cell absent
+from the table gets no correction at all, which is why this is not an error.
 
 Public because it is idempotent — passing its result back as `glacier_decoupling` resolves to
 itself — so a driver can resolve `k` once per cell, build [`run_parameters`](@ref) from it to check
@@ -804,17 +810,38 @@ function _lookup_decoupling_factor(row)
         @info "No Shaw et al. (2025) decoupling factor for this cell; running on ambient forcing"
         return nothing
     end
-    @info "Applying glacier decoupling weighted by the non-glacier fraction" k=found.decoupling_factor k_published=found.decoupling_factor_published glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
-    # An entirely glaciated cell weights k to exactly 1.0, which is the identity — skip the
-    # adjustment rather than paying for a no-op pass over the whole forcing record.
+    @info "Applying glacier decoupling" k=found.decoupling_factor glm=found.glm rgi_id=found.rgi_id match_distance_km=round(found.distance, digits=2)
+    # `k = 1` is the identity at every step of the adjustment, so skip it rather than paying for a
+    # no-op pass over the whole forcing record.
     return found.decoupling_factor >= 1 ? nothing : found.decoupling_factor
 end
 
-# The first 30 complete years of a record. Used only when nothing more authoritative is available:
-# no explicit `spinup_window` and no window inherited from a restart.
+# The first 30 whole calendar years of a record (fewer when it holds fewer), from 1 January 00:00 to the
+# last step of a 31 December. Used only when nothing more authoritative is available: no explicit
+# `spinup_window` and no window inherited from a restart. Whole years because the climatology keeps only
+# complete years, so the window names exactly the years it is built from: an ERA5-Land record, which
+# starts 1950-01-02T00:00, gives 1951-01-01T00:00 .. 1980-12-31T23:00.
 function _default_spinup_window(forcing_data)
-    start = DateTime(year(first(lookup(forcing_data, Ti))), 1, 1)
-    return (start, DateTime(year(start) + 29, 12, 31))
+    times = lookup(forcing_data, Ti)
+    step = _forcing_step(times)
+    whole = _whole_year_window(first(times), last(times), step)
+    whole === nothing && throw(ArgumentError(
+        "the forcing $(first(times)) .. $(last(times)) holds no whole calendar year, so no spinup " *
+        "climatology window can be drawn from it; pass `spinup_window`, or supply forcing covering " *
+        "at least one year from 1 January"))
+    return (whole[1], min(whole[2], DateTime(year(whole[1]) + 30) - step))
+end
+
+# The time step of a forcing axis, which must be uniform: the whole-year checks find a year's last step
+# as one step before the next 1 January.
+function _forcing_step(times)
+    length(times) >= 2 || throw(ArgumentError(
+        "a forcing of $(length(times)) time step(s) has no time step to build a climatology on"))
+    step = times[begin + 1] - times[begin]
+    all(==(step), diff(times)) || throw(ArgumentError(
+        "the forcing's time steps are not uniform ($(first(times)) .. $(last(times))), so its " *
+        "calendar years cannot be told whole"))
+    return step
 end
 
 # The window the record being continued was spun up on. Taken from the restart's file-level
@@ -838,33 +865,33 @@ _parse_datetime(::Nothing) = nothing
 _parse_datetime(s::AbstractString) = tryparse(DateTime, s)
 _parse_datetime(_) = nothing
 
-# The climatological year a fallback spinup runs on, with the one failure the window can have made
-# explicit: a window containing no complete year of this record.
+# The climatological cycle a fallback spinup runs on, with the failures the window can have made explicit.
 #
-# `forcing_climatology` averages whatever the window selects, and over an empty or partial selection
-# that is a `BoundsError` or a one-timestep "year" from deep inside GEMB — either way, unattributable
-# to the window that caused it. It happens for one reason worth naming: a continuation inherited the
-# window the record was spun up on (which is correct, and the point of inheriting it), but the caller
-# fetched only forcing near the saved time, so the years that window names were never downloaded.
-# `SpinupWindowUnavailable` names the window and the remedy, because the alternative — silently
-# spinning this bin up on a different climate than every other bin in the file — is the bug being
-# avoided here.
+# `forcing_climatology` keeps only the complete years of whatever the window selects, and quietly clamps
+# `n_years` to the years it finds, so a window that is not whole calendar years, is not inside the
+# forcing, or holds too few years would yield a climatology from other years than the window names, or a
+# shorter block, with nothing to say so. The window is therefore required to be whole calendar years on
+# the forcing's grid (an `ArgumentError`, a mistake in the window itself), inside the supplied forcing
+# (`SpinupWindowUnavailable`, whose usual cause is a continuation that inherited the window the record
+# was spun up on but fetched only forcing near the saved time), and long enough for the block (an
+# `ArgumentError`).
 function _spinup_climatology(cf, window, mp::ModelParameters;
                              method = SPINUP_CLIMATOLOGY_METHOD,
                              n_years = SPINUP_CLIMATOLOGY_N_YEARS)
     times = lookup(cf, Ti)
-    selected = filter(t -> window[1] <= t <= window[2], times)
-
-    # A span, not a step count: `forcing_climatology` calls whichever years hold the most timesteps
-    # "complete", so a selection covering one partial year passes any count test and yields a
-    # climatological "year" of however few steps that partial happened to hold. Spanning the block
-    # length is what actually distinguishes a climatology from a fragment of one — and `n_years` is
-    # silently clamped to the complete years available, so a short window would quietly reduce the
-    # block rather than fail.
-    needed = Day(365) * (method === :representative ? n_years : 1)
-    spans_the_block = !isempty(selected) && last(selected) - first(selected) >= needed
-    spans_the_block ||
-        throw(SpinupWindowUnavailable(window, length(selected), (first(times), last(times))))
+    step = _forcing_step(times)
+    _is_whole_year_window(window, step) || throw(ArgumentError(
+        "the spinup window $(window[1]) .. $(window[2]) is not whole calendar years on this forcing's " *
+        "$(Dates.canonicalize(step)) grid: it must start on 1 January, 00:00 and end at the last step of a 31 December " *
+        "(such as $(DateTime(year(window[2]) + 1) - step)). The climatology keeps only complete years, " *
+        "so any other window would be trimmed to them without notice."))
+    first(times) <= window[1] && window[2] <= last(times) ||
+        throw(SpinupWindowUnavailable(window, count(t -> window[1] <= t <= window[2], times),
+                                      (first(times), last(times))))
+    needed = method === :representative ? n_years : 1
+    _whole_years(window) >= needed || throw(ArgumentError(
+        "the spinup window $(window[1]) .. $(window[2]) holds $(_whole_years(window)) whole calendar " *
+        "year(s); the $(repr(method)) climatology needs $needed"))
 
     method === :representative || return forcing_climatology(cf, window; method)
     return forcing_climatology(cf, window; method, model_parameters = mp, n_years)
@@ -971,10 +998,14 @@ Where a file's stored run parameters disagree with a requested run's, as
 `parameters` field of [`read_glacier_cell_restart`](@ref)) returned; `requested` is a
 [`run_parameters`](@ref) dict.
 
-Only keys present in both are compared: a file written by an older version of `run_parameters`
-simply carries fewer of them, and that is a reason to note the gap rather than to refuse an append.
+A key present on one side only is a difference too, reported with `nothing` for the side that lacks
+it: a setting one run recorded and the other did not — a package version, a newly recorded model
+parameter — cannot be shown to agree, so the two are not known to be the same experiment.
 Values are compared in the NetCDF-encoded form the file stores, since attributes hold no `Symbol`
-or `Bool`.
+or `Bool`. A one-element vector and its element compare equal, because NetCDF reads a one-element
+attribute back as a scalar — a per-band setting of a one-band tile would otherwise never match itself.
+Values compare with `isequal`, so a parameter recorded as `NaN` (a setting the run does not read)
+matches itself.
 
 This is what [`gemb_glacier_cell`](@ref) checks a restart against, exposed so a driver can make the
 same comparison up front — before paying for a forcing download — and get the same verdict.
@@ -983,10 +1014,20 @@ function run_parameter_differences(saved, requested)
     differences = Dict{String,Tuple{Any,Any}}()
     for (key, value) in requested
         haskey(saved, key) || continue
-        _encode_attribute(saved[key]) == _encode_attribute(value) && continue
+        isequal(_attribute_value(saved[key]), _attribute_value(value)) && continue
         differences[key] = (saved[key], value)
     end
+    for key in keys(requested)
+        haskey(saved, key) || (differences[key] = (nothing, requested[key]))
+    end
+    for key in keys(saved)
+        haskey(requested, key) || (differences[key] = (saved[key], nothing))
+    end
     return differences
+end
+
+_attribute_value(x) = let v = _encode_attribute(x)
+    v isa AbstractVector && length(v) == 1 ? only(v) : v
 end
 
 # Compare the stored run parameters against this run's, and refuse the append on a disagreement
@@ -1000,11 +1041,6 @@ function _validate_restart_parameters(restart, parameters; force_restart::Bool, 
     end
 
     differences = run_parameter_differences(saved, parameters)
-
-    missing_keys = setdiff(keys(parameters), keys(saved))
-    isempty(missing_keys) ||
-        @warn "The existing $what file does not store every run parameter; these could not be verified" unverified=sort!(collect(missing_keys))
-
     isempty(differences) && return nothing
 
     if force_restart

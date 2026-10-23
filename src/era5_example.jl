@@ -82,9 +82,6 @@ begin
     using Logging
     import NCDatasets              # to read the per-cell output files back for plotting
 
-    # Set after the imports above: `DateTime` comes from Dates.
-    forcing_time_range = (DateTime(1950, 1, 1), DateTime(2026, 8, 1))
-
     gemb_elevation_classes_file = joinpath(@__DIR__, "..", "data", "$(climate_model)_glacier_elevation_classes.parquet")
     #output_dir = joinpath(@__DIR__, "..", "data", "gemb_runs", string(climate_model))
     output_dir = joinpath("/Users/gardnera/data/gemb/gemb_runs/run_001", string(climate_model))
@@ -92,6 +89,10 @@ begin
     # so they live off `tempdir()` and survive a reboot. Override with `ENV["CLIMATE_CACHE"]`.
     climate_cache = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", string(climate_model)))
     forcing_cache = joinpath(climate_cache, "cache")
+    # From the cached record's first step (ERA5-Land starts 1950-01-02T00:00), read as the run scripts
+    # read it, to 2026-08-01.
+    forcing_time_range = run_time_range(["record-start", "2026-08-01T00:00:00"],
+                                        era5_land_record_span(forcing_cache)).time_range
 
     #disable_logging(Logging.Info)
 

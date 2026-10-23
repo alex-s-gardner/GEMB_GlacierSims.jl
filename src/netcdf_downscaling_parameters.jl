@@ -21,7 +21,7 @@
 # roster (the same convention `_write_run_parameters!` uses for a cell run) so the status reader
 # names them from the file rather than recomputing a key set that a future version might extend.
 const _TILE_PARAMETER_KEYS = ("climate_model", "tile_size", "tile_buffer", "min_cells",
-                              "area_minimum", "elevation_interval_forcing",
+                              "area_minimum", "elevation_interval_forcing", "glacier_fraction_form",
                               "downscaling_schema_version")
 
 # What the file *contains*, as distinct from the settings it was derived under. Bumped whenever the set
@@ -122,6 +122,8 @@ function write_downscaling_tile_netcdf(path::AbstractString, tile, p;
                              min_cells, area_minimum,
                              n_intervals = elevation_intervals === nothing ? nothing :
                                            length(elevation_intervals),
+                             glacier_fraction_form = hasproperty(p, :glacier_fraction_form) ?
+                                                     p.glacier_fraction_form : :fraction,
                              institution, references)
     end
     return path
@@ -154,6 +156,7 @@ function write_sparse_downscaling_tile_netcdf(path::AbstractString, tile;
                                              area_minimum::Real = 0.0,
                                              reason::AbstractString,
                                              elevation_interval_forcing::Bool = false,
+                                             glacier_fraction_form::Symbol = :fraction,
                                              institution = nothing,
                                              references = nothing)
     mkpath(dirname(path))
@@ -167,7 +170,8 @@ function write_sparse_downscaling_tile_netcdf(path::AbstractString, tile;
         _write_tile_globals!(ds, tile, nothing; climate_model, time_range, tile_size, buffer,
                              min_cells, area_minimum, n_intervals = nothing,
                              sparse_reason = reason,
-                             elevation_interval_forcing, institution, references)
+                             elevation_interval_forcing, glacier_fraction_form, institution,
+                             references)
     end
     return path
 end
@@ -268,7 +272,7 @@ function _write_lapse_rate!(ds, p, precision, deflatelevel)
 
     # The joint screen, as a variable rather than a comment.
     #
-    # `derive_lapse_rate` consumes `k` to bring the cells to a common on-glacier state, so a `k`
+    # `derive_lapse_rate` consumes the decoupling fit to bring the cells to the ice-free state, so a `k`
     # outside (0, 1] corrupts that timestep's *slope* as well — and the corruption is a smooth false
     # gradient rather than scatter, so it is invisible in the slope series alone and no robust
     # estimator removes it. A reader who screens the two series separately therefore gets a
@@ -357,17 +361,21 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
 
     for (name, values, units, long_name, standard_name) in (
         ("interval_center", [Float64(iv.center) for iv in intervals], "m",
-         "elevation interval center", "height_above_reference_ellipsoid"),
+         "elevation interval center", ELEVATION_STANDARD_NAME),
         ("interval_lower", [Float64(iv.lo) for iv in intervals], "m",
-         "elevation interval lower edge", "height_above_reference_ellipsoid"),
+         "elevation interval lower edge", ELEVATION_STANDARD_NAME),
         ("interval_upper", [Float64(iv.hi) for iv in intervals], "m",
-         "elevation interval upper edge", "height_above_reference_ellipsoid"),
+         "elevation interval upper edge", ELEVATION_STANDARD_NAME),
         ("interval_area", [Float64(iv.area) for iv in intervals], "km2",
          "glacier area in the elevation interval", ""))
         v = NCDatasets.defVar(ds, name, Float64, ("elevation_interval",))
         v.attrib["units"] = units
         v.attrib["long_name"] = long_name
-        isempty(standard_name) || (v.attrib["standard_name"] = standard_name)
+        if standard_name == ELEVATION_STANDARD_NAME
+            _set_elevation_datum!(v)
+        elseif !isempty(standard_name)
+            v.attrib["standard_name"] = standard_name
+        end
         v[:] = values
     end
     ds["interval_area"].attrib["comment"] =
@@ -475,9 +483,9 @@ function _write_elevation_intervals!(ds, intervals, precision, deflatelevel)
         end
     end
     ds["temperature_air"].attrib["comment"] =
-        "Glacier-area weighted mean over the cells holding ice in this interval, each lapsed to " *
-        "the interval center and then decoupled — in that order, which is the order " *
-        "climate_adjust_for_glacier requires."
+        "Glacier-area weighted mean over the cells holding ice in this interval, each brought to " *
+        "the ice-free state with k at its own elevation, lapsed to the interval center with the " *
+        "ambient lapse rate, and then decoupled with k at the interval center."
     return nothing
 end
 
@@ -588,6 +596,7 @@ end
 function _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size, buffer,
                               min_cells, area_minimum, n_intervals,
                               sparse_reason = "", elevation_interval_forcing = nothing,
+                              glacier_fraction_form::Symbol = :fraction,
                               institution = nothing, references = nothing)
     for (k, v) in GEMB_CF_GLOBAL_ATTRIBUTES
         ds.attrib[k] = v
@@ -636,6 +645,9 @@ function _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size,
     has_intervals = elevation_interval_forcing === nothing ? n_intervals !== nothing :
                     elevation_interval_forcing
     ds.attrib["elevation_interval_forcing"] = _encode_attribute(has_intervals)
+    # How each cell's `glm` entered the decoupling and lapse-rate fits; a run applies the same form
+    # to the donor conversion (`decoupling_glacier_fraction`).
+    ds.attrib["glacier_fraction_form"] = string(glacier_fraction_form)
     ds.attrib["downscaling_schema_version"] = _TILE_SCHEMA_VERSION
     ds.attrib["downscaling_parameters"] = join(_TILE_PARAMETER_KEYS, " ")
     ds.attrib["downscaling_parameters_comment"] =
@@ -841,6 +853,9 @@ function read_downscaling_tile(path::AbstractString)
          # the fits and the albedo profile are otherwise anonymous once resolved, and a consumer
          # holding only the run cannot say which derivation produced them.
          source_path = abspath(path),
+         # The form the fits were derived under; a tile derived before it was recorded used the
+         # glacier fraction itself.
+         glacier_fraction_form = Symbol(get(dmeta, "glacier_fraction_form", "fraction")),
          attributes = dmeta)
     end
 end

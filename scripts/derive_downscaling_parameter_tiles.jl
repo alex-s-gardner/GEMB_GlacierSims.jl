@@ -12,7 +12,12 @@
 # Needs CDS credentials (`~/.cdsapirc` or `ENV["CDS_API_KEY"]`) and network. Forcing is cached as Zarr
 # chunks under `CLIMATE_CACHE` and shared between tiles, which is why tiles are visited in chunk order.
 #
-# Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start_year] [end_year]
+# Run:  julia --project=. scripts/derive_downscaling_parameter_tiles.jl [start] [end]
+#
+# `start` and `end` are read as the tile sweep reads them (`gemb_tile_sweep.jl`): a year, an ISO
+# date-time, or `record-start` / `record-end`, defaulting to the first and last steps of the cached
+# ERA5-Land record, so a derivation with no arguments fits the window the sweep runs. The process
+# exits with status 1 when any tile failed.
 #
 # Sizing, measured on the 47,121-cell global table at the 2°/1° default: 819 non-empty tiles,
 # ~170,000 cell forcing loads, ~60 MB per tile of fits before compression at the full 1950-2026
@@ -49,8 +54,17 @@ const AREA_MINIMUM = 0.0
 # Derive each tile's observed bare-ice albedo profile from MODIS and store it in the tile file, so every
 # elevation class runs at a measured `albedo_ice`? Off, every band falls back to the tuned constant
 # `albedo_ice` — a tile file written that way carries no profile, and nothing downstream can recover one.
-# Needs the Copernicus DEM and so network, but no CDS token.
+# Needs the Copernicus DEM, but no CDS token.
 const DERIVE_ALBEDO = get(ENV, "DERIVE_ALBEDO", "1") == "1"
+
+# Where the albedo reads the Copernicus DEM: `COPERNICUS_DEM_ARCHIVE` names a local mirror of the
+# copernicus-dem-30m bucket (`tileList.txt` and `<id>/<id>.tif`; `copernicus_dem_archive`), read with
+# no network. Unset, the DEM is fetched from the bucket and its tiles cached under GEMB_CACHE_PATH.
+const DEM_ARCHIVE = let root = get(ENV, "COPERNICUS_DEM_ARCHIVE", nothing)
+    root === nothing || isfile(joinpath(root, "tileList.txt")) ||
+        error("COPERNICUS_DEM_ARCHIVE=$root holds no tileList.txt; it must be a mirror of the copernicus-dem-30m bucket")
+    root
+end
 
 # Also store each tile's glacier-area weighted per-elevation-interval forcing? This is the expensive
 # half — most of the output volume, plus at least one extra pass over every cell's forcing — and the
@@ -58,21 +72,30 @@ const DERIVE_ALBEDO = get(ENV, "DERIVE_ALBEDO", "1") == "1"
 # bias-correction sweep needs to read the forcing rather than re-derive it.
 const RETAIN_ELEVATION_INTERVAL_FORCING = false
 
-# Default window: two full years, enough for a seasonal cycle with a second year to show it repeats.
-# Widen to the full record (1950, 2027) once a global pass at this window looks right — a wider window
-# re-derives every tile, since a pooled cross-cell regression cannot be appended to.
-const START_YEAR = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 2018
-const END_YEAR = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2020
-const TIME_RANGE = (DateTime(START_YEAR, 1, 1), DateTime(END_YEAR, 1, 1))
-
-
 const GI = GeoDataFrames.GeoInterface
+
+# How each cell's glacier-mask fraction `glm` enters the decoupling fit (`GLACIER_FRACTION_FORMS`):
+# `:indicator` (glm ≥ 0.5) in High Mountain Asia (RGI 7.0 regions 13-15), `:fraction` elsewhere. In
+# HMA glaciated cells sit almost only above the ice-free ones, so the fraction form leaves `glm` and
+# elevation nearly collinear and its k falls to or below zero on more than half the fitted hours;
+# ERA5-Land treats a cell more than half ice as wholly snow-covered, which is what the indicator
+# represents. Chosen from the tile's largest region by glacier area.
+const INDICATOR_REGIONS = ("13", "14", "15")
+tile_glacier_fraction_form(tile) =
+    nrow(tile.core) > 0 && tile_rgi_o1_region(tile.core) in INDICATOR_REGIONS ? :indicator : :fraction
 
 # Where the forcing cache and the tile outputs live. Kept outside the repo and off `tempdir()`: the
 # ERA5-Land chunks are tens of GB and expensive to re-fetch, so they must survive a reboot. Override
 # with `ENV["CLIMATE_CACHE"]` on a machine without this mount.
 const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE",
                           joinpath(BASE_CLIMATE_DIR, string(CLIMATE_MODEL)))
+
+# The fit window. The full record by default, which is the window the tile sweep runs: a different
+# window resolves the parameters on the climatology path there, and a wider window re-derives every
+# tile, since a pooled cross-cell regression cannot be appended to. Pass a shorter window, such as
+# 2018 2020, for a timing probe.
+const RUN_TIME = run_time_range(ARGS, era5_land_record_span(joinpath(CLIMATE_CACHE, "cache")))
+const TIME_RANGE = RUN_TIME.time_range
 
 const PARQUET = joinpath(@__DIR__, "..", "data", "$(CLIMATE_MODEL)_glacier_elevation_classes.parquet")
 # Overridable so a timing probe can share the forcing cache without writing files the production sweep
@@ -118,12 +141,14 @@ const TILE_NAMES = haskey(ENV, "TILE_NAMES") ? Set(split(ENV["TILE_NAMES"], ",")
 # going to do.
 function settings_rows()
     return [
-        setting("time range", TIME_RANGE, length(ARGS) >= 1 ? "ARGS" : "default"),
+        setting("time range", TIME_RANGE, RUN_TIME.source),
         setting("tile size / buffer", "$(TILE_SIZE)° / $(BUFFER)°"),
         setting("minimum cells to fit", MIN_CELLS),
         setting("minimum cell glacier area", "$(AREA_MINIMUM) km²"),
         env_setting("observed bare-ice albedo", DERIVE_ALBEDO, "DERIVE_ALBEDO"),
         setting("elevation-interval forcing", RETAIN_ELEVATION_INTERVAL_FORCING),
+        setting("glacier fraction in the decoupling fit",
+                "indicator (glm ≥ $(GLACIER_INDICATOR_THRESHOLD)) in RGI $(join(INDICATOR_REGIONS, ", ")); fraction elsewhere"),
         env_setting("worker blocks", TILE_BLOCKS, "TILE_BLOCKS"),
         env_setting("claim stale after", "$(Dates.value(CLAIM_STALE_AFTER)) h", "CLAIM_STALE_HOURS"),
         env_setting("tile limit", TILE_LIMIT == typemax(Int) ? "all" : TILE_LIMIT, "TILE_LIMIT"),
@@ -131,8 +156,11 @@ function settings_rows()
                     "TILE_NAMES"),
         env_setting("forcing cache budget", "$(CACHE_BUDGET_GIB) GiB", "FORCING_CACHE_GIB"),
         env_setting("climate cache", CLIMATE_CACHE, "CLIMATE_CACHE"),
-        env_setting("DEM tile cache", get(ENV, "GEMB_CACHE_PATH",
-                                          "GEMB_ClimateForcing data/ (package default)"),
+        env_setting("Copernicus DEM", DEM_ARCHIVE === nothing ? "network (copernicus-dem-30m bucket)" :
+                                      "local archive $(DEM_ARCHIVE)", "COPERNICUS_DEM_ARCHIVE"),
+        env_setting("DEM tile cache", DEM_ARCHIVE === nothing ?
+                                      get(ENV, "GEMB_CACHE_PATH", "GEMB_ClimateForcing data/ (package default)") :
+                                      "unused (local archive)",
                     "GEMB_CACHE_PATH"),
         env_setting("output", OUTPUT_DIR, "OUTPUT_DIR"),
     ]
@@ -193,8 +221,10 @@ function main()
                                                 min_cells = MIN_CELLS,
                                                 area_minimum = AREA_MINIMUM,
                                                 derive_albedo = DERIVE_ALBEDO,
+                                                dem_archive = DEM_ARCHIVE,
                                                 retain_elevation_interval_forcing =
                                                     RETAIN_ELEVATION_INTERVAL_FORCING,
+                                                glacier_fraction_form = tile_glacier_fraction_form,
                                                 institution = "NASA Jet Propulsion Laboratory",
                                                 tile_limit = TILE_LIMIT,
                                                 tile_gate = (TILE_BLOCKS == 1 && isempty(TILE_NAMES)) ?
@@ -219,4 +249,4 @@ function main()
     return summary
 end
 
-main()
+exit_on_failures(main(), "tiles")

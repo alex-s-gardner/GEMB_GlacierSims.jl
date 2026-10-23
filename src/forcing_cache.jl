@@ -10,8 +10,8 @@ factor of 3.62**.
 The existing Zarr chunk cache does not remove that cost. It keeps the compressed *bytes* on local disk,
 so the repeat is not a network fetch — but each load still decompresses them, extracts 17,521 timesteps
 across four variable groups, derives vapour pressure and wind speed, and validates units. At ~200 ms per
-cell that is the entire cost of the sweep once `_accumulate_cell!` is a function barrier: forcing I/O is
-99.8% of a tile's time.
+cell that is the entire cost of the sweep once the cross-cell accumulation is a function barrier:
+forcing I/O is 99.8% of a tile's time.
 
 This sits at the `forcing_loader` seam the derivation already exposes, so nothing about the derivation
 changes — it is handed a loader that sometimes answers from memory.

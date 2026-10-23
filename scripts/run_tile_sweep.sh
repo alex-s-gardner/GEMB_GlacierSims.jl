@@ -3,7 +3,11 @@
 # Run the whole (temperature offset x precipitation scaling) sweep over every glacierized 2 degree
 # tile, as TILE_BLOCKS concurrent single-threaded processes.
 #
-#   scripts/run_tile_sweep.sh [start_year] [end_year]
+#   scripts/run_tile_sweep.sh [start] [end]
+#
+# `start` and `end` are each a year, an ISO date-time, or `record-start` / `record-end`; without them the
+# sweep runs from the first to the last step of the cached ERA5-Land record (see gemb_tile_sweep.jl). Exits non-zero when any worker exits non-zero,
+# which a worker does when any tile it claimed failed, and reports how many tiles failed.
 #
 # One thread per process, one process per physical core. A GEMB spinup cycle allocates about 100 MiB and
 # Julia's collector is per-process and stops every thread, so threads inside one process contend for the
@@ -11,11 +15,12 @@
 # The measured curve is in the TILE_BLOCKS comment in gemb_tile_sweep.jl. A worker holds about 5 GB and
 # the heaviest tiles peak near 8 GB, so at 120 blocks the set occupies roughly 600 GB: wide enough that
 # memory, not collector contention, is what bounds the block count on a 1 TB machine. HEAP_SIZE_HINT
-# bounds it if that becomes tight.
+# bounds it if that becomes tight. Each worker keeps a small `sh` process beside it that refreshes the
+# heartbeat of its tile claim, so a tile that runs for days is not reclaimed by another worker.
 #
 # Each process drains its own contiguous, weight-balanced block of the chunk-ordered tile list first —
 # which is what keeps the forcing cache warm across neighbours — and then steals the heaviest tile still
-# unclaimed. Tiles are claimed by an atomic mkdir under tile_runs/claims, so nothing coordinates beyond the
+# unclaimed. Tiles are claimed by an atomic mkdir under $OUTPUT_DIR/claims, so nothing coordinates beyond the
 # filesystem, and a worker that finishes early takes work instead of idling. That matters more than it used
 # to: with forcing fetched on demand a tile's wall time is partly a CDS download, so band count alone no
 # longer predicts cost.
@@ -32,26 +37,41 @@
 # the package, so a syntax error or a missing dependency surfaces once here rather than 96 times in the
 # logs.
 #
-# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, JULIA, FORCING_CACHE_GIB, TILE_NAMES, FORCE,
+# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, PHYSICS_MEMBER (default B-kfit-table, as in
+# run_settings.jl), OUTPUT_DIR (default $CLIMATE_CACHE/tile_runs_v2/$PHYSICS_MEMBER), EFFECTIVE_LOADING_TABLE,
+# JULIA, FORCING_CACHE_GIB, TILE_NAMES, FORCE,
 # CLAIM_STALE_HOURS, SPINUP_SIMULATION_YEARS_MAXIMUM, HEAP_SIZE_HINT.
 
 set -uo pipefail
 
-START_YEAR="${1:-1950}"
-END_YEAR="${2:-2027}"
+# The run's ends, passed through to every worker; the workers read the cached record and resolve
+# `record-start` and an absent end from it.
+run_args=("${1:-record-start}")
+[ -n "${2:-}" ] && run_args+=("$2")
 # One process per core, less headroom. 96 of 128 leaves room for other work on the machine and for the
 # page cache the Zarr reads live in; raise it when the machine is otherwise idle.
 BLOCKS="${TILE_BLOCKS:-96}"
 JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIMATE_CACHE="${CLIMATE_CACHE:-/mnt/bylot-r3/data/era5land}"
-LOG_DIR="$CLIMATE_CACHE/tile_runs/logs"
+# The sweep's own default (`tile_run_dir` in run_settings.jl: `TILE_RUN_DIR` and the physics member),
+# which the native run takes as its reference. Exported so the workers run as this member and write
+# where the logs and claims below are kept.
+PHYSICS_MEMBER="${PHYSICS_MEMBER:-B-kfit-table}"
+export PHYSICS_MEMBER
+OUTPUT_DIR="${OUTPUT_DIR:-$CLIMATE_CACHE/tile_runs_v2/$PHYSICS_MEMBER}"
+export OUTPUT_DIR
+LOG_DIR="$OUTPUT_DIR/logs"
 
 [ -x "$JULIA" ] || { echo "no julia at $JULIA; set JULIA=/path/to/julia" >&2; exit 1; }
 [ -f "$REPO/data/era5land_glacier_elevation_classes.parquet" ] ||
     { echo "no elevation-class table under $REPO/data" >&2; exit 1; }
 [ -d "$CLIMATE_CACHE/downscaling_parameters" ] ||
     { echo "no downscaling parameters under $CLIMATE_CACHE; run derive_downscaling_parameter_tiles.jl first" >&2; exit 1; }
+
+# Put the invariant geopotential file in place before the workers start, or they race to download it.
+. "$REPO/scripts/restore_invariant.sh"
+restore_invariant "$JULIA" "$REPO" "$CLIMATE_CACHE" || { echo "nothing launched" >&2; exit 1; }
 
 # Julia sizes its GC heap target from total physical memory, so each of TILE_BLOCKS workers defers
 # collection as though it owned the machine alone and the collective high-water mark ratchets up over a
@@ -61,8 +81,8 @@ LOG_DIR="$CLIMATE_CACHE/tile_runs/logs"
 heap_args=()
 [ -n "${HEAP_SIZE_HINT:-}" ] && heap_args=(--heap-size-hint="$HEAP_SIZE_HINT")
 
-TILE_BLOCKS="$BLOCKS" SHOW_SETTINGS=1 "$JULIA" --project="$REPO" --startup-file=no -t 1 "${heap_args[@]}" \
-    "$REPO/scripts/gemb_tile_sweep.jl" "$START_YEAR" "$END_YEAR" ||
+TILE_BLOCKS="$BLOCKS" SHOW_SETTINGS=1 "$JULIA" --project="$REPO" --startup-file=no -t 1 ${heap_args[@]+"${heap_args[@]}"} \
+    "$REPO/scripts/gemb_tile_sweep.jl" "${run_args[@]}" ||
     { echo "settings pass failed; nothing launched" >&2; exit 1; }
 
 mkdir -p "$LOG_DIR"
@@ -81,15 +101,15 @@ if pgrep -f "$REPO/scripts/gemb_tile_sweep.jl" > /dev/null; then
     pgrep -fa "$REPO/scripts/gemb_tile_sweep.jl" | head -3 >&2
     exit 1
 fi
-rm -rf "$CLIMATE_CACHE/tile_runs/claims"
-echo "sweep $START_YEAR-$END_YEAR over $BLOCKS blocks; logs in $LOG_DIR"
+rm -rf "$OUTPUT_DIR/claims"
+echo "sweep ${run_args[*]} over $BLOCKS blocks; logs in $LOG_DIR"
 
 pids=()
 for i in $(seq 1 "$BLOCKS"); do
     log="$LOG_DIR/block_$(printf '%03d' "$i")of$BLOCKS.log"
     TILE_BLOCKS="$BLOCKS" TILE_BLOCK="$i" FORCING_CACHE_GIB="${FORCING_CACHE_GIB:-1}" \
-        "$JULIA" --project="$REPO" --startup-file=no -t 1 "${heap_args[@]}" \
-        "$REPO/scripts/gemb_tile_sweep.jl" "$START_YEAR" "$END_YEAR" > "$log" 2>&1 &
+        "$JULIA" --project="$REPO" --startup-file=no -t 1 ${heap_args[@]+"${heap_args[@]}"} \
+        "$REPO/scripts/gemb_tile_sweep.jl" "${run_args[@]}" > "$log" 2>&1 &
     pids+=($!)
 done
 
@@ -107,7 +127,11 @@ echo "blocks finished: $(( ${#pids[@]} - failed )) ok, $failed non-zero exit"
 printf 'tiles written  : %s\n' "$(grep -ah 'Wrote tile' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles extended : %s\n' "$(grep -ah 'Extended tile' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
 printf 'tiles skipped  : %s\n' "$(grep -ah 'already covers the request' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
-printf 'tiles failed   : %s\n' "$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l)"
-echo "summaries      : $CLIMATE_CACHE/tile_runs/tile_runs_summary_block*of$BLOCKS.parquet"
+tiles_failed=$(grep -ah 'Tile failed' "$LOG_DIR"/block_*of"$BLOCKS".log | wc -l | tr -d ' ')
+printf 'tiles failed   : %s\n' "$tiles_failed"
+echo "summaries      : $OUTPUT_DIR/tile_runs_summary_block*of$BLOCKS.parquet"
 
-[ "$failed" -eq 0 ] || exit 1
+if [ "$failed" -ne 0 ] || [ "$tiles_failed" -ne 0 ]; then
+    echo "sweep incomplete: $tiles_failed tile(s) failed, $failed block(s) exited non-zero" >&2
+    exit 1
+fi

@@ -27,8 +27,14 @@ passes differ in nothing but the offsets, so this refuses unless
 
 # Provenance
 
-Every global attribute is carried over from the first file, and `history` gains a line naming each source
-and the offsets it contributed, so the file records which points were run when. Per-run spinup provenance
+A global attribute every source carries with one value is carried over as is, and `history` gains a line
+naming each source and the offsets it contributed, so the file records which points were run when. An
+attribute the sources disagree on (`spinup_converged`, `max_dh_residual`, `n_bands_dropped`,
+`glacier_area_km2`, …) describes one source, so it is kept per source as a variable
+`source_<name>(delta_temperature)` holding, at each offset, the value of the file that offset came from.
+The global attribute is then the reduction over sources where one is defined — `all` for
+`spinup_converged`, the maximum for a `max_*` attribute — and is omitted otherwise;
+`source_attributes` lists the names kept per source. Per-run spinup provenance
 (`spinup_cycles`, `spinup_converged`, … — one value per band × offset × scaling) travels with its own
 offsets rather than being reduced or dropped, which is what keeps a merged file as answerable about how a
 column was settled as an unmerged one.
@@ -60,20 +66,24 @@ function merge_tile_perturbations(out_path::AbstractString,
         n_layers = maximum(ds.dim["layer"] for ds in datasets)
 
         mkpath(dirname(abspath(out_path)))
-        NCDatasets.NCDataset(out_path, "c") do out
-            _copy_tile_dims!(out, first(datasets), length(merged), n_layers)
-            _copy_tile_globals!(out, first(datasets), paths, offsets, merged)
-            _merge_group!(out, datasets, target, merged)
+        # Written beside `out_path` and renamed into place when whole, as the tile writer does.
+        _write_atomically(out_path) do tmp
+            NCDatasets.NCDataset(tmp, "c") do out
+                _copy_tile_dims!(out, first(datasets), length(merged), n_layers)
+                _copy_tile_globals!(out, datasets, paths, offsets, merged, target)
+                _merge_group!(out, datasets, target, merged)
 
-            # The restart group is state rather than series, but it is indexed by offset like everything
-            # else, so a merged file that omitted it would be unrestartable at exactly the new points.
-            if haskey(first(datasets).group, "restart")
-                gout = NCDatasets.defGroup(out, "restart")
-                gsrc = [ds.group["restart"] for ds in datasets]
-                for (k, v) in first(gsrc).attrib
-                    gout.attrib[k] = v
+                # The restart group is state rather than series, but it is indexed by offset like
+                # everything else, so a merged file that omitted it would be unrestartable at exactly
+                # the new points.
+                if haskey(first(datasets).group, "restart")
+                    gout = NCDatasets.defGroup(out, "restart")
+                    gsrc = [ds.group["restart"] for ds in datasets]
+                    for (k, v) in first(gsrc).attrib
+                        gout.attrib[k] = v
+                    end
+                    _merge_group!(gout, gsrc, target, merged)
                 end
-                _merge_group!(gout, gsrc, target, merged)
             end
         end
     finally
@@ -136,17 +146,54 @@ function _copy_tile_dims!(out, ref, n_offsets::Int, n_layers::Int)
     return nothing
 end
 
-function _copy_tile_globals!(out, ref, paths, offsets, merged)
-    for (k, v) in ref.attrib
+function _copy_tile_globals!(out, datasets, paths, offsets, merged, target)
+    ref = first(datasets)
+    names = unique!(reduce(vcat, [collect(keys(ds.attrib)) for ds in datasets]))
+    per_source = String[]
+    for k in names
         k == "history" && continue
-        out.attrib[k] = v
+        values = [get(ds.attrib, k, nothing) for ds in datasets]
+        if all(isequal(first(values)), values)
+            out.attrib[k] = first(values)
+            continue
+        end
+        push!(per_source, k)
+        _write_source_attribute!(out, k, values, target, length(merged))
+        reduced = _reduce_source_attribute(k, values)
+        reduced === nothing || (out.attrib[k] = reduced)
     end
+    isempty(per_source) || (out.attrib["source_attributes"] = join(sort!(per_source), " "))
     contributed = join(("$(basename(p)) [" * join(string.(o), ", ") * "]"
                         for (p, o) in zip(paths, offsets)), "; ")
     out.attrib["history"] = get(ref.attrib, "history", "") *
         "\n$(Dates.format(now(), "yyyy-mm-ddTHH:MM:SS")): delta_temperature axis merged to [" *
         join(string.(merged), ", ") * "] from " * contributed *
         " by GEMB_GlacierSims.merge_tile_perturbations"
+    return nothing
+end
+
+# A global attribute the sources disagree on, as `source_<key>(delta_temperature)`: each merged offset
+# holds the value of the file it came from. Numbers are stored as Float64 and anything else as text; a
+# source lacking the attribute gives fill or an empty string.
+function _write_source_attribute!(out, key, values, target, n_offsets)
+    numeric = all(v -> v === nothing || v isa Real, values)
+    data = numeric ? fill(NC_FILL, n_offsets) : fill("", n_offsets)
+    for (value, idx) in zip(values, target)
+        value === nothing && continue
+        data[idx] .= numeric ? Float64(value) : string(value)
+    end
+    v = NCDatasets.defVar(out, "source_" * key, numeric ? Float64 : String, ("delta_temperature",);
+                          (numeric ? (; fillvalue = NC_FILL) : (;))...)
+    v.attrib["long_name"] = "$key of the source file each temperature offset was merged from"
+    v[:] = data
+    return nothing
+end
+
+# The tile-level value of an attribute the sources disagree on, where one follows from theirs.
+function _reduce_source_attribute(key, values)
+    any(isnothing, values) && return nothing
+    key == "spinup_converged" && return all(==("true"), values) ? "true" : "false"
+    startswith(key, "max_") && all(v -> v isa Real, values) && return maximum(values)
     return nothing
 end
 

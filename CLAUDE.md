@@ -37,16 +37,15 @@ content-hash slug (`~/.julia/packages/GEMB_ClimateForcing/<slug>/`), so **any `P
 `data/invariant/era5_land/` starts empty, and every worker that starts after the bump tries to
 redownload it. Starting several workers at once at that moment hits a known race
 (`rename(...): no such file or directory`) — one wins, the rest fail that tile and exit. A copy
-is preserved at `$CLIMATE_CACHE/invariant/era5_land/`; after a dependency bump (or a reboot, which
-has the same effect on other `tempdir()`-cached state in this repo), restore it into the *current*
-slug's path before launching workers:
+is preserved at `$CLIMATE_CACHE/invariant/era5_land/`. The three launchers (`run_tile_sweep.sh`,
+`run_native_sweep.sh`, `run_derive_parameters.sh`) put it into the *current* path before starting any
+worker (`scripts/restore_invariant.sh`, which copies the preserved file or, failing that, downloads it
+once). Workers started by hand after a dependency bump (or a reboot, which has the same effect on other
+`tempdir()`-cached state in this repo) need the same done first:
 
 ```sh
-PKGDIR=$(~/.juliaup/bin/julia +release --project=. -e \
-  'using GEMB_ClimateForcing; print(pkgdir(GEMB_ClimateForcing))')
-mkdir -p "$PKGDIR/data/invariant/era5_land"
-cp -a /mnt/bylot-r3/data/era5land/invariant/era5_land/geo_1279l4_0.1x0.1.grib2_v4_unpack.nc \
-      "$PKGDIR/data/invariant/era5_land/"
+. scripts/restore_invariant.sh
+restore_invariant ~/.juliaup/bin/julia . /mnt/bylot-r3/data/era5land
 ```
 
 Low stakes either way — it is one 50 MB file from a plain HTTP URL, not a CDS-queued request.
@@ -64,6 +63,34 @@ background.
 - The table stores **native 0–359.9°E longitudes** and carries no `:latitude`/`:longitude` columns;
   callers add them from the Point geometry and leave them native, because that is what
   `climate_forcing` is keyed on. `wrap_lon` converts to `(-180, 180]` for geometry.
+- `data/background_black_carbon.csv` — background BC (and dust) in snow per RGI 7.0 o1 region, with
+  method, season and source per row; read by `background_black_carbon`. The scripts take the loading
+  from the physics member (`PHYSICS_MEMBER`, `src/physics_members.jl`): production uses BC plus dust
+  converted with SNICAR-ADv3 (impurity level `table`, in the default member `B-kfit-table`); the
+  levels `tbc`, `tdang`, `traw` and `bc0` (BC only, Dang optics, unconverted, none) are for
+  sensitivity runs. `BACKGROUND_BLACK_CARBON` and `BACKGROUND_BLACK_CARBON_OPTICS`, when set, must
+  agree with the member.
+- `data/shaw2025_glacier_bands.csv.gz` — the glaciers of the Shaw et al. (2025) decoupling table with
+  their RGI 6.0 area per 100 m band, written by `scripts/make_shaw_glacier_bands.jl` from the RGI 6.0
+  hypsometry files; read by `shaw_glacier_bands` for the area-weighted decoupling prior
+  (`shaw_decoupling_prior`) and the `kshaw` band decoupling (`shaw_band_decoupling`).
+- The decoupling fit reads each cell's `glm` as the fraction itself, or as an indicator (glm ≥ 0.5) in
+  High Mountain Asia (RGI 13-15; `tile_glacier_fraction_form` in
+  `scripts/derive_downscaling_parameter_tiles.jl`); the form is stored in each parameter tile and the
+  donor conversion uses the same form.
+- The glacier correction (a glaciated ERA5-Land cell's forcing taken to its ice-free equivalent before
+  it is lapsed) is additive by default, `T − glm·(γ + δz)` (`resolve_downscaling(...;
+  glacier_correction)`, `DEFAULT_GLACIER_CORRECTION`); `:multiplicative`, the division by
+  `1 − glm(1 − k)`, reproduces runs made before the option. Scripts read `GLACIER_CORRECTION`; a run
+  records `downscaling_glacier_correction` only for `:additive`.
+- Tile runs of a physics member go to `$CLIMATE_CACHE/tile_runs_v2/<member>/` and native runs to
+  `$CLIMATE_CACHE/native_runs/<member>/`; every tile records `physics_*` run parameters naming the
+  member.
+- `data/snicar_adv3_albedo.csv` — SNICAR-ADv3 broadband snow albedo over grain radius, BC and dust,
+  written by `scripts/snicar_adv3_albedo_grid.m`; the reference optics `background_black_carbon`
+  converts a measured loading against.
+- `data/rgi7_o1regions_simplified.geojson` — RGI 7.0 first-order region outlines (GTN-G 2023,
+  doi:10.5904/gtng-glacreg-2023-07), simplified at 0.01°, used to assign a tile its region.
 
 ## Testing
 
