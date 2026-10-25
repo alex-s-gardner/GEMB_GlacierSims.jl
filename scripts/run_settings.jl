@@ -28,12 +28,13 @@ const SPINUP_CLIMATOLOGY_LAST_YEAR = 1980
 # its grain-growth level sets the GEMB snow settings, its band decoupling level the `band_decoupling`
 # rule of `resolve_downscaling`, and its impurity level the snow impurity loading. Shared so that a
 # native cell runs as its reference tile's member. `PHYSICS_MEMBER` overrides the default, which is
-# Flanner & Zender grain growth with 350 kg m-3 fresh snow, the fitted band k, and the production
-# background impurity table; `run_tile_sweep.sh` and `run_native_sweep.sh` carry the same default.
+# grain level `S` (GEMB's default snow set; see `PHYSICS_GRAIN_VARIANTS`), the fitted band k, and the
+# production background impurity table; `run_tile_sweep.sh` and `run_native_sweep.sh` carry the same
+# default.
 # Each member's tiles go to a directory of their own (`tile_run_dir`), so no two members' tiles share
 # a directory.
 import GEMB_GlacierSims
-const DEFAULT_PHYSICS_MEMBER = "B-kfit-table"
+const DEFAULT_PHYSICS_MEMBER = "S-kfit-table"
 const PHYSICS_MEMBER = GEMB_GlacierSims.physics_member(get(ENV, "PHYSICS_MEMBER", DEFAULT_PHYSICS_MEMBER))
 
 # The form of the glacier correction (`resolve_downscaling`'s `glacier_correction`, one of

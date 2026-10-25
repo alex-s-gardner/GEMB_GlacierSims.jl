@@ -17,7 +17,7 @@
 #
 # Environment: NATIVE_BLOCKS (default 96), CLIMATE_CACHE, JULIA, TILE_NAMES, FORCE, FORCING_CORRECTIONS,
 # REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR, CLAIM_STALE_HOURS, HEAP_SIZE_HINT,
-# PHYSICS_MEMBER (default B-kfit-table), EFFECTIVE_LOADING_TABLE.
+# PHYSICS_MEMBER (default S-kfit-table), EFFECTIVE_LOADING_TABLE.
 
 set -uo pipefail
 
@@ -28,7 +28,7 @@ JULIA="${JULIA:-$HOME/.juliaup/bin/julia}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIMATE_CACHE="${CLIMATE_CACHE:-/mnt/bylot-r3/data/era5land}"
 # One directory per physics member, as the native script's own default.
-PHYSICS_MEMBER="${PHYSICS_MEMBER:-B-kfit-table}"
+PHYSICS_MEMBER="${PHYSICS_MEMBER:-S-kfit-table}"
 export PHYSICS_MEMBER
 OUTPUT_DIR="${OUTPUT_DIR:-$CLIMATE_CACHE/native_runs/$PHYSICS_MEMBER}"
 export OUTPUT_DIR

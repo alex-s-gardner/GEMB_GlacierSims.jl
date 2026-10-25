@@ -653,17 +653,17 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
         clear = ("PHYSICS_MEMBER" => nothing, "BACKGROUND_BLACK_CARBON" => nothing,
                  "BACKGROUND_BLACK_CARBON_OPTICS" => nothing, "EFFECTIVE_LOADING_TABLE" => nothing)
 
-        # The default is Flanner & Zender grain growth with the production impurity table and the
-        # fitted k.
+        # The default member, which every other check in this set reads from the scripts.
         d = load(clear...)
-        @test get_(d, :DEFAULT_PHYSICS_MEMBER) == "B-kfit-table"
-        @test get_(d, :PHYSICS_MEMBER).id == "B-kfit-table"
+        @test get_(d, :DEFAULT_PHYSICS_MEMBER) == "S-kfit-table"
+        default = get_(d, :DEFAULT_PHYSICS_MEMBER)
+        @test get_(d, :PHYSICS_MEMBER).id == default
         @test get_(d, :BACKGROUND_BLACK_CARBON) === :bc_dust
         @test get_(d, :BACKGROUND_BLACK_CARBON_OPTICS) === :snicar_adv3
         @test call(d, :tile_background_black_carbon, cells) ==
               background_black_carbon("11"; basis = :bc_dust, optics = :snicar_adv3)
         @test call(d, :tile_effective_black_carbon, cells) === nothing
-        @test call(d, :tile_run_dir, "/cache") == "/cache/tile_runs_v2/B-kfit-table"
+        @test call(d, :tile_run_dir, "/cache") == "/cache/tile_runs_v2/$default"
         # The launcher carries the same default member and directory.
         sh = read(joinpath(repo, "scripts", "run_tile_sweep.sh"), String)
         @test occursin("PHYSICS_MEMBER=\"\${PHYSICS_MEMBER:-$(get_(d, :DEFAULT_PHYSICS_MEMBER))}\"", sh)
@@ -691,7 +691,7 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
         # An `export` that agrees is accepted; one that disagrees stops the script.
         @test get_(load(clear..., "PHYSICS_MEMBER" => "C-kshaw-table",
                         "BACKGROUND_BLACK_CARBON" => "bc_dust"), :BACKGROUND_BLACK_CARBON) === :bc_dust
-        @test_throws "BACKGROUND_BLACK_CARBON=bc disagrees with physics member B-kfit-table, whose impurity level table sets bc_dust" load(
+        @test_throws "BACKGROUND_BLACK_CARBON=bc disagrees with physics member $default, whose impurity level table sets bc_dust" load(
             clear..., "BACKGROUND_BLACK_CARBON" => "bc")
         @test_throws "BACKGROUND_BLACK_CARBON_OPTICS=dang2015 disagrees" load(
             clear..., "BACKGROUND_BLACK_CARBON_OPTICS" => "dang2015")
@@ -708,7 +708,7 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
             clear..., "PHYSICS_MEMBER" => "C-kfit-cvis")
         @test_throws "EFFECTIVE_LOADING_TABLE=/nonexistent.csv does not exist" load(
             clear..., "PHYSICS_MEMBER" => "C-kfit-cvis", "EFFECTIVE_LOADING_TABLE" => "/nonexistent.csv")
-        @test_throws "EFFECTIVE_LOADING_TABLE is set, but physics member B-kfit-table takes no effective loading" load(
+        @test_throws "EFFECTIVE_LOADING_TABLE is set, but physics member $default takes no effective loading" load(
             clear..., "EFFECTIVE_LOADING_TABLE" => table)
 
         # Both scripts run as the member: model parameters, band rule and both loadings.

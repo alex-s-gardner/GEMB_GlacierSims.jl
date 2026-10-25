@@ -66,7 +66,7 @@ background.
 - `data/background_black_carbon.csv` — background BC (and dust) in snow per RGI 7.0 o1 region, with
   method, season and source per row; read by `background_black_carbon`. The scripts take the loading
   from the physics member (`PHYSICS_MEMBER`, `src/physics_members.jl`): production uses BC plus dust
-  converted with SNICAR-ADv3 (impurity level `table`, in the default member `B-kfit-table`); the
+  converted with SNICAR-ADv3 (impurity level `table`, in the default member `S-kfit-table`); the
   levels `tbc`, `tdang`, `traw` and `bc0` (BC only, Dang optics, unconverted, none) are for
   sensitivity runs. `BACKGROUND_BLACK_CARBON` and `BACKGROUND_BLACK_CARBON_OPTICS`, when set, must
   agree with the member.

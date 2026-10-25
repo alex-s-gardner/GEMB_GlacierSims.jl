@@ -37,7 +37,7 @@
 # the package, so a syntax error or a missing dependency surfaces once here rather than 96 times in the
 # logs.
 #
-# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, PHYSICS_MEMBER (default B-kfit-table, as in
+# Environment: TILE_BLOCKS (default 96), CLIMATE_CACHE, PHYSICS_MEMBER (default S-kfit-table, as in
 # run_settings.jl), OUTPUT_DIR (default $CLIMATE_CACHE/tile_runs_v2/$PHYSICS_MEMBER), EFFECTIVE_LOADING_TABLE,
 # JULIA, FORCING_CACHE_GIB, TILE_NAMES, FORCE,
 # CLAIM_STALE_HOURS, SPINUP_SIMULATION_YEARS_MAXIMUM, HEAP_SIZE_HINT.
@@ -57,7 +57,7 @@ CLIMATE_CACHE="${CLIMATE_CACHE:-/mnt/bylot-r3/data/era5land}"
 # The sweep's own default (`tile_run_dir` in run_settings.jl: `TILE_RUN_DIR` and the physics member),
 # which the native run takes as its reference. Exported so the workers run as this member and write
 # where the logs and claims below are kept.
-PHYSICS_MEMBER="${PHYSICS_MEMBER:-B-kfit-table}"
+PHYSICS_MEMBER="${PHYSICS_MEMBER:-S-kfit-table}"
 export PHYSICS_MEMBER
 OUTPUT_DIR="${OUTPUT_DIR:-$CLIMATE_CACHE/tile_runs_v2/$PHYSICS_MEMBER}"
 export OUTPUT_DIR

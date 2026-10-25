@@ -492,13 +492,20 @@ end
     fit_name = "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_synthesized_gembfit.arrow"
     beside = touch(joinpath(binned, fit_name))
     @test reference_forcing_corrections(member) == beside
+    # The scripts' settings, with the default physics member.
+    settings = Module()
+    Base.eval(settings, :(using Dates))
+    withenv("PHYSICS_MEMBER" => nothing) do
+        Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
+    end
+    default = settings.DEFAULT_PHYSICS_MEMBER
     # A physics member's fit is in that member's folder beside it, under the same name.
     @test_throws "no `gemb_calibration` output" reference_forcing_corrections(
-        member; physics_member = "B-kfit-table")
-    fit = joinpath(binned, "gemb_physics", "B-kfit-table", fit_name)
+        member; physics_member = default)
+    fit = joinpath(binned, "gemb_physics", default, fit_name)
     mkpath(dirname(fit))
     touch(fit)
-    @test reference_forcing_corrections(member; physics_member = "B-kfit-table") == fit
+    @test reference_forcing_corrections(member; physics_member = default) == fit
     @test_throws "is not an `…_aligned.jld2` file" reference_forcing_corrections(joinpath(binned, "x.jld2"))
     @test_throws "no GlobalGlacierAnalysis.jl source" gga_reference_ensemble_file(mktempdir())
     write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = joinpath(\"a\", \"b\")\n")
@@ -548,11 +555,6 @@ end
 
     # The tile sweep writes, and the native run reads, the same directory by default: the physics
     # member's under `TILE_RUN_DIR`. The launcher agrees with the scripts.
-    settings = Module()
-    Base.eval(settings, :(using Dates))
-    withenv("PHYSICS_MEMBER" => nothing) do
-        Base.include(settings, joinpath(_REPO, "scripts", "run_settings.jl"))
-    end
     @test settings.TILE_RUN_DIR == "tile_runs_v2"
     for script in ("gemb_tile_sweep.jl", "gemb_native_run.jl")
         @test occursin("tile_run_dir(CLIMATE_CACHE)",
@@ -573,8 +575,8 @@ end
     @test occursin("1950-01-02 .. 2026-08-14T23:00", out)       # the whole cached record
     @test occursin(r"spinup climatology +1951-01-01 \.\. 1980-12-31T23:00", out)
     @test occursin(fit, out)
-    @test occursin(joinpath(climate, "tile_runs_v2", "B-kfit-table"), out)
-    @test occursin(r"physics member +B-kfit-table", out)
+    @test occursin(joinpath(climate, "tile_runs_v2", default), out)
+    @test occursin(Regex("physics member +" * default), out)
     err = IOBuffer()
     @test !success(pipeline(native(mktempdir()); stdout = devnull, stderr = err))
     @test occursin("no GlobalGlacierAnalysis.jl source", String(take!(err)))
