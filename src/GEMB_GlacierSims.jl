@@ -172,6 +172,7 @@ export reference_forcing_corrections, gga_reference_ensemble_file,
 
 # GEMB at a firn-core site with snowfall matched to the core's accumulation, for densification tests.
 include("firn_site_run.jl")
-export FirnSite, firn_site_run, site_snowfall_scaling, firn_profile_on_grid
+export FirnSite, firn_site_run, site_downscaling, site_forcing, site_snowfall_scaling,
+       firn_profile_on_grid
 
 end # module

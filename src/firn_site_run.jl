@@ -1,9 +1,12 @@
 """
 GEMB at a firn-core site, for testing densification physics against a measured density profile.
 
-A site run forces one GEMB column with the reanalysis grid point nearest the core, lapsed to the
-site's elevation, and with precipitation scaled so the run's mean snowfall equals the accumulation
-measured at the core. Matching accumulation takes the forcing's accumulation error out of the
+A site run forces one GEMB column with the reanalysis grid point nearest the core, taken to the
+site's elevation by the production downscaling, and with precipitation scaled so the run's mean
+snowfall equals the accumulation measured at the core. The downscaling is the one a glacier band
+of the site's tile gets ([`site_downscaling`](@ref), [`site_forcing`](@ref)): the lapse rate fitted
+across the glacierized cells of the tile's buffered neighbourhood, the glacier correction of the
+site's own cell, and the decoupling factor at the site elevation. Matching accumulation takes the forcing's accumulation error out of the
 comparison: the Arthern-family rates scale with accumulation and the Crocus rate with the overburden
 it builds, so an accumulation error in the forcing would otherwise be fitted as a densification
 error. The run therefore tests the compaction physics, not the forcing.
@@ -67,13 +70,63 @@ function site_snowfall_scaling(forcing, accumulation::Real, mp::ModelParameters)
 end
 
 """
+    site_downscaling(fit, site::FirnSite, run_time; kwargs...) -> AppliedDownscaling
+
+The downscaling of a tile, `fit` from [`read_downscaling_tile`](@ref), resolved for one band centred
+on `site.elevation`, on the time axis `run_time` of the site's forcing. The basis is `:fitted` when
+`run_time` is the fit's own axis and `:climatology` otherwise, as in the tile sweep. Keywords are
+passed to [`resolve_downscaling`](@ref); pass the tile's `decoupling_factor_prior` and the physics
+member's `band_decoupling` and `glacier_correction`, as the tile sweep does.
+"""
+function site_downscaling(fit, site::FirnSite, run_time; kwargs...)
+    z = site.elevation
+    interval = (; lo = floor(Int, z), hi = floor(Int, z) + 1, center = z)
+    run_time = collect(DateTime, run_time)
+    basis = collect(DateTime, fit.time) == run_time ? :fitted : :climatology
+    return resolve_downscaling(fit, [interval], run_time; basis, kwargs...)
+end
+
+"""
+    site_forcing(forcing, applied::AppliedDownscaling, glacier_fraction) -> DimStack
+
+`forcing`, the raw reanalysis stack of the site's grid point, adjusted as
+[`elevation_interval_forcing`](@ref) adjusts each cell for a band: brought to the ice-free state with
+the cell's `glacier_fraction` (its `glm`, in the fit's glacier-fraction form) and the glacier
+correction at the cell's reanalysis elevation, lapsed to the band centre at `applied.lapse_rate`, and
+decoupled with the band's `k`. `applied` holds one band, the site, from [`site_downscaling`](@ref), on
+the forcing's time axis. Wind is not rescaled: a physics member with a wind factor is refused.
+"""
+function site_forcing(forcing, applied::AppliedDownscaling, glacier_fraction::Real)
+    band = only(applied.bands)
+    lookup(forcing, Ti) == applied.time || throw(DimensionMismatch(
+        "the downscaling is resolved on $(length(applied.time)) timesteps but the forcing has " *
+        "$(length(lookup(forcing, Ti))); resolve it on the forcing's time axis"))
+    get(applied.settings, "downscaling_wind_scaling", 1.0) == 1 &&
+        get(applied.settings, "downscaling_wind_correction", "scaling") == "scaling" ||
+        throw(ArgumentError("a site run applies no wind correction; resolve the downscaling with " *
+                            "wind_scaling = 1 and the :scaling wind rule"))
+    n = length(applied.time)
+    z_cell = Float64(DimensionalData.metadata(forcing)["elevation"])
+    form = Symbol(get(applied.settings, "downscaling_glacier_fraction_form", "fraction"))
+    g = decoupling_glacier_fraction(glacier_fraction, form)
+    correction = g == 0 ? ones(n) : applied.donor_decoupling_factor_at(z_cell)
+    ambient = _ambient_forcing(forcing, g, correction)
+    return _cell_forcing_at_interval(ambient, band.center - z_cell, band.decoupling_factor,
+                                     applied.lapse_rate, 0.0, ones(n))
+end
+
+"""
     firn_site_run(site::FirnSite, forcing, mp; kwargs...) -> NamedTuple
 
 Run GEMB at `site` on `forcing`, the raw reanalysis `DimStack` at the site's grid point (its
 `metadata["elevation"]` is the grid point's height), and return the column on the drilling date.
 
-The forcing is lapsed from the grid point to `site.elevation` at `lapse_rate` [K km⁻¹], its
-precipitation scaled by [`site_snowfall_scaling`](@ref), and its impurity metadata set from `mp`. The
+With `downscaling` (from [`site_downscaling`](@ref), on the forcing's time axis) the forcing is taken
+to the site by [`site_forcing`](@ref) with the cell's `glacier_fraction`. Without it, for a site whose
+tile has no glacierized cells to fit, it is lapsed from the grid point to `site.elevation` at the
+scalar `lapse_rate` [K km⁻¹] and left ambient. The record is then cut to one month past the drilling
+date, its precipitation scaled by [`site_snowfall_scaling`](@ref) over that span, and its impurity
+metadata set from `mp`. The
 column is at least `depth_minimum` deep (default `site.depth` plus
 $(FIRN_SITE_DEPTH_MARGIN) m), so the core lies inside it even where the column densifies more slowly
 than the steady state GEMB sizes it by. It is spun up on the `:representative` climatology of
@@ -91,6 +144,8 @@ Throws `ArgumentError` when the drilling date lies outside the forcing, and `For
 the forcing is incomplete.
 """
 function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
+                       downscaling = nothing,
+                       glacier_fraction::Real = 0.0,
                        lapse_rate = _DEFAULT_LAPSE_RATE,
                        spinup_window = nothing,
                        simulation_years_maximum::Real = 1000,
@@ -105,7 +160,12 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
         "$(first(times)) .. $(last(times))"))
 
     z_forcing = Float64(DimensionalData.metadata(forcing)["elevation"])
-    lapsed = climate_adjust_for_elevation(forcing, site.elevation - z_forcing; lapse_rate)
+    downscaled = downscaling === nothing ?
+                 climate_adjust_for_elevation(forcing, site.elevation - z_forcing; lapse_rate) :
+                 site_forcing(forcing, downscaling, glacier_fraction)
+    # The profile is read at the last monthly output at or before the drilling date, so the record
+    # runs one month past it, and the accumulation is matched over that same span.
+    lapsed = downscaled[Ti(first(times) .. min(last(times), site.date + Month(1)))]
     scaling = site_snowfall_scaling(lapsed, site.accumulation, mp)
     adjusted = _with_impurity_metadata(precipitation_adjust(lapsed, scaling), mp)
 
@@ -117,11 +177,8 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
                        convergence_drift_density = _spinup_drift_tolerance(
                            initial, cf_spinup, mp, convergence_drift_fac))
 
-    # Monthly output is enough to find the column on the drilling date; the profile is read at the
-    # last output time at or before it, so the run stops one month after it.
-    run_forcing = adjusted[Ti(first(times) .. min(last(times), site.date + Month(1)))]
     mp_run = ConstructionBase.setproperties(mp, (; output_frequency = :monthly))
-    output = gemb(spun, initialize_forcing(run_forcing), mp_run)
+    output = gemb(spun, initialize_forcing(adjusted), mp_run)
     out_times = collect(dims(output, Ti))
     i = findlast(<=(site.date), out_times)
     i === nothing && throw(ArgumentError(

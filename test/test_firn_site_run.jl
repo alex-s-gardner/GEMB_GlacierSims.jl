@@ -1,5 +1,6 @@
 # GEMB at a firn-core site: the snowfall scaling, the run on synthetic forcing, and the profile read
-# onto core depths. Included from `runtests.jl`; uses `_tiny_band_forcing` from `test_pipeline_audit.jl`.
+# onto core depths. Included from `runtests.jl`; uses `_tiny_band_forcing` and `_flat_applied` from
+# `test_pipeline_audit.jl`, and `_cp_forcing`, `_cp_table` and `_CP_TIME` from `runtests.jl`.
 
 # A cold snowy site: 10 years of 3-hourly forcing, 0.1 kg m-2 per step at 258 K (all snow), with a
 # reference elevation 200 m below the site.
@@ -26,6 +27,35 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         # Rain does not count: above the threshold the forcing has no snowfall to scale.
         warm = _tiny_band_forcing(; years = 2, temperature = 280.0, precipitation = 0.1)
         @test_throws "has no snowfall" site_snowfall_scaling(warm, 500.0, mp)
+    end
+
+    @testset "site forcing is the band forcing of a one-cell tile" begin
+        # A glaciated cell (glm 0.6) at 1000 m, warm enough that the decoupling and the glacier
+        # correction act, taken to a 1550 m band by `elevation_interval_forcing` and to a 1550 m site by
+        # `site_forcing`, under one applied downscaling: the two must agree exactly.
+        n = 6
+        temperature = [271.0, 274.0, 276.0, 279.0, 268.0, 281.0]
+        cell = (lon = 10.0, lat = 46.0, z = 1000.0, glm = 0.6, bins = [(1550, 2.0)])
+        forcing = _cp_forcing(cell.lat, cell.lon, cell.z, temperature)
+        applied = _flat_applied(_CP_TIME[1:n], [(1500, 1600)]; k = 0.7, lapse_rate = 5.5)
+        # The flat resolution carries no donor correction; give the cell a `k` series of its own.
+        applied = GEMB_GlacierSims.AppliedDownscaling(applied.time, applied.lapse_rate,
+            applied.lapse_rate_source, applied.bands, applied.basis, applied.settings,
+            applied.provenance, z -> fill(0.8, n))
+        band = only(collect(elevation_interval_forcing(
+            _cp_table([cell]), applied; climate_model = :synthetic,
+            time_range = (_CP_TIME[1], _CP_TIME[n]), forcing_loader = (_m, lat, lon; kw...) -> forcing)))
+        site = site_forcing(forcing, applied, cell.glm)
+        for v in (:temperature_air, :vapor_pressure, :longwave_downward, :pressure_air, :precipitation)
+            @test collect(site[v]) == collect(band.forcing[v])
+        end
+        # The lapse and the decoupling both acted: the band is colder than the cell at every step.
+        @test all(collect(site[:temperature_air]) .< temperature)
+        @test_throws "applies no wind correction" site_forcing(forcing,
+            GEMB_GlacierSims.AppliedDownscaling(applied.time, applied.lapse_rate,
+                applied.lapse_rate_source, applied.bands, applied.basis,
+                Dict{String,Any}("downscaling_wind_scaling" => 2.0), applied.provenance,
+                applied.donor_decoupling_factor_at), cell.glm)
     end
 
     @testset "a site run reaches the core and densifies with depth" begin
