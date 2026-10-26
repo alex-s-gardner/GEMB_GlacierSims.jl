@@ -170,4 +170,8 @@ export read_forcing_corrections, forcing_correction, native_cells, gemb_native_c
 export reference_forcing_corrections, gga_reference_ensemble_file,
        forcing_corrections_provenance_path, assert_corrections_fitted_on
 
+# GEMB at a firn-core site with snowfall matched to the core's accumulation, for densification tests.
+include("firn_site_run.jl")
+export FirnSite, firn_site_run, site_snowfall_scaling, firn_profile_on_grid
+
 end # module
