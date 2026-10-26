@@ -19,6 +19,10 @@
 # first 30 years of whatever record a site has. A date given only to the month is taken as its 15th,
 # and one given only to the year as 1 July.
 #
+# `MODEL_OVERRIDES`, when set, is a Julia `NamedTuple` literal of `ModelParameters` fields applied on
+# top of the member's snow settings, e.g. `(; crocus_handoff_density = 500.0)`, for a sensitivity run
+# under otherwise production settings. The overrides are recorded with each result.
+#
 # Results are written with `Serialization` to `<output.jls>` as a `Dict(record_id => result)`, where a result is
 # `firn_site_run`'s NamedTuple or, for a site that failed, `(; error = <message>)`. The file is
 # rewritten after each site, so an interrupted sweep keeps what it finished and a rerun skips those.
@@ -37,6 +41,11 @@ const PARAMETERS = ARGS[2]
 const OUTPUT = ARGS[3]
 const ONLY = Set(ARGS[4:end])
 const MEMBER = GEMB_GlacierSims.physics_member(get(ENV, "PHYSICS_MEMBER", "S-kfit-table"))
+const OVERRIDES = let s = get(ENV, "MODEL_OVERRIDES", "(;)")
+    v = eval(Meta.parse(s))
+    v isa NamedTuple || error("MODEL_OVERRIDES must be a NamedTuple literal, got $s")
+    v
+end
 const CACHE = joinpath(tempdir(), ".cache", "era5land")
 const RECORD_START = DateTime(1950, 1, 2)
 const SPINUP_WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
@@ -109,8 +118,8 @@ function main()
     results = isfile(OUTPUT) ? deserialize(OUTPUT) : Dict{String,Any}()
     todo = [s for s in sites if !haskey(results, s.record_id)]
     println(length(sites), " sites in the fit set, ", length(todo), " to run, under ", MEMBER.id,
-            " on ", Threads.nthreads(), " threads")
-    mp = GEMB_GlacierSims.physics_model_parameters(MEMBER)
+            isempty(OVERRIDES) ? "" : " with $OVERRIDES", " on ", Threads.nthreads(), " threads")
+    mp = GEMB.initialize_parameters(; MEMBER.model..., OVERRIDES...)
     MEMBER.wind_scaling == 1 && MEMBER.wind_correction === :scaling ||
         error("physics member $(MEMBER.id) corrects the wind, which a site run does not apply")
     token = GEMB_ClimateForcing.get_cds_api_key()
@@ -146,7 +155,8 @@ function main()
                                  glacier_correction = DEFAULT_GLACIER_CORRECTION)
             r = firn_site_run(site, forcing, mp; spinup_window = window, downscaling,
                               glacier_fraction = c.glm)
-            merge(r, (; tile = c.name, downscaled = downscaling !== nothing, glm = c.glm))
+            merge(r, (; tile = c.name, downscaled = downscaling !== nothing, glm = c.glm,
+                      overrides = OVERRIDES))
         catch e
             e isa InterruptException && rethrow()
             (; error = sprint(showerror, e))
