@@ -32,7 +32,9 @@
 # The runs are all of Test 1 (snowfall matched to the core) or all of Test 2 (end to end, the
 # forcing's own snowfall; `firn_site_sweep.jl` with `MATCH_ACCUMULATION=false`); a mix is refused.
 #
-# Writes `<out_dir>/cores.tsv` (every metric per core and configuration) and `<out_dir>/summary.md`.
+# Writes `<out_dir>/cores.tsv` (every metric per core and configuration), `<out_dir>/sites.tsv` (each
+# site's cores, region, weight and χ² per configuration, the input of the Stage B emulator) and
+# `<out_dir>/summary.md`.
 
 using GEMB_GlacierSims, Serialization, DelimitedFiles, TOML, Statistics, Printf, Random
 
@@ -233,6 +235,13 @@ function main()
         site_chi2[c] = [mean(filter(isfinite, [core_chi2[i] for i in s.ids])) for s in sites]
     end
     write(joinpath(OUT, "cores.tsv"), join(lines, '\n') * '\n')
+    open(joinpath(OUT, "sites.tsv"), "w") do io
+        println(io, join(["site", "region", "weight", "record_ids", configs...], '\t'))
+        for (k, s) in enumerate(sites)
+            println(io, join([k, s.region, @sprintf("%.6g", w[k]), join(s.ids, ","),
+                              [@sprintf("%.6g", site_chi2[c][k]) for c in configs]...], '\t'))
+        end
+    end
 
     objective(v, idx) = (k = filter(i -> isfinite(v[i]), idx); sum(w[k] .* v[k]) / sum(w[k]))
     all_idx = collect(eachindex(sites))
