@@ -175,19 +175,19 @@ function main()
         error("physics member $(MEMBER.id) corrects the wind, which a site run does not apply")
     token = isempty(FORCING_DIR) ? GEMB_ClimateForcing.get_cds_api_key() : nothing
     cells = site_cells(todo, ice_sheet)
-    forcings = Dict{String,Any}()
-    for site in todo
-        forcings[site.record_id] = try
-            read_forcing(site, token)
-        catch e
-            e isa InterruptException && rethrow()
-            (; error = sprint(showerror, e))
-        end
+    # From the cache, forcing is read serially before the threaded runs; from `FORCING_DIR`, each thread
+    # reads its own site's file, so only the running sites' records are held in memory.
+    load(site) = try
+        read_forcing(site, token)
+    catch e
+        e isa InterruptException && rethrow()
+        (; error = sprint(showerror, e))
     end
+    forcings = isempty(FORCING_DIR) ? Dict(site.record_id => load(site) for site in todo) : nothing
     lock = ReentrantLock()
     Threads.@threads for site in todo
         t0 = time()
-        forcing = forcings[site.record_id]
+        forcing = forcings === nothing ? load(site) : forcings[site.record_id]
         result = forcing isa NamedTuple ? forcing : try
             # The fixed window where the record holds it; otherwise `firn_site_run`'s default, the
             # first 30 whole years of the record.
