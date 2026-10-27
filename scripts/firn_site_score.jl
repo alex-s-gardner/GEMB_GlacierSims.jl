@@ -20,10 +20,14 @@
 # - χ² per core is the mean squared normalized residual; cores sharing an ERA5-Land cell and within
 #   100 m of elevation form one site, whose χ² is their mean; sites are weighted by the inverse of a
 #   Gaussian kernel density in (log accumulation, mean temperature, melt index), bandwidth one standard
-#   deviation per coordinate, capped at 3× the median weight;
+#   deviation per coordinate, capped at 3× the median weight; the accumulation is the reference run's
+#   mean snowfall, which is the core's measured accumulation when the runs match it;
 # - the objective is the weighted mean site χ². Against the reference, each configuration reports the
 #   bootstrap over sites (1,000 resamples) of the objective difference and, per RGI 7 o1 region (an
 #   ice-sheet site outside every region is its own region), the change in the region's mean χ².
+#
+# The runs are all of Test 1 (snowfall matched to the core) or all of Test 2 (end to end, the
+# forcing's own snowfall; `firn_site_sweep.jl` with `MATCH_ACCUMULATION=false`); a mix is refused.
 #
 # Writes `<out_dir>/cores.tsv` (every metric per core and configuration) and `<out_dir>/summary.md`.
 
@@ -184,6 +188,11 @@ function main()
     clim = climate_table()
     runs = Dict(c => deserialize(joinpath(RUNS, c * ".jls")) for c in configs)
     ids = sort(collect(keys(runs[REFERENCE])))
+    tests = unique(get(r, :match_accumulation, true) for c in configs for r in values(runs[c])
+                   if !haskey(r, :error))
+    length(tests) == 1 || error("the runs mix accumulation-matched and unmatched results")
+    test = only(tests) ? "Test 1 (snowfall matched to each core)" :
+           "Test 2 (end to end, the forcing's own snowfall)"
     metas = Dict(id => TOML.parsefile(joinpath(EX, id, "meta.toml")) for id in ids)
     excluded = [id for id in ids if get(metas[id]["timing"], "depth_reference", "") == "other"]
     ids = setdiff(ids, excluded)
@@ -197,7 +206,7 @@ function main()
                       groups)
         g === nothing ? push!(groups, [id]) : push!(groups[g], id)
     end
-    sites = [(; ids = g, acc = mean(runs[REFERENCE][i].site.accumulation for i in g),
+    sites = [(; ids = g, acc = mean(runs[REFERENCE][i].snowfall for i in g),
               T = clim[g[1]].T, melt = clim[g[1]].melt, region = region_of(runs[REFERENCE][g[1]].site))
              for g in groups]
     w = site_weights(sites)
@@ -225,7 +234,7 @@ function main()
     rng = Xoshiro(20261026)
     boots = [rand(rng, all_idx, length(all_idx)) for _ in 1:N_BOOT]
     regions = sort(unique(s.region for s in sites))
-    md = String["# Firn benchmark: Stage A", "",
+    md = String["# Firn benchmark: $test", "",
                 "Reference `$REFERENCE`. $(length(ids)) cores at $(length(sites)) sites" *
                 (isempty(excluded) ? "" : "; excluded for depth reference `other`: $(join(excluded, ", "))") * ".",
                 "", "| configuration | objective | Δ vs reference | Δ 95 % interval | share of resamples improving | worst region Δχ² (region) |",

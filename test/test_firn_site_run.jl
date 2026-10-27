@@ -12,7 +12,8 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         kw = (; record_id = "s", latitude = 60.0, longitude = -150.0, elevation = 2000.0,
               date = DateTime(2008, 5, 1), accumulation = 500.0, depth = 12.0)
         @test FirnSite(; kw...).depth == 12.0
-        @test_throws "needs a positive measured accumulation" FirnSite(; kw..., accumulation = 0.0)
+        @test_throws "a measured accumulation must be positive" FirnSite(; kw..., accumulation = 0.0)
+        @test isnan(FirnSite(; Base.structdiff(kw, (; accumulation = 0))...).accumulation)
         @test_throws "has no elevation" FirnSite(; kw..., elevation = NaN)
         @test_throws "core depth must be positive" FirnSite(; kw..., depth = 0.0)
         @test_throws "latitude must be in [-90, 90]" FirnSite(; kw..., latitude = 91.0)
@@ -79,5 +80,28 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         @test_throws "outside the forcing" firn_site_run(
             FirnSite(; record_id = "late", latitude = 60.0, longitude = -150.0, elevation = 2000.0,
                      date = DateTime(2020, 1, 1), accumulation = 400.0, depth = 8.0), forcing, mp)
+    end
+
+    @testset "a site run without accumulation matching keeps the forcing's snowfall" begin
+        forcing = _firn_site_forcing()
+        mp = initialize_parameters(output_frequency = :monthly)
+        site = FirnSite(; record_id = "unmatched", latitude = 60.0, longitude = -150.0,
+                        elevation = 2000.0, date = DateTime(2009, 6, 15), depth = 8.0)
+        window = (DateTime(2000), DateTime(2003) - Hour(3))
+        @test_throws "has no measured accumulation to match" firn_site_run(site, forcing, mp;
+                                                                           spinup_window = window)
+        r = firn_site_run(site, forcing, mp; match_accumulation = false, spinup_window = window,
+                          simulation_years_maximum = 30)
+        @test r.precipitation_scaling == 1
+        # All of the forcing's 0.1 kg m-2 per 3 h falls as snow: 292.2 kg m-2 per 365.25-day year.
+        @test r.snowfall ≈ 0.1 * 8 * 365.25 rtol = 1e-3
+        @test sum(r.profile.dz) >= site.depth + GEMB_GlacierSims.FIRN_SITE_DEPTH_MARGIN
+        # A measured accumulation is ignored without matching: the run is the same.
+        r2 = firn_site_run(FirnSite(; record_id = "unmatched", latitude = 60.0, longitude = -150.0,
+                                    elevation = 2000.0, date = DateTime(2009, 6, 15),
+                                    accumulation = 400.0, depth = 8.0),
+                           forcing, mp; match_accumulation = false, spinup_window = window,
+                           simulation_years_maximum = 30)
+        @test r2.profile.density == r.profile.density
     end
 end

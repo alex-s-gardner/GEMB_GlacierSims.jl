@@ -9,6 +9,10 @@
 # without a site elevation is skipped with a message, since the forcing is lapsed to it. Passing
 # record ids restricts the run to those.
 #
+# `MATCH_ACCUMULATION=false` runs the end-to-end test instead: every usable record with a site
+# elevation, measured accumulation or not, on the forcing's own snowfall (`firn_site_run` with
+# `match_accumulation = false`). Each result records which test it belongs to in `match_accumulation`.
+#
 # Each site runs `firn_site_run` under the physics member `PHYSICS_MEMBER` (default
 # "S-kfit-table", the production snow set) with snowfall matched to the core's accumulation, from the
 # start of the ERA5-Land record to the drilling date. The forcing at the site is the production band
@@ -46,6 +50,10 @@ const OVERRIDES = let s = get(ENV, "MODEL_OVERRIDES", "(;)")
     v isa NamedTuple || error("MODEL_OVERRIDES must be a NamedTuple literal, got $s")
     v
 end
+const MATCH = let s = get(ENV, "MATCH_ACCUMULATION", "true")
+    s in ("true", "false") || error("MATCH_ACCUMULATION must be true or false, got $s")
+    s == "true"
+end
 const CACHE = joinpath(tempdir(), ".cache", "era5land")
 const RECORD_START = DateTime(1950, 1, 2)
 const SPINUP_WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
@@ -71,7 +79,8 @@ function fit_set(library)
         meta = TOML.parsefile(joinpath(ex, id, "meta.toml"))
         # A record holds only the sections its sources fill, as in the library's own scripts.
         acc = get(get(meta, "accumulation", Dict()), "mean_accumulation_kg_m2_yr", NaN)
-        (acc isa Real && isfinite(acc) && acc > 0) || continue
+        measured = acc isa Real && isfinite(acc) && acc > 0
+        MATCH && !measured && continue
         pos = meta["position"]
         elev = get(pos, "elevation_m", NaN)
         if !(elev isa Real && isfinite(elev))
@@ -80,7 +89,7 @@ function fit_set(library)
         end
         push!(sites, FirnSite(; record_id = id, latitude = pos["latitude"], longitude = pos["longitude"],
                               elevation = elev, date = core_date(meta["timing"]["date"]),
-                              accumulation = acc, depth = meta["density"]["max_depth_m"]))
+                              accumulation = measured ? acc : NaN, depth = meta["density"]["max_depth_m"]))
     end
     return sites, skipped
 end
@@ -117,7 +126,8 @@ function main()
     foreach(s -> println("skip ", s), skipped)
     results = isfile(OUTPUT) ? deserialize(OUTPUT) : Dict{String,Any}()
     todo = [s for s in sites if !haskey(results, s.record_id)]
-    println(length(sites), " sites in the fit set, ", length(todo), " to run, under ", MEMBER.id,
+    println(length(sites), MATCH ? " sites in the fit set, " : " sites, unmatched, ",
+            length(todo), " to run, under ", MEMBER.id,
             isempty(OVERRIDES) ? "" : " with $OVERRIDES", " on ", Threads.nthreads(), " threads")
     mp = GEMB.initialize_parameters(; MEMBER.model..., OVERRIDES...)
     MEMBER.wind_scaling == 1 && MEMBER.wind_correction === :scaling ||
@@ -153,10 +163,10 @@ function main()
                                  decoupling_factor_prior = shaw_decoupling_prior(c.tile.bounds),
                                  band_decoupling = MEMBER.band_rule,
                                  glacier_correction = DEFAULT_GLACIER_CORRECTION)
-            r = firn_site_run(site, forcing, mp; spinup_window = window, downscaling,
-                              glacier_fraction = c.glm)
+            r = firn_site_run(site, forcing, mp; match_accumulation = MATCH, spinup_window = window,
+                              downscaling, glacier_fraction = c.glm)
             merge(r, (; tile = c.name, downscaled = downscaling !== nothing, glm = c.glm,
-                      overrides = OVERRIDES))
+                      overrides = OVERRIDES, match_accumulation = MATCH))
         catch e
             e isa InterruptException && rethrow()
             (; error = sprint(showerror, e))

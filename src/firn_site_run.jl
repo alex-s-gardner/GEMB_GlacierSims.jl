@@ -2,14 +2,16 @@
 GEMB at a firn-core site, for testing densification physics against a measured density profile.
 
 A site run forces one GEMB column with the reanalysis grid point nearest the core, taken to the
-site's elevation by the production downscaling, and with precipitation scaled so the run's mean
-snowfall equals the accumulation measured at the core. The downscaling is the one a glacier band
+site's elevation by the production downscaling, and by default with precipitation scaled so the
+run's mean snowfall equals the accumulation measured at the core. The downscaling is the one a glacier band
 of the site's tile gets ([`site_downscaling`](@ref), [`site_forcing`](@ref)): the lapse rate fitted
 across the glacierized cells of the tile's buffered neighbourhood, the glacier correction of the
 site's own cell, and the decoupling factor at the site elevation. Matching accumulation takes the forcing's accumulation error out of the
 comparison: the Arthern-family rates scale with accumulation and the Crocus rate with the overburden
 it builds, so an accumulation error in the forcing would otherwise be fitted as a densification
-error. The run therefore tests the compaction physics, not the forcing.
+error. The run therefore tests the compaction physics, not the forcing. Without the matching
+(`match_accumulation = false`) the run takes the forcing's own accumulation, and tests forcing and
+physics together, as a production column has them.
 
 The column is spun up on a climatology of the forcing record, then run from the start of the record
 to the drilling date, and the profile on that date is returned for comparison with the core.
@@ -20,11 +22,11 @@ to the drilling date, and the profile on that date is returned for comparison wi
 const FIRN_SITE_DEPTH_MARGIN = 10.0
 
 """
-    FirnSite(; record_id, latitude, longitude, elevation, date, accumulation, depth)
+    FirnSite(; record_id, latitude, longitude, elevation, date, accumulation = NaN, depth)
 
 A firn-core site: `latitude`, `longitude` [degrees], site `elevation` [m], drilling `date`, the
-measured mean `accumulation` [kg m⁻² yr⁻¹] that a site run's snowfall is matched to, and the core's
-`depth` [m], which the modeled column must reach.
+measured mean `accumulation` [kg m⁻² yr⁻¹] that a site run's snowfall is matched to (`NaN` where the
+core has none), and the core's `depth` [m], which the modeled column must reach.
 """
 Base.@kwdef struct FirnSite
     record_id::String
@@ -32,15 +34,16 @@ Base.@kwdef struct FirnSite
     longitude::Float64
     elevation::Float64
     date::DateTime
-    accumulation::Float64
+    accumulation::Float64 = NaN
     depth::Float64
     function FirnSite(record_id, latitude, longitude, elevation, date, accumulation, depth)
         -90 <= latitude <= 90 || throw(ArgumentError("latitude must be in [-90, 90], got $latitude"))
         isfinite(longitude) || throw(ArgumentError("longitude must be finite, got $longitude"))
         isfinite(elevation) || throw(ArgumentError(
             "site $record_id has no elevation; a site run lapses the forcing to it"))
-        accumulation > 0 || throw(ArgumentError(
-            "site $record_id needs a positive measured accumulation to match, got $accumulation"))
+        isnan(accumulation) || accumulation > 0 || throw(ArgumentError(
+            "site $record_id: a measured accumulation must be positive, or NaN for none; got " *
+            "$accumulation"))
         depth > 0 || throw(ArgumentError("site $record_id: core depth must be positive, got $depth"))
         return new(record_id, latitude, longitude, elevation, date, accumulation, depth)
     end
@@ -125,8 +128,9 @@ With `downscaling` (from [`site_downscaling`](@ref), on the forcing's time axis)
 to the site by [`site_forcing`](@ref) with the cell's `glacier_fraction`. Without it, for a site whose
 tile has no glacierized cells to fit, it is lapsed from the grid point to `site.elevation` at the
 scalar `lapse_rate` [K km⁻¹] and left ambient. The record is then cut to one month past the drilling
-date, its precipitation scaled by [`site_snowfall_scaling`](@ref) over that span, and its impurity
-metadata set from `mp`. The
+date, its precipitation scaled by [`site_snowfall_scaling`](@ref) over that span to
+`site.accumulation` (with `match_accumulation = false` it is left unscaled, and `site.accumulation`
+is not used), and its impurity metadata set from `mp`. The
 column is at least `depth_minimum` deep (default `site.depth` plus
 $(FIRN_SITE_DEPTH_MARGIN) m), so the core lies inside it even where the column densifies more slowly
 than the steady state GEMB sizes it by. It is spun up on the `:representative` climatology of
@@ -136,14 +140,16 @@ simulated years, then run from the start of the forcing to `site.date`.
 
 Returns `(; site, profile, time, precipitation_scaling, snowfall, spinup)`: `profile` is the column on
 the last output time at or before `site.date` (`dz` [m], `density` [kg m⁻³], `temperature` [K],
-`water` [kg m⁻²], `age` [d], surface first); `time` is that output time; `snowfall` is the run's mean
-annual snowfall, equal to `site.accumulation`; `spinup` holds the spinup provenance (`cycles`,
+`water` [kg m⁻²], `age` [d], surface first); `time` is that output time; `precipitation_scaling` is
+the factor applied (1 without matching); `snowfall` is the run's mean annual snowfall, equal to
+`site.accumulation` when matched; `spinup` holds the spinup provenance (`cycles`,
 `converged`).
 
-Throws `ArgumentError` when the drilling date lies outside the forcing, and `ForcingUnavailable` when
-the forcing is incomplete.
+Throws `ArgumentError` when the drilling date lies outside the forcing or when matching a site that has
+no measured accumulation, and `ForcingUnavailable` when the forcing is incomplete.
 """
 function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
+                       match_accumulation::Bool = true,
                        downscaling = nothing,
                        glacier_fraction::Real = 0.0,
                        lapse_rate = _DEFAULT_LAPSE_RATE,
@@ -158,6 +164,9 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     first(times) < site.date <= last(times) || throw(ArgumentError(
         "site $(site.record_id) was drilled on $(site.date), outside the forcing " *
         "$(first(times)) .. $(last(times))"))
+    match_accumulation && isnan(site.accumulation) && throw(ArgumentError(
+        "site $(site.record_id) has no measured accumulation to match; run it with " *
+        "match_accumulation = false"))
 
     z_forcing = Float64(DimensionalData.metadata(forcing)["elevation"])
     downscaled = downscaling === nothing ?
@@ -166,7 +175,7 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     # The profile is read at the last monthly output at or before the drilling date, so the record
     # runs one month past it, and the accumulation is matched over that same span.
     lapsed = downscaled[Ti(first(times) .. min(last(times), site.date + Month(1)))]
-    scaling = site_snowfall_scaling(lapsed, site.accumulation, mp)
+    scaling = match_accumulation ? site_snowfall_scaling(lapsed, site.accumulation, mp) : 1.0
     adjusted = _with_impurity_metadata(precipitation_adjust(lapsed, scaling), mp)
 
     window = something(spinup_window, _default_spinup_window(adjusted))
