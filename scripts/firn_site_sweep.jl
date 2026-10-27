@@ -19,7 +19,10 @@
 # forcing: the site's tile resolved for one band at the site elevation (`site_downscaling`, with the
 # tile's Shaw et al. prior, the member's band decoupling and the production glacier correction),
 # applied to the site's own cell with its `glm` (`site_forcing`). A site whose tile holds no
-# glacierized cell, so has no fit, is lapsed at 6.5 K km-1 and left ambient, and says so in the log. The spinup climatology is 1951-1980, or the
+# glacierized cell, so has no fit, is lapsed at 6.5 K km-1 and left ambient, and says so in the log. A
+# record whose `position.ice_sheet` is set is forced the same way: ERA5-Land models the ice-sheet surface
+# itself, so its cell needs no glacier correction, and the glacier-band fit of a peripheral tile does
+# not apply to it. The spinup climatology is 1951-1980, or the
 # first 30 years of whatever record a site has. A date given only to the month is taken as its 15th,
 # and one given only to the year as 1 July.
 #
@@ -32,7 +35,9 @@
 # rewritten after each site, so an interrupted sweep keeps what it finished and a rerun skips those.
 #
 # Forcing is read serially (the Zarr cache is shared), then sites run in parallel across Julia
-# threads, one column per thread.
+# threads, one column per thread. With `FORCING_DIR` set, each site's raw forcing is read from
+# `<FORCING_DIR>/<record_id>.jls` instead, so a machine without the cache or CDS access runs the same
+# sites; `PREFETCH_FORCING=1` writes those files from the cache and exits without running GEMB.
 
 using GEMB_GlacierSims, GEMB, GEMB_ClimateForcing
 using Dates, Serialization, TOML, DelimitedFiles, DataFrames
@@ -54,7 +59,10 @@ const MATCH = let s = get(ENV, "MATCH_ACCUMULATION", "true")
     s in ("true", "false") || error("MATCH_ACCUMULATION must be true or false, got $s")
     s == "true"
 end
-const CACHE = joinpath(tempdir(), ".cache", "era5land")
+const CACHE = joinpath(get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land"), "cache")
+const FORCING_DIR = get(ENV, "FORCING_DIR", "")
+const PREFETCH = get(ENV, "PREFETCH_FORCING", "0") == "1"
+PREFETCH && isempty(FORCING_DIR) && error("PREFETCH_FORCING=1 needs FORCING_DIR")
 const RECORD_START = DateTime(1950, 1, 2)
 const SPINUP_WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
 
@@ -73,7 +81,7 @@ function fit_set(library)
     col(n) = findfirst(==(n), vec(header))
     usable = [table[i, col("record_id")] for i in axes(table, 1)
               if table[i, col("dir")] == "extracted" && table[i, col("usable")] == "yes"]
-    sites, skipped = FirnSite[], String[]
+    sites, skipped, ice_sheet = FirnSite[], String[], Set{String}()
     for id in usable
         isempty(ONLY) || id in ONLY || continue
         meta = TOML.parsefile(joinpath(ex, id, "meta.toml"))
@@ -87,15 +95,16 @@ function fit_set(library)
             push!(skipped, "$id: no site elevation")
             continue
         end
+        isempty(get(pos, "ice_sheet", "")) || push!(ice_sheet, id)
         push!(sites, FirnSite(; record_id = id, latitude = pos["latitude"], longitude = pos["longitude"],
                               elevation = elev, date = core_date(meta["timing"]["date"]),
                               accumulation = measured ? acc : NaN, depth = meta["density"]["max_depth_m"]))
     end
-    return sites, skipped
+    return sites, skipped, ice_sheet
 end
 
 # The site's ERA5-Land cell in the glacier elevation-class table, for its `glm`, and its 2° tile.
-function site_cells(sites)
+function site_cells(sites, ice_sheet)
     table = GeoDataFrames.read(joinpath(@__DIR__, "..", "data", "era5land_glacier_elevation_classes.parquet"))
     lon = GeoInterface.x.(table.geometry)
     lat = GeoInterface.y.(table.geometry)
@@ -108,8 +117,9 @@ function site_cells(sites)
         i = argmin(@. abs(lat - s.latitude) + abs(mod(lon - x + 180, 360) - 180))
         near = abs(lat[i] - s.latitude) <= 0.051 && abs(mod(lon[i] - x + 180, 360) - 180) <= 0.051
         name = tile_output_name(tile_index(s.longitude, s.latitude))
-        out[s.record_id] = (; glm = near ? GEMB_GlacierSims._row_glm(table[i, :]) : 0.0,
-                            tile = get(tiles, name, nothing), name)
+        sheet = s.record_id in ice_sheet
+        out[s.record_id] = (; glm = near && !sheet ? GEMB_GlacierSims._row_glm(table[i, :]) : 0.0,
+                            tile = sheet ? nothing : get(tiles, name, nothing), name = sheet ? "ice_sheet" : name)
     end
     return out
 end
@@ -121,9 +131,40 @@ function tile_file(name)
     return nothing
 end
 
+function read_forcing(site, token)
+    isempty(FORCING_DIR) || return deserialize(joinpath(FORCING_DIR, site.record_id * ".jls"))
+    return climate_forcing(:era5land, site.latitude, site.longitude;
+                           time_range = (RECORD_START, site.date + Month(2)), token, cache_path = CACHE)
+end
+
+function prefetch(sites)
+    mkpath(FORCING_DIR)
+    token = GEMB_ClimateForcing.get_cds_api_key()
+    n_fail = 0
+    for site in sites
+        path = joinpath(FORCING_DIR, site.record_id * ".jls")
+        isfile(path) && continue
+        try
+            f = climate_forcing(:era5land, site.latitude, site.longitude;
+                                time_range = (RECORD_START, site.date + Month(2)), token, cache_path = CACHE)
+            serialize(path * ".part", f)
+            mv(path * ".part", path)
+            println("prefetched ", site.record_id)
+        catch e
+            e isa InterruptException && rethrow()
+            n_fail += 1
+            println("FAILED ", site.record_id, ": ", first(sprint(showerror, e), 300))
+        end
+        flush(stdout)
+    end
+    println(length(sites), " sites, ", n_fail, " failed; forcing in ", FORCING_DIR)
+    n_fail == 0 || exit(1)
+end
+
 function main()
-    sites, skipped = fit_set(LIBRARY)
+    sites, skipped, ice_sheet = fit_set(LIBRARY)
     foreach(s -> println("skip ", s), skipped)
+    PREFETCH && return prefetch(sites)
     results = isfile(OUTPUT) ? deserialize(OUTPUT) : Dict{String,Any}()
     todo = [s for s in sites if !haskey(results, s.record_id)]
     println(length(sites), MATCH ? " sites in the fit set, " : " sites, unmatched, ",
@@ -132,13 +173,12 @@ function main()
     mp = GEMB.initialize_parameters(; MEMBER.model..., OVERRIDES...)
     MEMBER.wind_scaling == 1 && MEMBER.wind_correction === :scaling ||
         error("physics member $(MEMBER.id) corrects the wind, which a site run does not apply")
-    token = GEMB_ClimateForcing.get_cds_api_key()
-    cells = site_cells(todo)
+    token = isempty(FORCING_DIR) ? GEMB_ClimateForcing.get_cds_api_key() : nothing
+    cells = site_cells(todo, ice_sheet)
     forcings = Dict{String,Any}()
     for site in todo
         forcings[site.record_id] = try
-            climate_forcing(:era5land, site.latitude, site.longitude;
-                            time_range = (RECORD_START, site.date + Month(2)), token, cache_path = CACHE)
+            read_forcing(site, token)
         catch e
             e isa InterruptException && rethrow()
             (; error = sprint(showerror, e))
@@ -176,7 +216,8 @@ function main()
             serialize(OUTPUT, results)
             status = haskey(result, :error) ? "FAILED: " * first(result.error, 200) :
                      "spinup $(result.spinup.cycles) cycles, converged $(result.spinup.converged)" *
-                     (result.downscaled ? "" : ", no tile fit: lapsed at 6.5 K/km, ambient")
+                     (result.downscaled ? "" : result.tile == "ice_sheet" ?
+                      ", ice sheet: lapsed at 6.5 K/km, ambient" : ", no tile fit: lapsed at 6.5 K/km, ambient")
             println(rpad(site.record_id, 48), round(Int, time() - t0), " s  ", status)
             flush(stdout)
         end

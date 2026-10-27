@@ -23,8 +23,9 @@
 #   deviation per coordinate, capped at 3× the median weight; the accumulation is the reference run's
 #   mean snowfall, which is the core's measured accumulation when the runs match it;
 # - the objective is the weighted mean site χ². Against the reference, each configuration reports the
-#   bootstrap over sites (1,000 resamples) of the objective difference and, per RGI 7 o1 region (an
-#   ice-sheet site outside every region is its own region), the change in the region's mean χ², and
+#   bootstrap over sites (1,000 resamples) of the objective difference and, per RGI 7 o1 region (a
+#   record with `position.ice_sheet`, or an ice-sheet site outside every region, is in its ice sheet's
+#   region), the change in the region's mean χ², and
 #   whether every region stays within 1 + 2·s/√n of it (n the region's sites, s the robust spread,
 #   1.4826·MAD, of the configuration's site χ² changes).
 #
@@ -166,7 +167,9 @@ function climate_table()
                 for i in axes(t, 1))
 end
 
-function region_of(site)
+function region_of(site, meta)
+    sheet = get(meta["position"], "ice_sheet", "")
+    isempty(sheet) || return sheet == "greenland" ? "Greenland ice sheet" : "Antarctic ice sheet"
     try
         return rgi_o1_region(site.longitude, site.latitude)
     catch e
@@ -209,7 +212,7 @@ function main()
         g === nothing ? push!(groups, [id]) : push!(groups[g], id)
     end
     sites = [(; ids = g, acc = mean(runs[REFERENCE][i].snowfall for i in g),
-              T = clim[g[1]].T, melt = clim[g[1]].melt, region = region_of(runs[REFERENCE][g[1]].site))
+              T = clim[g[1]].T, melt = clim[g[1]].melt, region = region_of(runs[REFERENCE][g[1]].site, metas[g[1]]))
              for g in groups]
     w = site_weights(sites)
 
