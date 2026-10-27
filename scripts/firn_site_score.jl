@@ -24,7 +24,9 @@
 #   mean snowfall, which is the core's measured accumulation when the runs match it;
 # - the objective is the weighted mean site χ². Against the reference, each configuration reports the
 #   bootstrap over sites (1,000 resamples) of the objective difference and, per RGI 7 o1 region (an
-#   ice-sheet site outside every region is its own region), the change in the region's mean χ².
+#   ice-sheet site outside every region is its own region), the change in the region's mean χ², and
+#   whether every region stays within 1 + 2·s/√n of it (n the region's sites, s the robust spread,
+#   1.4826·MAD, of the configuration's site χ² changes).
 #
 # The runs are all of Test 1 (snowfall matched to the core) or all of Test 2 (end to end, the
 # forcing's own snowfall; `firn_site_sweep.jl` with `MATCH_ACCUMULATION=false`); a mix is refused.
@@ -237,18 +239,25 @@ function main()
     md = String["# Firn benchmark: $test", "",
                 "Reference `$REFERENCE`. $(length(ids)) cores at $(length(sites)) sites" *
                 (isempty(excluded) ? "" : "; excluded for depth reference `other`: $(join(excluded, ", "))") * ".",
-                "", "| configuration | objective | Δ vs reference | Δ 95 % interval | share of resamples improving | worst region Δχ² (region) |",
-                "|---|---|---|---|---|---|"]
+                "", "| configuration | objective | Δ vs reference | Δ 95 % interval | share of resamples improving | worst region Δχ² (region) | regions past 1 + 2·s/√n |",
+                "|---|---|---|---|---|---|---|"]
     ref = site_chi2[REFERENCE]
     for c in sort(configs; by = c -> objective(site_chi2[c], all_idx))
         v = site_chi2[c]
         Δ = [objective(v, b) - objective(ref, b) for b in boots]
-        reg = [(rg, mean(filter(isfinite, [v[i] - ref[i] for i in all_idx if sites[i].region == rg])))
-               for rg in regions]
-        worst = reg[argmax(last.(reg))]
-        push!(md, @sprintf("| `%s` | %.3f | %+.3f | %+.3f … %+.3f | %.3f | %+.2f (%s) |", c,
+        d = [v[i] - ref[i] for i in all_idx]
+        dd = filter(isfinite, d)
+        s = 1.4826 * median(abs.(dd .- median(dd)))
+        reg = map(regions) do rg
+            x = filter(isfinite, [d[i] for i in all_idx if sites[i].region == rg])
+            (rg, mean(x), 1 + 2 * s / sqrt(length(x)))
+        end
+        worst = reg[argmax(getindex.(reg, 2))]
+        past = [@sprintf("%s (%+.2f > %.2f)", r...) for r in reg if r[2] > r[3]]
+        push!(md, @sprintf("| `%s` | %.3f | %+.3f | %+.3f … %+.3f | %.3f | %+.2f (%s) | %s |", c,
                            objective(v, all_idx), objective(v, all_idx) - objective(ref, all_idx),
-                           quantile(Δ, 0.025), quantile(Δ, 0.975), mean(Δ .< 0), worst[2], worst[1]))
+                           quantile(Δ, 0.025), quantile(Δ, 0.975), mean(Δ .< 0), worst[2], worst[1],
+                           c == REFERENCE ? "" : isempty(past) ? "none" : join(past, ", ")))
     end
     push!(md, "", "Per-core metrics: `cores.tsv`. The seasonal-snow regression guard (plan §6.5) is run " *
               "separately on the finalists.")
