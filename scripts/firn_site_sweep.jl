@@ -185,7 +185,8 @@ function main()
     end
     forcings = isempty(FORCING_DIR) ? Dict(site.record_id => load(site) for site in todo) : nothing
     lock = ReentrantLock()
-    Threads.@threads for site in todo
+    # `:greedy` hands out one site at a time: site run times differ by more than tenfold.
+    Threads.@threads :greedy for site in todo
         t0 = time()
         forcing = forcings === nothing ? load(site) : forcings[site.record_id]
         result = forcing isa NamedTuple ? forcing : try
