@@ -53,7 +53,14 @@ const SIGMA_UNSTATED = 30.0
 const SIGMA_BIN_FLOOR = 10.0
 const N_BOOT = 1000
 
-function core_rows(id)
+# A core's rows, read once and kept: they do not depend on the configuration. Beside the rows it holds
+# them sorted by midpoint (`mid`, `ρ_mid`), as `core_density_at` reads them, and the core's own
+# horizon depths (`horizon`, keyed by density), which `horizon_pair` compares each run with.
+const CORE_CACHE = Dict{String,Any}()
+
+core_rows(id) = get!(() -> read_core_rows(id), CORE_CACHE, id)
+
+function read_core_rows(id)
     t, h = readdlm(joinpath(EX, id, "profile.csv"), ',', Any; header = true)
     c(n) = findfirst(==(n), vec(h))
     num(x) = x isa Real ? Float64(x) : (v = tryparse(Float64, string(x)); v === nothing ? NaN : v)
@@ -64,14 +71,20 @@ function core_rows(id)
     pt = bot .<= top .+ 1e-9
     top[pt] .-= 0.05; bot[pt] .+= 0.05
     top .= max.(top, 0.0)
-    return (; top = top[keep], bot = bot[keep], ρ = ρ[keep], reading = rs[keep], stated = ds[keep])
+    top, bot, ρ = top[keep], bot[keep], ρ[keep]
+    mid = (top .+ bot) ./ 2
+    s = sortperm(mid)
+    horizon = Dict(ρc => first_reach(mid[s], ρ[s], ρc) for ρc in (550.0, 830.0))
+    return (; top, bot, ρ, reading = rs[keep], stated = ds[keep], mid = mid[s], ρ_mid = ρ[s], horizon)
 end
 
-# Mean modeled density over [top, bottom]; NaN where the column does not reach.
-function model_mean(p, top, bot)
-    zb = cumsum(p.dz); zt = zb .- p.dz
+# Mean modeled density over [top, bottom]; NaN where the column does not reach. `zb` and `zt` are the
+# layer bottoms `cumsum(p.dz)` and tops `zb .- p.dz`; only the layers from the first whose bottom lies
+# below `top` can overlap the interval, and the rest add nothing.
+function model_mean(p, top, bot, zb = cumsum(p.dz), zt = zb .- p.dz)
     m = h = 0.0
-    for k in eachindex(p.dz)
+    for k in searchsortedfirst(zb, top):lastindex(p.dz)
+        zt[k] >= bot && break
         o = min(bot, zb[k]) - max(top, zt[k])
         o > 0 || continue
         m += o * p.density[k]; h += o
@@ -83,8 +96,7 @@ model_density_at(p, z) = (k = searchsortedfirst(cumsum(p.dz), z); k > length(p.d
 
 # Core density at depth `z` by linear interpolation between row midpoints, held flat beyond them.
 function core_density_at(o, z)
-    mid = (o.top .+ o.bot) ./ 2
-    p = sortperm(mid); mid, ρ = mid[p], o.ρ[p]
+    mid, ρ = o.mid, o.ρ_mid
     z <= first(mid) && return first(ρ)
     z >= last(mid) && return last(ρ)
     k = searchsortedlast(mid, z)
@@ -106,17 +118,31 @@ end
 const HORIZON_MINIMUM_DEPTH = 3.0
 
 function first_reach(z, ρ, ρc)
-    deeper = [median(@view ρ[i:end]) for i in eachindex(ρ)]
+    deeper = suffix_medians(ρ)
     k = findfirst(i -> z[i] >= HORIZON_MINIMUM_DEPTH && ρ[i] >= ρc && deeper[i] >= ρc, eachindex(z))
     k === nothing && return NaN
     (k == 1 || z[k - 1] < HORIZON_MINIMUM_DEPTH || ρ[k - 1] >= ρc) && return z[k]
     return z[k - 1] + (ρc - ρ[k - 1]) * (z[k] - z[k - 1]) / (ρ[k] - ρ[k - 1])
 end
 
+# `median(ρ[i:end])` for every `i`, as `Statistics.median` gives it (NaN when the suffix holds a NaN),
+# from one pass from the bottom that keeps the suffix sorted.
+function suffix_medians(ρ)
+    out = similar(ρ, Float64)
+    v = Float64[]; sizehint!(v, length(ρ))
+    n_nan = 0
+    for i in reverse(eachindex(ρ))
+        x = ρ[i]
+        isnan(x) ? (n_nan += 1) : insert!(v, searchsortedfirst(v, x), x)
+        n = length(v)
+        out[i] = n_nan > 0 ? NaN : isodd(n) ? v[(n + 1) ÷ 2] : Statistics.middle(v[n ÷ 2], v[n ÷ 2 + 1])
+    end
+    return out
+end
+
 # Model - core horizon depth [m], and the core's horizon depth, which scales its error.
 function horizon_pair(o, p, ρc)
-    mid = (o.top .+ o.bot) ./ 2; s = sortperm(mid)
-    zc = first_reach(mid[s], o.ρ[s], ρc)
+    zc = o.horizon[ρc]
     zm = first_reach(cumsum(p.dz) .- p.dz ./ 2, p.density, ρc)
     return zm - zc, zc
 end
@@ -131,7 +157,8 @@ end
 function core_metrics(id, r, meta)
     o = core_rows(id); p = r.profile
     σrow = row_sigma(o, get(get(meta, "density", Dict()), "method", ""))
-    mod = [model_mean(p, o.top[i], o.bot[i]) for i in eachindex(o.ρ)]
+    zb = cumsum(p.dz); zt = zb .- p.dz
+    mod = [model_mean(p, o.top[i], o.bot[i], zb, zt) for i in eachindex(o.ρ)]
     mid = (o.top .+ o.bot) ./ 2; w = o.bot .- o.top
     m = Dict{Symbol,Float64}(); z = Dict{Symbol,Float64}()
     for (j, (lo, hi)) in enumerate(BINS)
