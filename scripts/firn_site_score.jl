@@ -16,7 +16,8 @@
 #   the digitizing error, over √n rows, floored at 10 kg m-3; for the FAC and horizon metrics, where the
 #   registration states no σ_obs, σ_rep alone, which for a horizon is 0.35 of the core's horizon depth,
 #   at least 0.5 m. Rows flagged `suspect` and records whose depth reference
-#   is `other` are excluded;
+#   is `other` are excluded, as are the records listed in `EXCLUDE_RECORDS` (comma-separated
+#   record ids), which the summary names;
 # - χ² per core is the mean squared normalized residual; cores sharing an ERA5-Land cell and within
 #   100 m of elevation form one site, whose χ² is their mean; sites are weighted by the inverse of a
 #   Gaussian kernel density in (log accumulation, mean temperature, melt index), bandwidth one standard
@@ -229,7 +230,10 @@ function main()
            "Test 2 (end to end, the forcing's own snowfall)"
     metas = Dict(id => TOML.parsefile(joinpath(EX, id, "meta.toml")) for id in ids)
     excluded = [id for id in ids if get(metas[id]["timing"], "depth_reference", "") == "other"]
-    ids = setdiff(ids, excluded)
+    listed = filter(!isempty, split(get(ENV, "EXCLUDE_RECORDS", ""), ','))
+    unknown = setdiff(listed, ids)
+    isempty(unknown) || error("EXCLUDE_RECORDS names records with no run: $(join(unknown, ", "))")
+    ids = setdiff(ids, excluded, listed)
 
     # Sites: one ERA5-Land cell, elevation within 100 m.
     groups = Vector{Vector{String}}()
@@ -277,7 +281,8 @@ function main()
     regions = sort(unique(s.region for s in sites))
     md = String["# Firn benchmark: $test", "",
                 "Reference `$REFERENCE`. $(length(ids)) cores at $(length(sites)) sites" *
-                (isempty(excluded) ? "" : "; excluded for depth reference `other`: $(join(excluded, ", "))") * ".",
+                (isempty(excluded) ? "" : "; excluded for depth reference `other`: $(join(excluded, ", "))") *
+                (isempty(listed) ? "" : "; excluded by EXCLUDE_RECORDS: $(join(listed, ", "))") * ".",
                 "", "| configuration | objective | Δ vs reference | Δ 95 % interval | share of resamples improving | worst region Δχ² (region) | regions past 1 + 2·s/√n |",
                 "|---|---|---|---|---|---|---|"]
     ref = site_chi2[REFERENCE]
