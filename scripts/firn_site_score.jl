@@ -9,9 +9,11 @@
 # - per core: `bias_0_1`, `bias_1_5`, `bias_5_10`, `bias_10_20` (mean model - core over the core rows
 #   whose midpoint falls in the bin, given at least 1 m of sample; model density is the mean over each
 #   row's own interval), `fac10`, `fac20` (model - core firn air content over the core's span, when its
-#   rows cover 90 % of it), `z550`, `z830` (model - core depth of first reaching the density, when both
-#   do: the shallowest depth below 3 m from which the median of all deeper samples is past the
-#   density, so that an ice layer is not taken for the transition), `rmse` (reported only);
+#   rows cover 90 % of it), `z550`, `z830` (model - core depth of first reaching the density: the
+#   shallowest depth below 3 m from which the median of all deeper samples is past the density, so that
+#   an ice layer is not taken for the transition; where the core reaches it and the model column does
+#   not, the column depth stands for the model's, a lower bound on the error; `HORIZON_CENSORED=drop`
+#   scores only cores where both reach it), `rmse` (reported only);
 # - each residual divided by sqrt(σ_obs² + σ_rep²). σ_obs is the row error of the density method, plus
 #   the digitizing error, over √n rows, floored at 10 kg m-3; for the FAC and horizon metrics, where the
 #   registration states no σ_obs, σ_rep alone, which for a horizon is 0.35 of the core's horizon depth,
@@ -141,10 +143,16 @@ function suffix_medians(ρ)
     return out
 end
 
-# Model - core horizon depth [m], and the core's horizon depth, which scales its error.
+# Model - core horizon depth [m], and the core's horizon depth, which scales its error. Where the core
+# reaches `ρc` and the model column does not, the model horizon lies below the column, so its error is at
+# least the column's depth minus the core's horizon: that bound is the residual (`HORIZON_CENSORED`),
+# so a run cannot improve its score by never reaching a density the core reaches.
+const HORIZON_CENSORED = get(ENV, "HORIZON_CENSORED", "bound") == "bound"
+
 function horizon_pair(o, p, ρc)
     zc = o.horizon[ρc]
     zm = first_reach(cumsum(p.dz) .- p.dz ./ 2, p.density, ρc)
+    HORIZON_CENSORED && isfinite(zc) && isnan(zm) && (zm = sum(p.dz))
     return zm - zc, zc
 end
 
