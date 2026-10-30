@@ -21,6 +21,14 @@ to the drilling date, and the profile on that date is returned for comparison wi
 # and density, so the core must lie clear of it.
 const FIRN_SITE_DEPTH_MARGIN = 10.0
 
+# Shallowest site column [m]. The fixed-temperature bottom cell sets the firn temperature well above
+# it, so it must lie far below the 10 m firn temperature a site run is compared on.
+const FIRN_SITE_DEPTH_MINIMUM = 100.0
+
+# The column depth a site run asks for by default [m]: deep enough to hold the core with
+# `FIRN_SITE_DEPTH_MARGIN` to spare, and at least `FIRN_SITE_DEPTH_MINIMUM`.
+firn_site_depth_minimum(site) = max(FIRN_SITE_DEPTH_MINIMUM, site.depth + FIRN_SITE_DEPTH_MARGIN)
+
 """
     FirnSite(; record_id, latitude, longitude, elevation, date, accumulation = NaN, depth)
 
@@ -131,9 +139,10 @@ scalar `lapse_rate` [K km⁻¹] and left ambient. The record is then cut to one 
 date, its precipitation scaled by [`site_snowfall_scaling`](@ref) over that span to
 `site.accumulation` (with `match_accumulation = false` it is left unscaled, and `site.accumulation`
 is not used), and its impurity metadata set from `mp`. The
-column is at least `depth_minimum` deep (default `site.depth` plus
-$(FIRN_SITE_DEPTH_MARGIN) m), so the core lies inside it even where the column densifies more slowly
-than the steady state GEMB sizes it by. It is spun up on the `:representative` climatology of
+column is at least `depth_minimum` deep (default the larger of $(FIRN_SITE_DEPTH_MINIMUM) m and
+`site.depth` plus $(FIRN_SITE_DEPTH_MARGIN) m), so the core lies inside it even where the column
+densifies more slowly than the steady state GEMB sizes it by, and the fixed-temperature lower
+boundary lies far enough below 10 m not to set the firn temperature there. It is spun up on the `:representative` climatology of
 `spinup_window` (whole calendar years; default the first 30 of the record), to a firn-air-content
 drift below `convergence_drift_fac` m yr⁻¹ over `drift_window` cycles or `simulation_years_maximum`
 simulated years, then run from the start of the forcing to `site.date`.
@@ -157,7 +166,7 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
                        simulation_years_maximum::Real = 1000,
                        convergence_drift_fac = SPINUP_DRIFT_FAC,
                        drift_window::Int = SPINUP_DRIFT_WINDOW,
-                       depth_minimum::Real = site.depth + FIRN_SITE_DEPTH_MARGIN)
+                       depth_minimum::Real = firn_site_depth_minimum(site))
     forcing_is_complete(forcing) || throw(ForcingUnavailable(
         "forcing for site $(site.record_id) is incomplete (all-NaN or no reference elevation)"))
     times = lookup(forcing, Ti)

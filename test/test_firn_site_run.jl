@@ -69,7 +69,7 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
                           simulation_years_maximum = 30)
         @test r.time == DateTime(2009, 5, 31, 21)
         @test r.snowfall ≈ 400.0 rtol = 1e-10
-        @test sum(r.profile.dz) >= site.depth + GEMB_GlacierSims.FIRN_SITE_DEPTH_MARGIN
+        @test sum(r.profile.dz) >= GEMB_GlacierSims.firn_site_depth_minimum(site)
         @test r.spinup.cycles >= 1
         # Lapsed 200 m upward at 6.5 K km-1: the column is colder than the 258.15 K forcing.
         @test maximum(r.profile.temperature) < 258.15
@@ -95,7 +95,7 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         @test r.precipitation_scaling == 1
         # All of the forcing's 0.1 kg m-2 per 3 h falls as snow: 292.2 kg m-2 per 365.25-day year.
         @test r.snowfall ≈ 0.1 * 8 * 365.25 rtol = 1e-3
-        @test sum(r.profile.dz) >= site.depth + GEMB_GlacierSims.FIRN_SITE_DEPTH_MARGIN
+        @test sum(r.profile.dz) >= GEMB_GlacierSims.firn_site_depth_minimum(site)
         # A measured accumulation is ignored without matching: the run is the same.
         r2 = firn_site_run(FirnSite(; record_id = "unmatched", latitude = 60.0, longitude = -150.0,
                                     elevation = 2000.0, date = DateTime(2009, 6, 15),
