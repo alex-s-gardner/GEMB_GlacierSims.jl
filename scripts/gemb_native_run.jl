@@ -3,7 +3,7 @@
 #
 # Each cell's elevation bands are a GEMB column of their own, forced with that cell's forcing lapsed to
 # the band center and decoupled by its tile's downscaling (`gemb_native_cell`). The correction — the
-# precipitation scaling and temperature offset GlobalGlacierAnalysis.jl's `gemb_calibration` fitted per
+# precipitation scaling and temperature offset GlacierHydrology.jl's `gemb_calibration` fitted per
 # geotile against altimetry, over the (ΔT × pscale) grid of the tile sweep — is applied after the
 # downscaling, as it was in the runs it was fitted to. So this is the tile sweep at one perturbation
 # point per tile, with the cells run separately instead of averaged.
@@ -39,7 +39,7 @@
 # ERA5-Land record. The process exits with status 1 when any cell or tile it ran failed.
 #
 # Environment overrides:  NATIVE_BLOCKS, NATIVE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
-# FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GGA_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
+# FORCING_CORRECTIONS, REFERENCE_ENSEMBLE_FILE, GVC_PROJECT, REFERENCE_TILE_DIR, OUTPUT_DIR,
 # CORRECTION_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, UNIT_COLUMNS, DONOR_MAX_DISTANCE_KM,
 # PHYSICS_MEMBER and EFFECTIVE_LOADING_TABLE (see run_settings.jl), both matching the reference tile
 # sweep's
@@ -63,19 +63,19 @@ const CLIMATE_CACHE = get(ENV, "CLIMATE_CACHE", joinpath("/mnt/bylot-r3/data", s
 const PARAMETER_DIR = joinpath(CLIMATE_CACHE, "downscaling_parameters")
 const OUTPUT_DIR = get(ENV, "OUTPUT_DIR", joinpath(CLIMATE_CACHE, "native_runs", PHYSICS_MEMBER.id))
 
-# The calibration to apply: the `gemb_calibration` output of GlobalGlacierAnalysis.jl's reference
-# ensemble member. The member is the `reference_ensemble_file` its checkout declares (GGA_PROJECT, by
-# default the checkout beside this one), or REFERENCE_ENSEMBLE_FILE; FORCING_CORRECTIONS names the
-# correction file directly. Whichever is used must exist, or the run stops here. The member's fit is the
-# one GlobalGlacierAnalysis.jl made against this physics member's sweep.
-const GGA_PROJECT = get(ENV, "GGA_PROJECT",
-                        joinpath(dirname(dirname(@__DIR__)), "GlobalGlacierAnalysis.jl"))
+# The calibration to apply: GlacierHydrology.jl's `gemb_calibration` output for the reference ensemble
+# member of the volume dataset. The member is the `reference_ensemble_file` a GlacierVolumeChange.jl
+# checkout declares (GVC_PROJECT, by default the checkout beside this one), or REFERENCE_ENSEMBLE_FILE;
+# FORCING_CORRECTIONS names the correction file directly. Whichever is used must exist, or the run stops
+# here. The member's fit is the one GlacierHydrology.jl made against this physics member's sweep.
+const GVC_PROJECT = get(ENV, "GVC_PROJECT",
+                        joinpath(dirname(dirname(@__DIR__)), "GlacierVolumeChange.jl"))
 const FORCING_CORRECTIONS_SOURCE =
     haskey(ENV, "FORCING_CORRECTIONS") ? "ENV[FORCING_CORRECTIONS]" :
     haskey(ENV, "REFERENCE_ENSEMBLE_FILE") ? "ENV[REFERENCE_ENSEMBLE_FILE]" :
-    "reference member of $GGA_PROJECT"
+    "reference member of $GVC_PROJECT"
 const FORCING_CORRECTIONS = haskey(ENV, "FORCING_CORRECTIONS") ? ENV["FORCING_CORRECTIONS"] :
-    reference_forcing_corrections(get(() -> gga_reference_ensemble_file(GGA_PROJECT), ENV,
+    reference_forcing_corrections(get(() -> gvc_reference_ensemble_file(GVC_PROJECT), ENV,
                                       "REFERENCE_ENSEMBLE_FILE"); physics_member = PHYSICS_MEMBER.id)
 # The tile sweep that correction was fitted against, whose stored run parameters this run must match:
 # by default the directory the sweep writes for this physics member (`tile_run_dir`).

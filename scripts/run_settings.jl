@@ -15,7 +15,7 @@ const SHOW_SETTINGS = get(ENV, "SHOW_SETTINGS", "0") == "1"
 # The directory under `CLIMATE_CACHE` holding one directory of tile runs per physics member
 # (`tile_run_dir`), which the tile sweep writes by default and the native run takes its reference tile
 # runs from, so the two agree without either being told. `run_tile_sweep.sh` carries the same name. A
-# new name is a new set of tile runs: GlobalGlacierAnalysis.jl reads every file in the directory its
+# new name is a new set of tile runs: GlacierHydrology.jl reads every file in the directory its
 # GEMB run id and physics member name.
 const TILE_RUN_DIR = "tile_runs_v2"
 
