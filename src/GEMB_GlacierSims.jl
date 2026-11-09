@@ -167,7 +167,7 @@ include("forcing_corrections.jl")
 include("glacier_native_run.jl")
 export read_forcing_corrections, forcing_correction, native_cells, gemb_native_cell,
        native_cell_spinup_seed, native_tile_lost_area
-export reference_forcing_corrections, gga_reference_ensemble_file,
+export reference_forcing_corrections, gvc_reference_ensemble_file,
        forcing_corrections_provenance_path, assert_corrections_fitted_on
 
 # GEMB at a firn-core site with snowfall matched to the core's accumulation, for densification tests.

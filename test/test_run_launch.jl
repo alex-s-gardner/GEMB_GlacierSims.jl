@@ -476,18 +476,19 @@ end
 end
 
 @testset "run launch: native corrections come from the reference member and its sweep" begin
-    # The reference member GlobalGlacierAnalysis.jl declares, read from its source.
-    gga = mktempdir()
-    mkpath(joinpath(gga, "src"))
+    # The reference member GlacierVolumeChange.jl declares, read from its source.
+    gvc = mktempdir()
+    ensemble_jl = joinpath(gvc, "src", "config", "ensemble.jl")
+    mkpath(dirname(ensemble_jl))
     binned = mktempdir()
     member = joinpath(binned, "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_aligned.jld2")
-    write(joinpath(gga, "src", "utilities_project.jl"), """
-        const δice = 917;
-        const reference_ensemble_file = "$member";
-        function project_products(; project_id = :v01) end
+    write(ensemble_jl, """
+        # Ensemble membership: fill sets, surface masks and the reference member.
+        const reference_ensemble_file = "$member"; 
+        function ensemble_members(config) end
         """)
-    @test gga_reference_ensemble_file(gga) == member
-    # Its `gemb_calibration` output, named as GlobalGlacierAnalysis.jl names it.
+    @test gvc_reference_ensemble_file(gvc) == member
+    # Its `gemb_calibration` output, named as GlacierHydrology.jl names it.
     @test_throws "no `gemb_calibration` output for the reference ensemble member" reference_forcing_corrections(member)
     fit_name = "glacier_rgi7_dh_cop30_v2_cc_nmad5_v01_filled_ac_p6_synthesized_gembfit.arrow"
     beside = touch(joinpath(binned, fit_name))
@@ -507,11 +508,11 @@ end
     touch(fit)
     @test reference_forcing_corrections(member; physics_member = default) == fit
     @test_throws "is not an `…_aligned.jld2` file" reference_forcing_corrections(joinpath(binned, "x.jld2"))
-    @test_throws "no GlobalGlacierAnalysis.jl source" gga_reference_ensemble_file(mktempdir())
-    write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = joinpath(\"a\", \"b\")\n")
-    @test_throws "not a string literal" gga_reference_ensemble_file(gga)
-    write(joinpath(gga, "src", "utilities_project.jl"), "const x = 1\n")
-    @test_throws "declares `reference_ensemble_file` 0 times" gga_reference_ensemble_file(gga)
+    @test_throws "no GlacierVolumeChange.jl source" gvc_reference_ensemble_file(mktempdir())
+    write(ensemble_jl, "const reference_ensemble_file = joinpath(\"a\", \"b\")\n")
+    @test_throws "not a string literal" gvc_reference_ensemble_file(gvc)
+    write(ensemble_jl, "const x = 1\n")
+    @test_throws "declares `reference_ensemble_file` 0 times" gvc_reference_ensemble_file(gvc)
 
     # The provenance of the fit: the directory of tile runs it read, and their source trees.
     sweep = mktempdir()
@@ -564,14 +565,14 @@ end
                    read(joinpath(_REPO, "scripts", "run_tile_sweep.sh"), String))
 
     # The native script's settings pass takes the corrections from the reference member, and stops when
-    # the member's GlobalGlacierAnalysis.jl checkout cannot be found.
-    write(joinpath(gga, "src", "utilities_project.jl"), "const reference_ensemble_file = \"$member\"\n")
+    # the GlacierVolumeChange.jl checkout that declares the member cannot be found.
+    write(ensemble_jl, "const reference_ensemble_file = \"$member\"\n")
     climate = mktempdir()
     mv(_production_fixture(), joinpath(climate, "cache"))
-    native(gga_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
+    native(gvc_dir) = addenv(`$(Base.julia_cmd()) --project=$_REPO --startup-file=no
                               $(joinpath(_REPO, "scripts", "gemb_native_run.jl"))`,
-                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GGA_PROJECT" => gga_dir)
-    out = read(native(gga), String)
+                             "CLIMATE_CACHE" => climate, "SHOW_SETTINGS" => "1", "GVC_PROJECT" => gvc_dir)
+    out = read(native(gvc), String)
     @test occursin("1950-01-02 .. 2026-08-14T23:00", out)       # the whole cached record
     @test occursin(r"spinup climatology +1951-01-01 \.\. 1980-12-31T23:00", out)
     @test occursin(fit, out)
@@ -579,7 +580,7 @@ end
     @test occursin(Regex("physics member +" * default), out)
     err = IOBuffer()
     @test !success(pipeline(native(mktempdir()); stdout = devnull, stderr = err))
-    @test occursin("no GlobalGlacierAnalysis.jl source", String(take!(err)))
+    @test occursin("no GlacierVolumeChange.jl source", String(take!(err)))
 end
 
 @testset "run launch: a native tile over the lost-ice rule fails every launch" begin

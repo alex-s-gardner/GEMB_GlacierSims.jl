@@ -1,6 +1,6 @@
 """
 Calibrated forcing corrections: the precipitation scaling and temperature offset fitted per 2° geotile
-by GlobalGlacierAnalysis.jl's `gemb_calibration`, looked up for the cells a native-resolution run
+by GlacierHydrology.jl's `gemb_calibration`, looked up for the cells a native-resolution run
 covers.
 
 The fit is made against tile runs ([`gemb_glacier_tile`](@ref)) over a (ΔT × pscale) grid, so a
@@ -102,9 +102,9 @@ end
 """
     reference_forcing_corrections(reference_ensemble_file; physics_member = nothing) -> String
 
-The `gemb_calibration` output GlobalGlacierAnalysis.jl writes for the ensemble member whose aligned
+The `gemb_calibration` output GlacierHydrology.jl writes for the ensemble member whose aligned
 binned file is `reference_ensemble_file` (`…_aligned.jld2`): `…_synthesized_gembfit.arrow` beside it.
-GlobalGlacierAnalysis.jl names the synthesized file by replacing `aligned.jld2` with `synthesized.jld2`
+GlacierHydrology.jl names the synthesized file by replacing `aligned.jld2` with `synthesized.jld2`
 and its fit by replacing `.jld2` with `_gembfit.arrow`. A fit against a physics member's sweep is
 written to `gemb_physics/<member>/` under the same directory, with the same name; `physics_member` is
 that member's id. Throws when the name does not end in `_aligned.jld2` or the file does not exist.
@@ -124,17 +124,17 @@ function reference_forcing_corrections(reference_ensemble_file::AbstractString;
 end
 
 """
-    gga_reference_ensemble_file(gga_dir) -> String
+    gvc_reference_ensemble_file(gvc_dir) -> String
 
-The reference ensemble member that the GlobalGlacierAnalysis.jl checkout at `gga_dir` declares, read
-from the `const reference_ensemble_file = "…"` in its `src/utilities_project.jl` without loading that
+The reference ensemble member that the GlacierVolumeChange.jl checkout at `gvc_dir` declares, read
+from the `const reference_ensemble_file = "…"` in its `src/config/ensemble.jl` without loading that
 package. Throws unless the file declares it exactly once, as a string literal.
 """
-function gga_reference_ensemble_file(gga_dir::AbstractString)
-    path = joinpath(gga_dir, "src", "utilities_project.jl")
+function gvc_reference_ensemble_file(gvc_dir::AbstractString)
+    path = joinpath(gvc_dir, "src", "config", "ensemble.jl")
     isfile(path) || throw(ArgumentError(
-        "no GlobalGlacierAnalysis.jl source at $path, so the reference ensemble member is unknown; " *
-        "set GGA_PROJECT to its checkout, or REFERENCE_ENSEMBLE_FILE or FORCING_CORRECTIONS"))
+        "no GlacierVolumeChange.jl source at $path, so the reference ensemble member is unknown; " *
+        "set GVC_PROJECT to its checkout, or REFERENCE_ENSEMBLE_FILE or FORCING_CORRECTIONS"))
     found = Any[]
     _find_const_assignments!(found, Meta.parseall(read(path, String); filename = path),
                              :reference_ensemble_file)
@@ -142,7 +142,7 @@ function gga_reference_ensemble_file(gga_dir::AbstractString)
         "$path declares `reference_ensemble_file` $(length(found)) times; expected once"))
     only(found) isa String || throw(ArgumentError(
         "`reference_ensemble_file` in $path is not a string literal, so it cannot be read without " *
-        "loading GlobalGlacierAnalysis.jl; set REFERENCE_ENSEMBLE_FILE"))
+        "loading GlacierVolumeChange.jl; set REFERENCE_ENSEMBLE_FILE"))
     return only(found)
 end
 
