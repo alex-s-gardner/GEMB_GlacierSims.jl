@@ -34,7 +34,7 @@
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
 # OUTPUT_DIR and join them on with `merge_tile_perturbations`; the existing points are not re-run.
 #
-# Sizing: a 60-band tile over the 10x10 grid is 6,000 simulations, and one simulation is the spinup plus
+# Sizing: a 60-band tile over the 9 × 11 grid is 5,940 simulations, and one simulation is the spinup plus
 # the transient. Both scale with the record: over a 7-year record a simulation was about 10 s, and the
 # full ERA5-Land record is eleven times longer with a `:representative` spinup costing about 2.2x the
 # model-years of an averaged one. Measure with a TILE_LIMIT or TILE_NAMES subset before committing to a
@@ -74,11 +74,13 @@ const FORCING_RECORD = era5_land_record_span(joinpath(CLIMATE_CACHE, "cache"))
 const RUN_TIME = run_time_range(ARGS, FORCING_RECORD)
 const TIME_RANGE = RUN_TIME.time_range
 
-# The perturbation grid the downstream fit searches. Both axes are dense near their identity and sparse
-# at the extremes: the optimum is expected close to 1.0 / 0 K, so resolution matters there, while the
-# far points exist to bracket it and to show the response is monotonic. The fit interpolates linearly
-# between nodes across a concave response, and most fitted scalings land between 1.5 and 4, so that
-# span carries nodes at every 0.5.
+# The perturbation grid the downstream fit searches: 9 precipitation scalings × 11 temperature offsets.
+# The fit interpolates linearly between nodes, so node spacing sets its error. In a perfect-model test
+# against a dense 14 × 19 sweep on four tiles (Alps, Iceland, Arctic Canada, Alaska), fitting each target
+# with only these nodes gives accumulation and runoff errors of p95 ≈ 2 % and area-weighted bias ≈ +0.5 %,
+# runoff measured relative to accumulation. Wider spacing fails the bias limit of 1 %. The temperature
+# axis is what matters: runoff on cold tiles rises steeply between −1 and +2 K, so that span carries a
+# node every 0.5–1 K, while thinning the scaling axis costs little.
 #
 # `1.0` and `0.0` must be present, except under `SUPPLEMENTARY`. They are the baseline the reports and
 # the reference discharge locate with `findfirst`, and a grid without them silently loses both.
@@ -87,10 +89,10 @@ const TIME_RANGE = RUN_TIME.time_range
 # they are what a re-run reproduces, and they are in git.
 const PRECIPITATION_SCALINGS = haskey(ENV, "PRECIPITATION_SCALINGS") ?
     parse.(Float64, split(ENV["PRECIPITATION_SCALINGS"], ",")) :
-    [0.25, 0.75, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
+    [0.25, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
 const DELTA_TEMPERATURES = haskey(ENV, "DELTA_TEMPERATURES") ?
     parse.(Float64, split(ENV["DELTA_TEMPERATURES"], ",")) :
-    [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0, 4.0, 5.0, 6.0]
+    [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
 # Ceiling on the spinup, not the convergence test: bands exit on the drift criterion well inside this on
 # glacier firn, so the ceiling only binds on an outlier. A column that reaches it is kept and counted
