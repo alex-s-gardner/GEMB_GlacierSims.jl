@@ -29,6 +29,10 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
+[sources]
+GEMB = {rev = "main", url = "https://github.com/alex-s-gardner/GEMB.jl"}
+GEMB_ClimateForcing = {rev = "main", url = "https://github.com/alex-s-gardner/GEMB_ClimateForcing.jl"}
+
 [compat]
 CairoMakie = "0.15.13"
 CodecZlib = "0.7"
@@ -36,7 +40,7 @@ ConstructionBase = "1"
 DataFrames = "1.8.2"
 DimensionalData = "0.30"
 Extents = "0.1.6"
-GEMB = "1.9.9, 2"
+GEMB = "1.10"
 GEMB_ClimateForcing = "0.1.0"
 GeoDataFrames = "0.4.3"
 GeoInterface = "1.6.2"

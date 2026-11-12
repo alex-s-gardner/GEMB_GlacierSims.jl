@@ -59,7 +59,7 @@ end
 _old_default_parameters(; kwargs...) = initialize_parameters(;
     densification_method = :Arthern, new_snow_method = :Constant350,
     grain_growth_method = :hybrid, destructive_metamorphism = false,
-    destructive_metamorphism_density = 175.0, kwargs...)
+    destructive_metamorphism_density = 175.0, GEMB_GlacierSims._NO_WIND_PACKING..., kwargs...)
 
 @testset "physics members" begin
     @testset "the registry" begin
@@ -69,7 +69,8 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
         @test m.model == (; grain_growth_method = :FlannerZender2006,
                           new_snow_method = :vanKampenhout2017, densification_method = :Crocus,
                           destructive_metamorphism = true, blowing_snow_method = :none,
-                          drift_fetch_length = 10.0, new_snow_density = 350.0,
+                          drift_fetch_length = 10.0, redeposition_temperature_taper = false,
+                          new_snow_density = 350.0,
                           destructive_metamorphism_density = 175.0)
         # D1 is C with Keenan et al. (2021) wind packing at a 10 m fetch, and nothing else.
         d1 = physics_member("D1-kfit-table")
@@ -142,16 +143,13 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
                 @test getproperty(mp, field) == value
             end
         end
-        # S is the GEMB default snow configuration; A matches `GEMB` run with hybrid grain growth,
-        # constant 350 kg m-3 fresh snow and Arthern densification.
+        # S is the GEMB default snow configuration, wind packing included; A matches `GEMB` run
+        # with hybrid grain growth, constant 350 kg m-3 fresh snow, Arthern densification and no
+        # wind packing.
         default = initialize_parameters()
         @test all(getproperty(default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.S.model))
-        old_default = initialize_parameters(; densification_method = :Arthern,
-                                            new_snow_method = :Constant350,
-                                            grain_growth_method = :hybrid,
-                                            destructive_metamorphism = false,
-                                            destructive_metamorphism_density = 175.0)
-        @test all(getproperty(old_default, f) == v for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.A.model))
+        @test all(getproperty(_old_default_parameters(), f) == v
+                  for (f, v) in pairs(PHYSICS_GRAIN_VARIANTS.A.model))
         @test_throws "physics member B-kfit-bc0 sets grain_growth_method; remove it from the keywords" physics_model_parameters(
             physics_member("B-kfit-bc0"); grain_growth_method = :hybrid)
         @test_throws "physics member D1-kfit-table sets blowing_snow_method" physics_model_parameters(
