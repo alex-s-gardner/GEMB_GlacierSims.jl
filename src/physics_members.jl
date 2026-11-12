@@ -1,3 +1,8 @@
+# The wind fields of a level without wind packing: `:none`, with the fetch and taper `D1` runs
+# at, so every level fixes the same fields.
+const _NO_WIND_PACKING = (; blowing_snow_method = :none, drift_fetch_length = 10.0,
+                          redeposition_temperature_taper = false)
+
 # A level with Flanner & Zender (2006) grain growth, the `B` (`:Arthern`) or `C` (`:Crocus` with
 # destructive metamorphism) settling, and a constant fresh-snow density `ρ` [kg m-3].
 function _constant_snow_level(settling::String, ρ::Float64)
@@ -8,7 +13,7 @@ function _constant_snow_level(settling::String, ρ::Float64)
             "Crocus densification with destructive metamorphism"
     return (; description = "Flanner & Zender (2006) grain growth; $(Int(ρ)) kg m-3 fresh snow; $words",
             model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :Constant,
-                     settle..., blowing_snow_method = :none, drift_fetch_length = 10.0,
+                     settle..., _NO_WIND_PACKING...,
                      new_snow_density = ρ, destructive_metamorphism_density = 175.0))
 end
 
@@ -50,10 +55,12 @@ each sets:
 - `C`: Flanner & Zender (2006) grain growth with van Kampenhout et al. (2017) fresh-snow density,
   `:Crocus` densification and destructive metamorphism, the pairing GEMB documents for that density;
 - `D1`: `C` with the Keenan et al. (2021) erosion–redeposition packing (`blowing_snow_method =
-  :Keenan2021`) at a fetch length of 10 m (`drift_fetch_length`, their eq. 3);
-- `S`: GEMB's default snow set, calibrated on SNOTEL seasonal snow: `C` with the fresh-snow
-  temperature term refitted (`new_snow_method = :vanKampenhout2017SNOTEL`) and destructive
-  metamorphism tapering above 100 kg m⁻³ (`destructive_metamorphism_density`);
+  :Keenan2021`) as they ran it, at a fetch length of 10 m (`drift_fetch_length`, their eq. 3) and
+  without the temperature taper;
+- `S`: GEMB's default snow set: `C` with the fresh-snow temperature term refitted on SNOTEL seasonal
+  snow (`new_snow_method = :vanKampenhout2017SNOTEL`), destructive metamorphism tapering above
+  100 kg m⁻³ (`destructive_metamorphism_density`), and GEMB's default wind packing
+  (`GEMB.CROCUS_FIRN_WIND_PACKING`), which the GEMB firn calibration was made with;
 - `B250`, `B300`: `B` with a constant fresh-snow density of 250 or 300 kg m⁻³
   (`new_snow_method = :Constant`, `new_snow_density`);
 - `C250`, `C300`, `C350`: `C`'s settling (`:Crocus` densification with destructive metamorphism)
@@ -61,9 +68,9 @@ each sets:
 
 The letter of a level names its settling (`B`: `:Arthern` without destructive metamorphism; `C`:
 `:Crocus` with it) and the number its constant deposition density. Levels without wind packing run
-`blowing_snow_method = :none`, under which `drift_fetch_length` is not read and is held at GEMB's
-default, and levels whose fresh snow is not `:Constant` hold `new_snow_density`, which only `:Constant`
-reads, at GEMB's default; so every level fixes the same fields. Every level but `S` sets
+`blowing_snow_method = :none` (`_NO_WIND_PACKING`), and levels whose fresh snow is not `:Constant`
+hold `new_snow_density`, which only `:Constant` reads, at GEMB's default; so every level fixes the
+same fields. Every level but `S` sets
 `destructive_metamorphism_density` to 175 kg m⁻³, the value the A–D and constant-density levels were
 run with, whether or not it reads it.
 """
@@ -71,33 +78,34 @@ const PHYSICS_GRAIN_VARIANTS = (
     A = (; description = "hybrid grain growth; 350 kg m-3 fresh snow; Arthern densification",
          model = (; grain_growth_method = :hybrid, new_snow_method = :Constant350,
                   densification_method = :Arthern, destructive_metamorphism = false,
-                  blowing_snow_method = :none, drift_fetch_length = 10.0,
+                  _NO_WIND_PACKING...,
                   new_snow_density = 350.0, destructive_metamorphism_density = 175.0)),
     B = (; description = "Flanner & Zender (2006) grain growth; 350 kg m-3 fresh snow; " *
                          "Arthern densification",
          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :Constant350,
                   densification_method = :Arthern, destructive_metamorphism = false,
-                  blowing_snow_method = :none, drift_fetch_length = 10.0,
+                  _NO_WIND_PACKING...,
                   new_snow_density = 350.0, destructive_metamorphism_density = 175.0)),
     C = (; description = "Flanner & Zender (2006) grain growth; van Kampenhout et al. (2017) " *
                          "fresh snow; Crocus densification with destructive metamorphism",
          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017,
                   densification_method = :Crocus, destructive_metamorphism = true,
-                  blowing_snow_method = :none, drift_fetch_length = 10.0,
+                  _NO_WIND_PACKING...,
                   new_snow_density = 350.0, destructive_metamorphism_density = 175.0)),
     D1 = (; description = "Flanner & Zender (2006) grain growth; van Kampenhout et al. (2017) " *
                           "fresh snow; Crocus densification with destructive metamorphism; " *
                           "Keenan et al. (2021) wind packing, 10 m fetch",
           model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017,
                    densification_method = :Crocus, destructive_metamorphism = true,
-                   blowing_snow_method = :Keenan2021, drift_fetch_length = 10.0,
+                   _NO_WIND_PACKING..., blowing_snow_method = :Keenan2021,
                    new_snow_density = 350.0, destructive_metamorphism_density = 175.0)),
     S = (; description = "Flanner & Zender (2006) grain growth; SNOTEL-calibrated van Kampenhout " *
                          "et al. (2017) fresh snow; Crocus densification with destructive " *
-                         "metamorphism at 100 kg m-3",
+                         "metamorphism at 100 kg m-3; Keenan et al. (2021) wind packing with the " *
+                         "Walter et al. (2024) temperature taper, 250 m fetch",
          model = (; grain_growth_method = :FlannerZender2006, new_snow_method = :vanKampenhout2017SNOTEL,
                   densification_method = :Crocus, destructive_metamorphism = true,
-                  blowing_snow_method = :none, drift_fetch_length = 10.0,
+                  GEMB.CROCUS_FIRN_WIND_PACKING...,
                   new_snow_density = 350.0, destructive_metamorphism_density = 100.0)),
     B250 = _constant_snow_level("B", 250.0),
     B300 = _constant_snow_level("B", 300.0),
