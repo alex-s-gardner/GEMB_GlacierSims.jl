@@ -1,6 +1,6 @@
 name = "GEMB_GlacierSims"
 uuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Alex Gardner"]
 
 [deps]
@@ -51,7 +51,7 @@ NCDatasets = "0.14.15"
 ProgressMeter = "1.11.0"
 Proj = "1.9.0"
 Rasters = "0.15.0"
-SHA = "0.7"
+SHA = "0.7, 1"
 SortTileRecursiveTree = "0.1.4"
 TOML = "1"
 Tables = "1.13.0"
