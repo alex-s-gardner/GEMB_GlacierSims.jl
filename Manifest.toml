@@ -2,7 +2,7 @@
 
 julia_version = "1.13.0"
 manifest_format = "2.1"
-project_hash = "f040de8d1404c9167c8de349bb72e9fd3d4dbdfd"
+project_hash = "a7c2cf3e8f1ce13d769e3cd7cd70849c2f05bb8e"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -956,7 +956,7 @@ version = "0.1.1"
 deps = ["CairoMakie", "CodecZlib", "ConstructionBase", "DataFrames", "Dates", "DimensionalData", "Extents", "GEMB", "GEMB_ClimateForcing", "GeoDataFrames", "GeoInterface", "GeoParquet", "GeometryOps", "Makie", "NCDatasets", "ProgressMeter", "Proj", "Rasters", "SHA", "SortTileRecursiveTree", "Statistics", "TOML", "Tables", "Zarr"]
 path = "."
 uuid = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
-version = "0.1.1"
+version = "0.1.2"
 
 [[deps.GEOS_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
