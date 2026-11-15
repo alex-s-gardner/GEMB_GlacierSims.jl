@@ -653,7 +653,7 @@ end
 
 @testset "pipeline audit: intervals without band forcing" begin
     # The tile holds 99.5 km² at 1050 m, which has a band, and 0.5 km² at 1150 m, which does not —
-    # an interval `elevation_interval_forcing` dropped. 0.5 % of the tile's ice is under the 1 %
+    # an interval `elevation_interval_forcing` dropped. 0.5 % of the tile's ice is under the 10 %
     # default: the tile runs, and the interval is counted with its area and written to the file.
     forcing = _tiny_band_forcing()
     run = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 99.5), (1150, 0.5)],
@@ -675,13 +675,20 @@ end
     @test status.band_edges == [(1000.0, 1100.0)]
     @test status.lost_area_km2 ≈ 0.5
 
-    # 2 km² of 100 is above the 1 % default, so the tile is refused before any GEMB run; a looser
-    # stated fraction admits it.
+    # 12 km² of 100 is above the 10 % default, so the tile is refused before any GEMB run; a looser
+    # stated fraction admits it. 2 km² of 100 runs under the default and is refused by a stricter one.
+    @test_throws "above the 10.0 % allowed by `lost_area_fraction_maximum`" _tiny_tile_run(
+        [0.4]; forcing, core_bins = [(1050, 88.0), (1150, 12.0)], extra_edges = [(1100, 1200)])
+    loose = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 88.0), (1150, 12.0)],
+                           extra_edges = [(1100, 1200)], lost_area_fraction_maximum = 0.15)
+    @test loose.provenance["intervals_without_forcing_area_km2"] ≈ 12.0
+    default = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)],
+                             extra_edges = [(1100, 1200)])
+    @test default.provenance["intervals_without_forcing_area_km2"] ≈ 2.0
+    @test default.provenance["lost_area_fraction_maximum"] == LOST_AREA_FRACTION_MAXIMUM
     @test_throws "above the 1.0 % allowed by `lost_area_fraction_maximum`" _tiny_tile_run(
-        [0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)], extra_edges = [(1100, 1200)])
-    loose = _tiny_tile_run([0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)],
-                           extra_edges = [(1100, 1200)], lost_area_fraction_maximum = 0.05)
-    @test loose.provenance["intervals_without_forcing_area_km2"] ≈ 2.0
+        [0.4]; forcing, core_bins = [(1050, 98.0), (1150, 2.0)], extra_edges = [(1100, 1200)],
+        lost_area_fraction_maximum = 0.01)
     @test_throws "lost_area_fraction_maximum must be in [0, 1]" _tiny_tile_run(
         [0.4]; forcing, lost_area_fraction_maximum = 1.5)
 
@@ -715,14 +722,14 @@ end
     warm = _tiny_band_forcing()
     cold = _tiny_band_forcing(; temperature = 200.0)
 
-    # Spec 2: the cold band holds 2 % of the tile's ice and fails validation against a grid reaching
-    # -30 K. That is ice the run would not model, so the 1 % rule refuses the tile before any GEMB run.
-    @test_throws "above the 1.0 % allowed by `lost_area_fraction_maximum`" _accounting_tile_run(
-        [(1050, 98.0, 0.0, warm), (1150, 2.0, 0.0, cold)]; core_bins = [(1050, 98.0), (1150, 2.0)],
+    # Spec 2: the cold band holds 12 % of the tile's ice and fails validation against a grid reaching
+    # -30 K. That is ice the run would not model, so the 10 % rule refuses the tile before any GEMB run.
+    @test_throws "above the 10.0 % allowed by `lost_area_fraction_maximum`" _accounting_tile_run(
+        [(1050, 88.0, 0.0, warm), (1150, 12.0, 0.0, cold)]; core_bins = [(1050, 88.0), (1150, 12.0)],
         validation_grid = ([-30.0], [1.0]))
-    # So does 2 % of the ice left unrecovered inside a modelled band.
-    @test_throws "unrecovered inside modelled bands: 2.0 km²" _accounting_tile_run(
-        [(1050, 98.0, 2.0, warm)]; core_bins = [(1050, 100.0)])
+    # So does 12 % of the ice left unrecovered inside a modelled band.
+    @test_throws "unrecovered inside modelled bands: 12.0 km²" _accounting_tile_run(
+        [(1050, 88.0, 12.0, warm)]; core_bins = [(1050, 100.0)])
 
     # The hypsometry identity, with every kind of loss at once. The tile holds 10 km² at 1050 m, of
     # which 1 km² no cell could force; 5 km² at 1150 m, a band of 3 km² with 2 km² unrecovered, which
@@ -803,8 +810,8 @@ end
     @test [b.center for b in tile_run.bands] == [1050.0]
     @test tile_run.provenance["dropped_band_centers"] == [3050.0]
     @test tile_run.provenance["lost_area_km2"] ≈ 55.0
-    # Above 1 % of the tile's ice, so the tile sweep refuses it under the default.
-    @test_throws "above the 1.0 % allowed" gemb_glacier_tile(tile, applied, tile_bands, mp; common...)
+    # Above 10 % of the tile's ice, so the tile sweep refuses it under the default.
+    @test_throws "above the 10.0 % allowed" gemb_glacier_tile(tile, applied, tile_bands, mp; common...)
 
     status = read_glacier_tile_status(write_glacier_tile_netcdf(joinpath(mktempdir(), "t.nc"),
                                                                 tile_run))

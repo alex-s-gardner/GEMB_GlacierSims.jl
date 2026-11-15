@@ -36,8 +36,11 @@ const TILE_HEIGHT_VARIABLES = (:dh, :dh_mass, :dh_water, :dh_firn, :dh_residual,
 const TILE_DIAGNOSTIC_VARIABLES = (:refreeze_thermal, :refreeze_thermal_count)
 
 # Largest fraction of a tile's ice, by default, that may go unmodelled before
-# [`gemb_glacier_tile`](@ref) refuses the tile (see its `lost_area_fraction_maximum` keyword).
-const LOST_AREA_FRACTION_MAXIMUM = 0.01
+# [`gemb_glacier_tile`](@ref) refuses the tile (see its `lost_area_fraction_maximum` keyword). Coastal
+# and island tiles lose ice wherever ERA5-Land has no land cell within the donor distance, and summit
+# bands where the adjusted forcing fails validation; at 10 % such a tile runs the ice it can model and
+# records the rest, while a tile mostly without forcing is still refused.
+const LOST_AREA_FRACTION_MAXIMUM = 0.10
 
 # Why an elevation interval holding ice was not modelled, as stored in a tile file's
 # `dropped_band_causes`. The codes are what the file holds; the meanings are written beside them.
