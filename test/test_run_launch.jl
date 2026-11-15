@@ -587,7 +587,7 @@ end
     if Sys.which("bash") === nothing
         @test_skip "bash is not available"
     else
-        # A tile whose native run left more than 1 % of its ice unmodelled keeps its
+        # A tile whose native run left more than 10 % of its ice unmodelled keeps its
         # `.lost_ice_exceeded` file, so a launch in which no worker ran it still exits non-zero.
         climate = mktempdir()
         mkpath(joinpath(climate, "downscaling_parameters"))
