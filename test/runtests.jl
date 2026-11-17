@@ -2526,6 +2526,29 @@ end
             @test downscaling_source_counts(none.lapse_rate_source)[:prior] == n
         end
 
+        @testset "a tile that accepts too few fits uses the prior" begin
+            # One accepted timestep of twelve (8 %), under the 10 % default: the tile's own fits, and
+            # the climatology built from them, are set aside and every timestep takes the prior.
+            lapse = fill(-8.0, n); lapse[1] = 6.0
+            spread = fill(10.0, n); spread[1] = 900.0
+            few = resolve_downscaling(_fit(; k = fill(0.7, n), lapse, spread), bands, rt;
+                                      basis = :fitted, lapse_rate_prior = 6.5)
+            @test few.lapse_rate == fill(6.5, n)
+            @test downscaling_source_counts(few.lapse_rate_source)[:prior] == n
+            @test few.settings["downscaling_lapse_rate_fit_fraction"] ≈ 1 / 12
+            @test few.settings["downscaling_lapse_rate_fit_fraction_minimum"] == 0.10
+
+            # The same tile at a minimum it clears keeps its accepted fit and the climatology of it.
+            kept = resolve_downscaling(_fit(; k = fill(0.7, n), lapse, spread), bands, rt;
+                                       basis = :fitted, lapse_rate_prior = 6.5,
+                                       fit_fraction_minimum = 0.05)
+            @test kept.lapse_rate[1] == 6.0
+            @test downscaling_source_counts(kept.lapse_rate_source)[:fitted] == 1
+
+            @test_throws "fit_fraction_minimum must be in [0, 1], got 1.5" resolve_downscaling(
+                _fit(; k = fill(0.7, n), lapse), bands, rt; fit_fraction_minimum = 1.5)
+        end
+
         @testset "an out-of-domain k is excluded, not clamped" begin
             # A band's `k` is re-evaluated from the four coefficients, not read off the stored
             # `decoupling_factor` series, so it is the coefficients that decide whether a band's fit

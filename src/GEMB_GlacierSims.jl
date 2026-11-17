@@ -107,6 +107,7 @@ include("applied_downscaling.jl")
 export hypsometry_intervals, resolve_downscaling, AppliedDownscaling
 export DOWNSCALING_SOURCES, downscaling_source_counts, decoupling_factor_prior
 export APPLIED_LAPSE_RATE_STDERR_MAXIMUM, APPLIED_LAPSE_RATE_WINDOW
+export APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM
 export BAND_DECOUPLING_RULES, band_decoupling_rule
 
 include("forcing_cache.jl")

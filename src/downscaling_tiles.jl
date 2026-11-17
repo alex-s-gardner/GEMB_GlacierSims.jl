@@ -325,8 +325,8 @@ unconditionally.
 - `elevation_interval_batch = 0`: how many intervals to accumulate per pass when the above is on.
   `0` means one pass holding every interval at once, which is the fewest forcing reads and the most
   memory. Ignored when interval forcing is off.
-- `downscaling_basis`, `lapse_rate_stderr_maximum`, `elevation_spread_minimum`,
-  `lapse_rate_window`, `lapse_rate_prior`,
+- `downscaling_basis`, `lapse_rate_stderr_maximum`, `lapse_rate_fit_fraction_minimum`,
+  `elevation_spread_minimum`, `lapse_rate_window`, `lapse_rate_prior`,
   `decoupling_factor_prior`: how the fits are turned into applied parameters, forwarded to
   [`resolve_downscaling`](@ref). These affect **only** the interval forcing, since that is the only
   thing here that applies a fit; the stored fits themselves are always raw.
@@ -386,6 +386,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                                 APPLIED_ELEVATION_SPREAD_MINIMUM,
                                             lapse_rate_stderr_maximum::Real =
                                                 APPLIED_LAPSE_RATE_STDERR_MAXIMUM,
+                                            lapse_rate_fit_fraction_minimum::Real =
+                                                APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM,
                                             lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                                             lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                                             decoupling_factor_prior = nothing,
@@ -484,6 +486,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                              elevation_interval_batch,
                                              downscaling_basis, elevation_spread_minimum,
                                              lapse_rate_stderr_maximum,
+                                             lapse_rate_fit_fraction_minimum,
                                              lapse_rate_window, lapse_rate_prior,
                                              decoupling_factor_prior,
                                              glacier_fraction_form = form,

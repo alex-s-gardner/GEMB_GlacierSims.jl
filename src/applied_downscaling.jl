@@ -93,6 +93,20 @@ const APPLIED_LAPSE_RATE_STDERR_MAXIMUM = 1.0
 # discards sound central values to avoid tails that the standard error identifies directly.
 const APPLIED_ELEVATION_SPREAD_MINIMUM = 50.0
 
+# Smallest fraction of a tile's fitted timesteps that must pass the acceptance tests before any of its
+# fits is used, as measured or through the climatology; below it every timestep takes the lapse-rate prior.
+#
+# The climatology is a median of whatever was accepted, so on a tile that accepts almost nothing it is a
+# median of the few hours whose slope happened to be well determined, and those are not a random sample:
+# with cells spanning tens of metres a slope is resolved mainly when the temperature contrast is strong,
+# which over cold coasts in summer is a marine inversion. Extrapolated a kilometre to the glacier, such a
+# climatology puts the summit bands warmer than the coast.
+#
+# Across the 753 fitted tiles of the global table the median tile accepts 86 % of its timesteps. The 61
+# tiles below 10 % hold 2.3 % of the glacier area, and their cells span a median of 11 to 73 m of
+# elevation by bin, against 103 m and more above it.
+const APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM = 0.10
+
 """
     hypsometry_intervals(grid_cells) -> Vector{@NamedTuple{lo::Int, hi::Int, center::Float64}}
 
@@ -285,7 +299,10 @@ A timestep's own fit is accepted when all of these hold, and used as measured:
    keeping 17,159 fits and keeping 4,777.
 
 Anything else falls to the median of accepted fits for its month and hour of day, then for its month,
-then over the whole record, and only failing all three to `lapse_rate_prior`.
+then over the whole record, and only failing all three to `lapse_rate_prior`. A tile that accepts fewer
+than `fit_fraction_minimum` of its fitted timesteps uses `lapse_rate_prior` throughout: its accepted
+fits are too few, and too selective, to stand for the tile
+([`APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM`](@ref)).
 
 # The decoupling factor
 
@@ -358,6 +375,8 @@ silently reverting to the climatology.
   `spread_minimum = $APPLIED_ELEVATION_SPREAD_MINIMUM` m: the lapse-rate acceptance tests, in the order
   described above. `stderr_maximum` is the one to tune; `spread_minimum` applies only to tiles carrying
   no standard error.
+- `fit_fraction_minimum = $APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM`: the fraction of fitted timesteps a
+  tile must accept to use its own lapse-rate fits at all; below it the tile takes `lapse_rate_prior`.
 - `lapse_rate_prior = $(_DEFAULT_LAPSE_RATE)`: a scalar or a 12-element monthly cycle (January first),
   used where no fit and no climatology exists. `GREENLAND_LAPSE_RATE`, `ARCTIC_LAPSE_RATE` and
   `ANTARCTICA_LAPSE_RATE` from `GEMB_ClimateForcing` are the published cycles to pass here when the
@@ -406,6 +425,7 @@ function resolve_downscaling(fit, intervals, run_time;
                              min_cells::Int = _MIN_CELLS_DEFAULT,
                              spread_minimum::Real = APPLIED_ELEVATION_SPREAD_MINIMUM,
                              stderr_maximum::Real = APPLIED_LAPSE_RATE_STDERR_MAXIMUM,
+                             fit_fraction_minimum::Real = APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM,
                              lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                              lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                              decoupling_factor_prior = nothing,
@@ -439,6 +459,8 @@ function resolve_downscaling(fit, intervals, run_time;
         throw(ArgumentError("spread_minimum must be >= 0 m, got $spread_minimum"))
     stderr_maximum > 0 ||
         throw(ArgumentError("stderr_maximum must be > 0 K/km, got $stderr_maximum"))
+    0 <= fit_fraction_minimum <= 1 ||
+        throw(ArgumentError("fit_fraction_minimum must be in [0, 1], got $fit_fraction_minimum"))
 
     lapse_prior = _monthly_prior(lapse_rate_prior, "lapse_rate_prior", _LAPSE_RATE_LIMITS;
                                  open_lower = false)
@@ -476,8 +498,12 @@ function resolve_downscaling(fit, intervals, run_time;
                  (isfinite(spread[t]) && spread[t] >= spread_minimum))
                 for t in eachindex(lapse)]
 
+    # The share of fitted timesteps accepted; below the minimum, none of them is used.
+    n_lapse_accepted = count(accepted)
+    lapse_fit_fraction = isempty(accepted) ? 0.0 : n_lapse_accepted / length(accepted)
+    lapse_used = lapse_fit_fraction >= fit_fraction_minimum ? accepted : falses(length(accepted))
     lapse_rate, lapse_rate_source =
-        _resolve_series(fit_time, lapse, accepted, run_time, basis, lapse_prior)
+        _resolve_series(fit_time, lapse, lapse_used, run_time, basis, lapse_prior)
     _assert_applicable(lapse_rate, _LAPSE_RATE_LIMITS, "lapse rate"; open_lower = false)
 
     # The hypsometry span, as the validity range `k` is evaluated within. Every band centre is inside it
@@ -538,7 +564,9 @@ function resolve_downscaling(fit, intervals, run_time;
         "downscaling_fit_time_coverage_start" => isempty(fit_time) ? "none" : string(first(fit_time)),
         "downscaling_fit_time_coverage_end" => isempty(fit_time) ? "none" : string(last(fit_time)),
         "downscaling_n_fit_timesteps" => length(fit_time),
-        "downscaling_n_lapse_rate_accepted" => count(accepted),
+        "downscaling_n_lapse_rate_accepted" => n_lapse_accepted,
+        "downscaling_lapse_rate_fit_fraction" => lapse_fit_fraction,
+        "downscaling_lapse_rate_fit_fraction_minimum" => Float64(fit_fraction_minimum),
         "downscaling_albedo_ice_default" => Float64(albedo_ice_default),
         "downscaling_albedo_ice_range" => [Float64(albedo_ice_range[1]), Float64(albedo_ice_range[2])],
         "downscaling_bare_ice_albedo_available" => albedo_profile !== nothing,
