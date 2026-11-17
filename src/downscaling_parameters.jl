@@ -239,8 +239,8 @@ measurements behind this.
   not a per-timestep one: forcing completeness is screened per cell, so the contributing cell count
   is the same at every timestep. `k` needs four cells regardless, since it has four parameters. See
   [`derive_decoupling_factor`](@ref) for what the number was chosen against.
-- `downscaling_basis = :fitted`, `lapse_rate_stderr_maximum`, `elevation_spread_minimum`,
-  `lapse_rate_window`,
+- `downscaling_basis = :fitted`, `lapse_rate_stderr_maximum`, `lapse_rate_fit_fraction_minimum`,
+  `elevation_spread_minimum`, `lapse_rate_window`,
   `lapse_rate_prior`, `decoupling_factor_prior`, `glacier_correction`: how the fits are turned into the applied parameters
   `elevation_interval_forcing` uses, and only there — the returned fits are untouched by these. All
   forwarded to [`resolve_downscaling`](@ref); see it for what each one accepts or rejects. `:fitted`
@@ -312,6 +312,8 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                        APPLIED_ELEVATION_SPREAD_MINIMUM,
                                    lapse_rate_stderr_maximum::Real =
                                        APPLIED_LAPSE_RATE_STDERR_MAXIMUM,
+                                   lapse_rate_fit_fraction_minimum::Real =
+                                       APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM,
                                    lapse_rate_window = APPLIED_LAPSE_RATE_WINDOW,
                                    lapse_rate_prior = _DEFAULT_LAPSE_RATE,
                                    decoupling_factor_prior = nothing,
@@ -362,6 +364,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                   basis = downscaling_basis, min_cells,
                                   spread_minimum = elevation_spread_minimum,
                                   stderr_maximum = lapse_rate_stderr_maximum,
+                                  fit_fraction_minimum = lapse_rate_fit_fraction_minimum,
                                   lapse_rate_window, lapse_rate_prior, decoupling_factor_prior,
                                   glacier_correction)
     # Donors are the region's own cells: a derivation is handed the neighbourhood it should draw on, so
