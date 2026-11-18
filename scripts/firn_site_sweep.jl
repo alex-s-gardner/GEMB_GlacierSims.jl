@@ -30,6 +30,12 @@
 # top of the member's snow settings, e.g. `(; crocus_handoff_density = 500.0)`, for a sensitivity run
 # under otherwise production settings. The overrides are recorded with each result.
 #
+# `STATION_CORRECTION=1` corrects the downward longwave of each site's ERA5-Land forcing toward on-ice
+# weather stations (`era5land_station_correction`), in the group `era5land_correction_group` gives it;
+# Arctic ice caps are left uncorrected. A site is on an ice sheet when its record sets
+# `position.ice_sheet` or it lies in no RGI 7.0 region, as `firn_site_score.jl` assigns regions. Each
+# result records the group in `station_correction`.
+#
 # Results are written with `Serialization` to `<output.jls>` as a `Dict(record_id => result)`, where a result is
 # `firn_site_run`'s NamedTuple or, for a site that failed, `(; error = <message>)`. The file is
 # rewritten after each site, so an interrupted sweep keeps what it finished and a rerun skips those.
@@ -62,6 +68,10 @@ end
 const CACHE = joinpath(get(ENV, "CLIMATE_CACHE", "/mnt/bylot-r3/data/era5land"), "cache")
 const FORCING_DIR = get(ENV, "FORCING_DIR", "")
 const PREFETCH = get(ENV, "PREFETCH_FORCING", "0") == "1"
+const STATION_CORRECTION = let s = get(ENV, "STATION_CORRECTION", "0")
+    s in ("0", "1") || error("STATION_CORRECTION must be 0 or 1, got $(repr(s))")
+    s == "1"
+end
 PREFETCH && isempty(FORCING_DIR) && error("PREFETCH_FORCING=1 needs FORCING_DIR")
 const RECORD_START = DateTime(1950, 1, 2)
 const SPINUP_WINDOW = (DateTime(1951, 1, 1), DateTime(1980, 12, 31, 23))
@@ -103,6 +113,19 @@ function fit_set(library)
     return sites, skipped, ice_sheet
 end
 
+# The station-correction group of a site: on an ice sheet when the record says so or the site lies in
+# no RGI region (as `firn_site_score.jl` assigns regions), otherwise by its RGI region.
+function correction_group(s, ice_sheet)
+    sheet = s.record_id in ice_sheet || try
+        rgi_o1_region(s.longitude, s.latitude)
+        false
+    catch e
+        e isa ArgumentError || rethrow()
+        true
+    end
+    return era5land_correction_group(s.longitude, s.latitude; ice_sheet = sheet)
+end
+
 # The site's ERA5-Land cell in the glacier elevation-class table, for its `glm`, and its 2° tile.
 function site_cells(sites, ice_sheet)
     table = GeoDataFrames.read(joinpath(@__DIR__, "..", "data", "era5land_glacier_elevation_classes.parquet"))
@@ -118,8 +141,10 @@ function site_cells(sites, ice_sheet)
         near = abs(lat[i] - s.latitude) <= 0.051 && abs(mod(lon[i] - x + 180, 360) - 180) <= 0.051
         name = tile_output_name(tile_index(s.longitude, s.latitude))
         sheet = s.record_id in ice_sheet
+        group = STATION_CORRECTION ? correction_group(s, ice_sheet) : nothing
         out[s.record_id] = (; glm = near && !sheet ? GEMB_GlacierSims._row_glm(table[i, :]) : 0.0,
-                            tile = sheet ? nothing : get(tiles, name, nothing), name = sheet ? "ice_sheet" : name)
+                            tile = sheet ? nothing : get(tiles, name, nothing), name = sheet ? "ice_sheet" : name,
+                            group)
     end
     return out
 end
@@ -205,7 +230,8 @@ function main()
                                  band_decoupling = MEMBER.band_rule,
                                  glacier_correction = DEFAULT_GLACIER_CORRECTION)
             r = firn_site_run(site, forcing, mp; match_accumulation = MATCH, spinup_window = window,
-                              downscaling, glacier_fraction = c.glm)
+                              downscaling, glacier_fraction = c.glm,
+                              station_correction = STATION_CORRECTION ? c.group : nothing)
             merge(r, (; tile = c.name, downscaled = downscaling !== nothing, glm = c.glm,
                       overrides = OVERRIDES, match_accumulation = MATCH))
         catch e
