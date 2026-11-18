@@ -104,4 +104,53 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
                            simulation_years_maximum = 30)
         @test r2.profile.density == r.profile.density
     end
+
+    @testset "the ERA5-Land station correction" begin
+        base = _firn_site_forcing()
+        meta = Dict{String,Any}(DimensionalData.metadata(base)); meta["dataset"] = "ERA5-Land"
+        era = DimensionalData.rebuild(base; metadata = meta)
+        months = month.(lookup(era, Ti))
+        c = era5land_station_correction(era, :greenland_ice_sheet)
+        dLW = GEMB_GlacierSims._era5land_correction_table()[:greenland_ice_sheet]
+        @test collect(c[:longwave_downward]) ≈ max.(collect(era[:longwave_downward]) .+ dLW[months], 0.0)
+        # Longwave only: every other layer is unchanged.
+        for v in (:temperature_air, :vapor_pressure, :wind_speed, :precipitation, :pressure_air, :shortwave_downward)
+            @test collect(c[v]) == collect(era[v])
+        end
+        @test DimensionalData.metadata(c)["era5land_station_correction"] == "greenland_ice_sheet"
+
+        # ERA5-Land only, once, and a known group.
+        @test_throws "applies to ERA5-Land forcing only" era5land_station_correction(base, :greenland_ice_sheet)
+        @test_throws "already carries the station correction" era5land_station_correction(c, :alpine)
+        @test_throws "unknown correction group" era5land_station_correction(era, :arctic_ice_cap)
+
+        # Every group has twelve finite monthly offsets.
+        tab = GEMB_GlacierSims._era5land_correction_table()
+        @test Set(keys(tab)) == Set(ERA5LAND_CORRECTION_GROUPS)
+        @test all(g -> length(tab[g]) == 12 && all(isfinite, tab[g]), ERA5LAND_CORRECTION_GROUPS)
+
+        # Groups by location; Arctic ice caps are not corrected.
+        @test era5land_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet
+        @test era5land_correction_group(0.0, -75.0; ice_sheet = true) === :antarctic_ice_sheet
+        @test era5land_correction_group(-80.0, 75.3; ice_sheet = false) === nothing   # Devon Ice Cap
+        @test era5land_correction_group(17.4, 78.8; ice_sheet = false) === nothing    # Lomonosovfonna
+        @test era5land_correction_group(-16.7, 64.4; ice_sheet = false) === :alpine   # Vatnajökull
+        @test era5land_correction_group(8.0, 46.5; ice_sheet = false) === :alpine     # Aletsch
+        @test era5land_correction_group(-140.3, 60.4; ice_sheet = false) === :alpine  # St. Elias
+
+        # In a site run, the correction is applied to the forcing at the site and recorded; without it
+        # the run is unchanged by the option existing.
+        mp = initialize_parameters(output_frequency = :monthly)
+        site = FirnSite(; record_id = "synthetic", latitude = 60.0, longitude = -150.0,
+                        elevation = 2000.0, date = DateTime(2009, 6, 15), accumulation = 400.0, depth = 8.0)
+        window = (DateTime(2000), DateTime(2003) - Hour(3))
+        r0 = firn_site_run(site, era, mp; spinup_window = window, simulation_years_maximum = 30)
+        r1 = firn_site_run(site, era, mp; spinup_window = window, simulation_years_maximum = 30,
+                           station_correction = :greenland_ice_sheet)
+        @test r0.station_correction === nothing
+        @test r1.station_correction === :greenland_ice_sheet
+        @test r1.profile.temperature[1:5] != r0.profile.temperature[1:5]
+        @test_throws "applies to ERA5-Land forcing only" firn_site_run(site, base, mp;
+            spinup_window = window, simulation_years_maximum = 30, station_correction = :alpine)
+    end
 end
