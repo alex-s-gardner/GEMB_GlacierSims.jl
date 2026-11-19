@@ -129,6 +129,31 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         @test Set(keys(tab)) == Set(ERA5LAND_CORRECTION_GROUPS)
         @test all(g -> length(tab[g]) == 12 && all(isfinite, tab[g]), ERA5LAND_CORRECTION_GROUPS)
 
+        # The wind factor multiplies wind speed and its climatological mean, and leaves longwave unless asked.
+        dU = GEMB_GlacierSims._era5land_wind_correction_table()[:alpine]
+        w = era5land_station_correction(era, nothing; wind_group = :alpine)
+        @test collect(w[:wind_speed]) ≈ collect(era[:wind_speed]) .* dU[months]
+        @test collect(w[:longwave_downward]) == collect(era[:longwave_downward])
+        haskey(meta, "wind_speed_mean") &&
+            @test DimensionalData.metadata(w)["wind_speed_mean"] ≈ meta["wind_speed_mean"] * sum(dU[months]) / length(months)
+        @test DimensionalData.metadata(w)["era5land_wind_correction"] == "alpine"
+        @test !haskey(DimensionalData.metadata(w), "era5land_station_correction")
+        b = era5land_station_correction(era, :greenland_ice_sheet; wind_group = :greenland_ice_sheet)
+        @test collect(b[:longwave_downward]) ≈ collect(c[:longwave_downward])
+        @test collect(b[:wind_speed]) ≈ collect(era[:wind_speed]) .*
+              GEMB_GlacierSims._era5land_wind_correction_table()[:greenland_ice_sheet][months]
+        @test_throws "already carries the station correction" era5land_station_correction(w, nothing; wind_group = :alpine)
+        @test_throws "neither a longwave nor a wind correction group" era5land_station_correction(era, nothing)
+        @test_throws "unknown wind correction group" era5land_station_correction(era, nothing; wind_group = :x)
+        wt = GEMB_GlacierSims._era5land_wind_correction_table()
+        @test Set(keys(wt)) == Set(ERA5LAND_WIND_CORRECTION_GROUPS)
+        @test all(g -> length(wt[g]) == 12 && all(>(0), wt[g]), ERA5LAND_WIND_CORRECTION_GROUPS)
+        @test era5land_wind_correction_group(-80.0, 75.3; ice_sheet = false) === :arctic_ice_cap   # Devon Ice Cap
+        @test era5land_wind_correction_group(8.0, 46.5; ice_sheet = false) === :alpine
+        @test era5land_wind_correction_group(-47.0, 67.0; ice_sheet = true, ablation = true) === :greenland_ablation
+        @test era5land_wind_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet
+        @test era5land_wind_correction_group(0.0, -75.0; ice_sheet = true) === :antarctic_ice_sheet
+
         # Groups by location; Arctic ice caps are not corrected.
         @test era5land_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet
         @test era5land_correction_group(0.0, -75.0; ice_sheet = true) === :antarctic_ice_sheet

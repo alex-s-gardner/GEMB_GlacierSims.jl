@@ -147,7 +147,7 @@ boundary lies far enough below 10 m not to set the firn temperature there. It is
 drift below `convergence_drift_fac` m yr⁻¹ over `drift_window` cycles or `simulation_years_maximum`
 simulated years, then run from the start of the forcing to `site.date`.
 
-Returns `(; site, profile, time, precipitation_scaling, snowfall, spinup, station_correction)`: `profile` is the column on
+Returns `(; site, profile, time, precipitation_scaling, snowfall, spinup, station_correction, wind_correction)`: `profile` is the column on
 the last output time at or before `site.date` (`dz` [m], `density` [kg m⁻³], `temperature` [K],
 `water` [kg m⁻²], `age` [d], surface first); `time` is that output time; `precipitation_scaling` is
 the factor applied (1 without matching); `snowfall` is the run's mean annual snowfall, equal to
@@ -155,8 +155,9 @@ the factor applied (1 without matching); `snowfall` is the run's mean annual sno
 `converged`).
 
 With `station_correction`, a group of [`era5land_station_correction`](@ref), the downward longwave of
-the ERA5-Land forcing at the site is corrected toward on-ice weather stations; the result's
-`station_correction` records the group (`nothing` without it).
+the ERA5-Land forcing at the site is corrected toward on-ice weather stations, and with `wind_correction`, a wind
+group of it ([`era5land_wind_correction_group`](@ref)), its wind speed; the result's `station_correction` and
+`wind_correction` record the groups (`nothing` without them).
 
 Throws `ArgumentError` when the drilling date lies outside the forcing or when matching a site that has
 no measured accumulation, and `ForcingUnavailable` when the forcing is incomplete.
@@ -171,7 +172,8 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
                        convergence_drift_fac = SPINUP_DRIFT_FAC,
                        drift_window::Int = SPINUP_DRIFT_WINDOW,
                        depth_minimum::Real = firn_site_depth_minimum(site),
-                       station_correction::Union{Nothing,Symbol} = nothing)
+                       station_correction::Union{Nothing,Symbol} = nothing,
+                       wind_correction::Union{Nothing,Symbol} = nothing)
     forcing_is_complete(forcing) || throw(ForcingUnavailable(
         "forcing for site $(site.record_id) is incomplete (all-NaN or no reference elevation)"))
     times = lookup(forcing, Ti)
@@ -186,8 +188,8 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     downscaled = downscaling === nothing ?
                  climate_adjust_for_elevation(forcing, site.elevation - z_forcing; lapse_rate) :
                  site_forcing(forcing, downscaling, glacier_fraction)
-    if station_correction !== nothing
-        downscaled = era5land_station_correction(downscaled, station_correction)
+    if station_correction !== nothing || wind_correction !== nothing
+        downscaled = era5land_station_correction(downscaled, station_correction; wind_group = wind_correction)
     end
     # The profile is read at the last monthly output at or before the drilling date, so the record
     # runs one month past it, and the accumulation is matched over that same span.
@@ -222,7 +224,7 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     spinup = (; cycles = meta.spinup_cycles, converged = meta.spinup_converged)
     snowfall = scaling * _mean_annual_snowfall(lapsed, mp)
     return (; site, profile, time = out_times[i], precipitation_scaling = scaling, snowfall, spinup,
-            station_correction)
+            station_correction, wind_correction)
 end
 
 # Mean annual snowfall [kg m-2 yr-1] of `forcing`, partitioned as `site_snowfall_scaling` does.
