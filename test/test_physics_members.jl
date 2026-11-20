@@ -550,9 +550,10 @@ _old_default_parameters(; kwargs...) = initialize_parameters(;
         @test p["physics_impurity"] == "table"
         @test p["model_grain_growth_method"] === :FlannerZender2006
         @test p["model_black_carbon_snow"] == bbc.black_carbon_snow
-        # Without a member, no `physics_*` key is written.
+        # Without a member, no member key is written; the precipitation phase is recorded either way.
         plain = tile_run_parameters(mp, shawapplied; spinup_window = window, background_black_carbon = bbc)
-        @test !any(startswith("physics_"), keys(plain))
+        @test filter(startswith("physics_"), collect(keys(plain))) |> sort ==
+              ["physics_precipitation_phase", "physics_precipitation_phase_held"]
         # Two members are two experiments.
         mA = physics_member("A-kshaw-table")
         pA = tile_run_parameters(physics_model_parameters(mA), shawapplied; spinup_window = window,

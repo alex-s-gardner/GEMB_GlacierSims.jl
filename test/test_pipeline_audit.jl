@@ -924,27 +924,29 @@ end
 
 @testset "pipeline audit: snowfall fraction from the Jennings 2018 phase model" begin
     # 271.15 K is below the 0 °C threshold, so the threshold run snows everything; the phase model
-    # rains part of it. Under ΔT the fraction is recomputed unless held.
+    # rains part of it. By default the fraction is held at the unperturbed forcing under ΔT.
     f = _tiny_band_forcing(; temperature = 271.15, precipitation = 1.0)
     mp = initialize_parameters(output_frequency = :monthly)
     run(; kw...) = _tiny_tile_run([0.4]; forcing = f, mp, kw...)
     rain(r) = sum(r.bands_series[:rain])
 
-    thr = run()
-    jen = run(; precipitation_phase = :jennings2018)
+    thr = run(; precipitation_phase = :threshold)
+    jen = run()
     @test rain(thr) == 0 && rain(jen) > 0
-    @test !haskey(thr.parameters, "physics_precipitation_phase")
+    @test thr.parameters["physics_precipitation_phase"] == "threshold"
+    @test thr.parameters["physics_precipitation_phase_held"] == false
     @test jen.parameters["physics_precipitation_phase"] == "jennings2018"
-    @test !haskey(jen.parameters, "physics_precipitation_phase_held")
+    @test jen.parameters["physics_precipitation_phase_held"] == true
 
     # At ΔT = +2 the recomputed fraction rains more than the held one.
-    warm = run(; precipitation_phase = :jennings2018, delta_temperatures = [2.0])
-    held = run(; precipitation_phase = :jennings2018, delta_temperatures = [2.0], hold_precipitation_phase = true)
+    held = run(; delta_temperatures = [2.0])
+    warm = run(; delta_temperatures = [2.0], hold_precipitation_phase = false)
     @test rain(warm) > rain(held)
-    @test held.parameters["physics_precipitation_phase_held"] == true
+    @test warm.parameters["physics_precipitation_phase_held"] == false
 
     @test_throws "precipitation_phase must be one of" run(; precipitation_phase = :wetbulb)
-    @test_throws "hold_precipitation_phase needs precipitation_phase = :jennings2018" run(; hold_precipitation_phase = true)
+    @test_throws "hold_precipitation_phase needs precipitation_phase = :jennings2018" run(;
+        precipitation_phase = :threshold, hold_precipitation_phase = true)
 end
 
 @testset "pipeline audit: tile totals by hand" begin

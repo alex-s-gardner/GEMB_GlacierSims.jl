@@ -28,8 +28,9 @@
 # Environment overrides:  TILE_BLOCKS, TILE_BLOCK, TILE_LIMIT, TILE_NAMES (comma-separated), FORCE=1,
 # SPINUP_SIMULATION_YEARS_MAXIMUM, SPINUP_CLIMATOLOGY_START, SPINUP_CLIMATOLOGY_STOP,
 # PRECIPITATION_SCALINGS, DELTA_TEMPERATURES, OUTPUT_FREQUENCY, OUTPUT_DIR, FORCING_CACHE_GIB,
-# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, PRECIPITATION_PHASE (threshold or
-# jennings2018), HOLD_PRECIPITATION_PHASE=1, PHYSICS_MEMBER (see run_settings.jl),
+# DONOR_MAX_DISTANCE_KM, CLAIM_STALE_HOURS, SUPPLEMENTARY=1, PRECIPITATION_PHASE (jennings2018,
+# the default, or threshold), HOLD_PRECIPITATION_PHASE (1, the default under jennings2018, or 0),
+# PHYSICS_MEMBER (see run_settings.jl),
 # EFFECTIVE_LOADING_TABLE (for a `cvis` member), COLUMN_PROFILES (see run_settings.jl)
 #
 # To widen the perturbation grid, run the extra points as a supplementary sweep into their own
@@ -170,8 +171,9 @@ const FORCE = get(ENV, "FORCE", "0") == "1"
 const SUPPLEMENTARY = get(ENV, "SUPPLEMENTARY", "0") == "1"
 # The snow–rain partition (`gemb_glacier_tile`'s `precipitation_phase`), and whether the temperature
 # offsets leave it as the unperturbed band forcing has it (`hold_precipitation_phase`).
-const PRECIPITATION_PHASE = Symbol(get(ENV, "PRECIPITATION_PHASE", "threshold"))
-const HOLD_PRECIPITATION_PHASE = get(ENV, "HOLD_PRECIPITATION_PHASE", "0") == "1"
+const PRECIPITATION_PHASE = Symbol(get(ENV, "PRECIPITATION_PHASE", "jennings2018"))
+const HOLD_PRECIPITATION_PHASE = get(ENV, "HOLD_PRECIPITATION_PHASE",
+                                     PRECIPITATION_PHASE === :jennings2018 ? "1" : "0") == "1"
 
 # Which slice of the tile list this process owns, as `TILE_BLOCK` of `TILE_BLOCKS`, 1-based.
 #
@@ -447,7 +449,9 @@ function run_tile(i, tile, name, path, mp; token, cache)
                                    climatology_n_years = GEMB_GlacierSims.SPINUP_CLIMATOLOGY_N_YEARS,
                                    background_black_carbon = black_carbon,
                                    effective_black_carbon = effective,
-                                   physics_member = PHYSICS_MEMBER)
+                                   physics_member = PHYSICS_MEMBER,
+                                   precipitation_phase = PRECIPITATION_PHASE,
+                                   hold_precipitation_phase = HOLD_PRECIPITATION_PHASE)
 
     status = read_glacier_tile_status(path)
     disposition = FORCE ? :rebuild :

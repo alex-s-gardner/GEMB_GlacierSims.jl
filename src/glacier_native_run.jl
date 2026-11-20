@@ -85,7 +85,7 @@ function gemb_native_cell(cell, applied::AppliedDownscaling, mp::ModelParameters
                           time_range,
                           token = nothing,
                           cache_path = nothing,
-                          forcing_loader = climate_forcing,
+                          forcing_loader = cell_forcing,
                           donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT,
                           spinup_window = nothing,
                           simulation_years_maximum::Real = 1000,
