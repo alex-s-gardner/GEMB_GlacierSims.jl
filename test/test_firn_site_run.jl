@@ -152,7 +152,11 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         @test era5land_wind_correction_group(8.0, 46.5; ice_sheet = false) === :alpine
         @test era5land_wind_correction_group(-47.0, 67.0; ice_sheet = true, ablation = true) === :greenland_ablation
         @test era5land_wind_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet
-        @test era5land_wind_correction_group(0.0, -75.0; ice_sheet = true) === :antarctic_ice_sheet
+        @test era5land_wind_correction_group(0.0, -75.0; ice_sheet = true, elevation = 2892.0) === :antarctic_plateau  # Kohnen
+        @test era5land_wind_correction_group(-112.1, -79.5; ice_sheet = true, elevation = 1766.0) === :antarctic_slope  # WAIS Divide
+        @test era5land_wind_correction_group(-161.7, -79.4; ice_sheet = true, elevation = 550.0) === :antarctic_low     # RICE
+        @test era5land_wind_correction_group(0.0, -75.0; ice_sheet = true, elevation = 1500.0) === :antarctic_slope
+        @test_throws "needs its elevation" era5land_wind_correction_group(0.0, -75.0; ice_sheet = true)
 
         # Groups by location; Arctic ice caps are not corrected.
         @test era5land_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet

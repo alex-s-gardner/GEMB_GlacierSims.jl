@@ -22,7 +22,9 @@ its measured temperature.
 The wind factors (`U` rows) are medians over the stations of each group of the monthly mean station 10 m wind over
 ERA5-Land's. Their groups are those of the longwave and two more that take no longwave offset:
 `:arctic_ice_cap` (the Arctic ice-cap stations) and `:greenland_ablation` (the Greenland ablation-zone stations);
-the Antarctic wind group is the AntAWS stations above 1500 m (Wang et al., 2023). Over glaciers and ice caps
+the Antarctic Ice Sheet takes three wind groups by elevation, from the AntAWS stations (Wang et al., 2023), because
+their wind over ERA5-Land's falls with elevation: `:antarctic_low` below 1500 m (the coast and ice shelves),
+`:antarctic_slope` from 1500 to 2500 m and `:antarctic_plateau` above 2500 m. Over glaciers and ice caps
 ERA5-Land's wind is a half to a third of the stations'; over the Greenland accumulation zone it agrees with them.
 
 The correction describes ERA5-Land's errors, so [`era5land_station_correction`](@ref) refuses any
@@ -43,8 +45,10 @@ const ERA5LAND_STATION_CORRECTIONS_TABLE =
 # Station groups of the longwave correction.
 const ERA5LAND_CORRECTION_GROUPS = (:antarctic_ice_sheet, :greenland_ice_sheet, :alpine)
 # Station groups of the wind correction.
-const ERA5LAND_WIND_CORRECTION_GROUPS = (:antarctic_ice_sheet, :greenland_ice_sheet, :greenland_ablation,
-                                         :arctic_ice_cap, :alpine)
+const ERA5LAND_WIND_CORRECTION_GROUPS = (:antarctic_low, :antarctic_slope, :antarctic_plateau, :greenland_ice_sheet,
+                                         :greenland_ablation, :arctic_ice_cap, :alpine)
+# Upper elevation [m] of each Antarctic wind group, lowest first.
+const _ANTARCTIC_WIND_BANDS = ((1500.0, :antarctic_low), (2500.0, :antarctic_slope), (Inf, :antarctic_plateau))
 
 # RGI 7.0 first-order regions of the Arctic ice caps, which are not corrected.
 const _UNCORRECTED_RGI_REGIONS = ("03", "04", "05", "07", "09")
@@ -98,15 +102,24 @@ function era5land_correction_group(lon::Real, lat::Real; ice_sheet::Bool)
 end
 
 """
-    era5land_wind_correction_group(lon, lat; ice_sheet::Bool, ablation::Bool = false) -> Symbol
+    era5land_wind_correction_group(lon, lat; ice_sheet::Bool, ablation::Bool = false, elevation = NaN) -> Symbol
 
 The station group of the wind factor of [`era5land_station_correction`](@ref) for a site at (`lon`, `lat`)
-[degrees]: `:antarctic_ice_sheet` for an Antarctic ice-sheet site; for a Greenland ice-sheet site
+[degrees]: for an Antarctic ice-sheet site, by its `elevation` [m], `:antarctic_low` below 1500 m,
+`:antarctic_slope` from 1500 to 2500 m and `:antarctic_plateau` above; for a Greenland ice-sheet site
 `:greenland_ablation` with `ablation = true` and `:greenland_ice_sheet` otherwise; for a glacier or ice cap
 `:arctic_ice_cap` in RGI 7.0 regions 03, 04, 05, 07 and 09 and `:alpine` elsewhere, Iceland included.
+
+Throws for an Antarctic ice-sheet site without a finite `elevation`.
 """
-function era5land_wind_correction_group(lon::Real, lat::Real; ice_sheet::Bool, ablation::Bool = false)
-    ice_sheet && return lat < 0 ? :antarctic_ice_sheet : ablation ? :greenland_ablation : :greenland_ice_sheet
+function era5land_wind_correction_group(lon::Real, lat::Real; ice_sheet::Bool, ablation::Bool = false,
+                                        elevation::Real = NaN)
+    if ice_sheet && lat < 0
+        isfinite(elevation) || throw(ArgumentError(
+            "an Antarctic ice-sheet site needs its elevation to choose an Antarctic wind group"))
+        return last(first(b for b in _ANTARCTIC_WIND_BANDS if elevation < first(b)))
+    end
+    ice_sheet && return ablation ? :greenland_ablation : :greenland_ice_sheet
     return rgi_o1_region(lon, lat) in _UNCORRECTED_RGI_REGIONS ? :arctic_ice_cap : :alpine
 end
 
