@@ -246,7 +246,7 @@ measurements behind this.
   forwarded to [`resolve_downscaling`](@ref); see it for what each one accepts or rejects. `:fitted`
   is the default here because this method derives and applies over one window, so every timestep has
   its own fit to prefer; a run over a window wider than the fits needs `:climatology`.
-- `forcing_loader = climate_forcing`: the loader, called as
+- `forcing_loader = cell_forcing`: the loader, called as
   `forcing_loader(climate_model, lat, lon; time_range, token, cache_path)`. Injectable so the
   derivation can be exercised without a CDS token.
 
@@ -321,7 +321,7 @@ function derive_downscaling_parameters(climate_model::Symbol, time_range,
                                    donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT,
                                    glacier_fraction_form::Symbol = :fraction,
                                    glacier_correction::Symbol = DEFAULT_GLACIER_CORRECTION,
-                                   forcing_loader = climate_forcing)
+                                   forcing_loader = cell_forcing)
     glacier_fraction_form in GLACIER_FRACTION_FORMS || throw(ArgumentError(
         "glacier_fraction_form must be one of $(GLACIER_FRACTION_FORMS), got :$glacier_fraction_form"))
     elevation_interval_batch >= 0 || throw(ArgumentError(
@@ -504,7 +504,7 @@ end
 
 """
     elevation_interval_forcing(grid_cells, applied; climate_model, time_range, token, cache_path,
-                               elevation_interval_batch = 0, forcing_loader = climate_forcing,
+                               elevation_interval_batch = 0, forcing_loader = cell_forcing,
                                donor_cells = nothing,
                                donor_max_distance_km = $_DONOR_MAX_DISTANCE_KM_DEFAULT)
 
@@ -584,7 +584,7 @@ function elevation_interval_forcing(grid_cells, applied::AppliedDownscaling;
                                     token = nothing,
                                     cache_path = nothing,
                                     elevation_interval_batch::Int = 0,
-                                    forcing_loader = climate_forcing,
+                                    forcing_loader = cell_forcing,
                                     donor_cells = nothing,
                                     donor_max_distance_km::Real = _DONOR_MAX_DISTANCE_KM_DEFAULT)
     load(row) = forcing_loader(climate_model, row.latitude, row.longitude;

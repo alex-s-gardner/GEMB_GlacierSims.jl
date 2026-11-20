@@ -111,7 +111,7 @@ export APPLIED_LAPSE_RATE_FIT_FRACTION_MINIMUM
 export BAND_DECOUPLING_RULES, band_decoupling_rule
 
 include("forcing_cache.jl")
-export CachedForcingLoader, forcing_cache_capacity, forcing_cache_report
+export CachedForcingLoader, forcing_cache_capacity, forcing_cache_report, cell_forcing
 
 include("downscaling_parameters.jl")
 export derive_downscaling_parameters, grid_cells_in_region, RegionForcingUnavailable

@@ -187,10 +187,10 @@ function main()
     # Hourly, so the record length follows from the window. Used only to turn the memory budget into a
     # cell count, which is what the cache is sized in.
     n_time = round(Int, Dates.value(TIME_RANGE[2] - TIME_RANGE[1]) / 3_600_000)
-    loader = climate_forcing
+    loader = cell_forcing
     if CACHE_BUDGET_GIB > 0
         capacity = forcing_cache_capacity(CACHE_BUDGET_GIB * 2^30, n_time)
-        loader = CachedForcingLoader(climate_forcing; capacity)
+        loader = CachedForcingLoader(cell_forcing; capacity)
         @info "Cross-tile forcing cache" budget_GiB=CACHE_BUDGET_GIB capacity_cells=capacity MiB_per_cell=round(CACHE_BUDGET_GIB * 1024 / capacity, digits = 1)
     end
 

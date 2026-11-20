@@ -922,6 +922,33 @@ end
     @test all(v -> same[v] == wet[v], GEMB_GlacierSims._FORCING_VARIABLES)
 end
 
+@testset "pipeline audit: snowfall fraction from the Jennings 2018 phase model" begin
+    # 271.15 K is below the 0 °C threshold, so the threshold run snows everything; the phase model
+    # rains part of it. By default the fraction is held at the unperturbed forcing under ΔT.
+    f = _tiny_band_forcing(; temperature = 271.15, precipitation = 1.0)
+    mp = initialize_parameters(output_frequency = :monthly)
+    run(; kw...) = _tiny_tile_run([0.4]; forcing = f, mp, kw...)
+    rain(r) = sum(r.bands_series[:rain])
+
+    thr = run(; precipitation_phase = :threshold)
+    jen = run()
+    @test rain(thr) == 0 && rain(jen) > 0
+    @test thr.parameters["physics_precipitation_phase"] == "threshold"
+    @test thr.parameters["physics_precipitation_phase_held"] == false
+    @test jen.parameters["physics_precipitation_phase"] == "jennings2018"
+    @test jen.parameters["physics_precipitation_phase_held"] == true
+
+    # At ΔT = +2 the recomputed fraction rains more than the held one.
+    held = run(; delta_temperatures = [2.0])
+    warm = run(; delta_temperatures = [2.0], hold_precipitation_phase = false)
+    @test rain(warm) > rain(held)
+    @test warm.parameters["physics_precipitation_phase_held"] == false
+
+    @test_throws "precipitation_phase must be one of" run(; precipitation_phase = :wetbulb)
+    @test_throws "hold_precipitation_phase needs precipitation_phase = :jennings2018" run(;
+        precipitation_phase = :threshold, hold_precipitation_phase = true)
+end
+
 @testset "pipeline audit: tile totals by hand" begin
     # Spec 62: bands of 10 and 30 km², runoff [1,2,3] and [4,5,6] kg m-2 per interval, dh
     # [-0.1,-0.2,-0.3] and [0,-0.1,-0.2] m.

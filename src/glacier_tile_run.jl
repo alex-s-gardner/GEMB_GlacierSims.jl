@@ -144,7 +144,12 @@ forcing was built with, carried through for provenance; `band_forcing` an iterab
 
 Per (band, delta, scaling) the forcing chain is
 
-    cf = initialize_forcing(precipitation_adjust(temperature_adjust(band.forcing, delta), scaling))
+    cf = initialize_forcing(precipitation_adjust(temperature_adjust(f, delta;
+                                                                    hold_precipitation_phase),
+                                                 scaling))
+
+with `f = with_snowfall_fraction(band.forcing)` under `precipitation_phase = :jennings2018` and
+`f = band.forcing` under `:threshold`.
 
 with the forcing's `black_carbon_snow` and `black_carbon_ice` set to the run's `ModelParameters`
 values, which `gemb` requires, and nothing else. The band forcing has already been lapsed to the band
@@ -153,13 +158,28 @@ would move the forcing off the band it is defined at, and `climate_adjust_for_gl
 warm excess a second time. Both adjustments act on the raw band stack and are exact identities at
 `delta = 0` / `scaling = 1`, so the unperturbed run is bit-for-bit the plain band forcing.
 
-`precipitation_adjust` scales **total** precipitation, and GEMB partitions phase downstream against
-`mp.rain_temperature_threshold`, so a scaling above 1 raises rain as well as snow. Where the scaling
+`precipitation_adjust` scales **total** precipitation, and GEMB partitions it downstream by the band's
+snow fraction (or, under `:threshold`, against `mp.rain_temperature_threshold`), so a scaling above 1
+raises rain as well as snow. Where the scaling
 stands in for snow redistribution and avalanching that is an overstatement, and it is the reason the
 published 2° products exclude rain from their aggregates.
 
 # Keywords
 - `delta_temperatures = [0.0]`, `precipitation_scalings = [1.0]`: the perturbation grid.
+- `precipitation_phase = :jennings2018`: how GEMB splits precipitation into snow and rain.
+  `:jennings2018` is a snow fraction from the band's air temperature and relative humidity
+  (`with_snowfall_fraction`, the bivariate logistic model of Jennings et al. 2018), computed on the
+  band forcing before any temperature offset. `:threshold` is all snow at or below
+  `mp.rain_temperature_threshold` and all rain above it.
+- `hold_precipitation_phase = (precipitation_phase === :jennings2018)`: under `:jennings2018`, `true`
+  keeps the band's unperturbed snow fraction at every temperature offset, so the offset acts on the
+  energy balance only; `false` recomputes it from the offset temperature. `:threshold` with `true` is
+  refused, the threshold partition having no fraction to hold.
+
+Both are always recorded, as the run parameters `physics_precipitation_phase` and
+`physics_precipitation_phase_held`, so tiles run under different partitions are never merged or
+calibrated together, and a tile written before the options existed (the threshold partition, with
+neither key) does not compare as current against a run that asks for either.
 - `spinup_window`: `(start, stop)` the repeating spinup cycle is built from, by
   `SPINUP_CLIMATOLOGY_METHOD` (`:representative`, a block of `SPINUP_CLIMATOLOGY_N_YEARS` real years).
   Whole calendar years; defaults to the first 30 whole calendar years of the band forcing, but a sweep
@@ -264,7 +284,13 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            lost_area_fraction_maximum::Real = LOST_AREA_FRACTION_MAXIMUM,
                            background_black_carbon = nothing,
                            effective_black_carbon = nothing,
-                           physics_member = nothing)
+                           physics_member = nothing,
+                           precipitation_phase::Symbol = :jennings2018,
+                           hold_precipitation_phase::Bool = precipitation_phase === :jennings2018)
+    GEMB_ClimateForcing._check_precipitation_phase(precipitation_phase)
+    precipitation_phase === :threshold && hold_precipitation_phase && throw(ArgumentError(
+        "hold_precipitation_phase needs precipitation_phase = :jennings2018; the threshold partition " *
+        "has no snow fraction to hold"))
     mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
     physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
                                                          background_black_carbon,
@@ -302,7 +328,11 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         (delta_temperatures, precipitation_scalings) :
         (union_grid(delta_temperatures, validation_grid[1]),
          union_grid(precipitation_scalings, validation_grid[2]))
-    bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings)
+    if precipitation_phase === :jennings2018
+        bands = [merge(b, (; forcing = with_snowfall_fraction(b.forcing))) for b in bands]
+    end
+    bands, dropped = _runnable_bands(bands, validation_deltas, validation_scalings;
+                                     hold_precipitation_phase)
     isempty(bands) && throw(ForcingUnavailable(
         "no band of this tile could be perturbed into forcing GEMB accepts; the highest bands are " *
         "lapse extrapolations far above every contributing reanalysis surface, and a cold " *
@@ -324,7 +354,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                                      climatology_method = SPINUP_CLIMATOLOGY_METHOD,
                                      climatology_n_years = SPINUP_CLIMATOLOGY_N_YEARS,
                                      background_black_carbon, effective_black_carbon,
-                                     physics_member)
+                                     physics_member, precipitation_phase, hold_precipitation_phase)
 
     # Resuming: keep only forcing newer than the saved state, and let each run inherit its saved column
     # instead of spinning up again. The saved time is the last *output* time, and every forcing step up to
@@ -370,7 +400,8 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
         # already decoupled. Rebuilt per task rather than shared across perturbations, so concurrent
         # tasks never hand each other the same object. The impurity metadata is the run's own, which
         # `gemb` requires the forcing's impurity layers to equal.
-        cf = initialize_forcing(_with_impurity_metadata(_perturbed_forcing(band.forcing, delta, pscale),
+        cf = initialize_forcing(_with_impurity_metadata(_perturbed_forcing(band.forcing, delta, pscale;
+                                                                           hold_precipitation_phase),
                                                         mp))
 
         # The band's own bare-ice albedo, carried on the band by `resolve_downscaling`. Built per
@@ -610,8 +641,8 @@ end
 
 # A band's forcing at one perturbation point: the temperature offset, then the precipitation scaling.
 # The one definition the band validation and the run share, so a band validated is the band run.
-_perturbed_forcing(forcing, delta, pscale) =
-    precipitation_adjust(temperature_adjust(forcing, delta), pscale)
+_perturbed_forcing(forcing, delta, pscale; hold_precipitation_phase::Bool = false) =
+    precipitation_adjust(temperature_adjust(forcing, delta; hold_precipitation_phase), pscale)
 
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
 #
@@ -629,7 +660,8 @@ _perturbed_forcing(forcing, delta, pscale) =
 #
 # Only the adjustment chain is run here, not a spinup, so this costs a pass over each band's record per
 # perturbation against thousands of column-years of simulation.
-function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
+function _runnable_bands(bands, delta_temperatures, precipitation_scalings;
+                         hold_precipitation_phase::Bool = false)
     keep = similar(bands, 0)
     dropped = NamedTuple[]
 
@@ -637,7 +669,8 @@ function _runnable_bands(bands, delta_temperatures, precipitation_scalings)
         failure = nothing
         for pscale in precipitation_scalings, delta in delta_temperatures
             try
-                initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale))
+                initialize_forcing(_perturbed_forcing(band.forcing, delta, pscale;
+                                                      hold_precipitation_phase))
             catch e
                 e isa InterruptException && rethrow()
                 is_caller_error(e) && rethrow()
@@ -906,13 +939,17 @@ most one of the two may be given.
 
 `physics_member`, a [`physics_member`](@ref), adds the `physics_*` keys that name it, after checking
 that `mp`, `applied` and the loading are the configuration it names.
+
+`precipitation_phase` and `hold_precipitation_phase` (see [`gemb_glacier_tile`](@ref), whose defaults
+they share) are recorded as `physics_precipitation_phase` and `physics_precipitation_phase_held`.
 """
 function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; spinup_window,
                              simulation_years_maximum = nothing, convergence_drift_fac = nothing,
                              drift_window = nothing, donor_max_distance_km = nothing,
                              climatology_method = nothing, climatology_n_years = nothing,
                              background_black_carbon = nothing, effective_black_carbon = nothing,
-                             physics_member = nothing)
+                             physics_member = nothing, precipitation_phase::Symbol = :jennings2018,
+                             hold_precipitation_phase::Bool = precipitation_phase === :jennings2018)
     mp = _with_snow_loading(mp, background_black_carbon, effective_black_carbon)
     physics_member === nothing || _assert_physics_member(physics_member, mp, applied,
                                                          background_black_carbon,
@@ -948,6 +985,8 @@ function tile_run_parameters(mp::ModelParameters, applied::AppliedDownscaling; s
     effective_black_carbon === nothing ||
         _record_effective_black_carbon!(params, effective_black_carbon)
     physics_member === nothing || merge!(params, physics_member_parameters(physics_member))
+    params["physics_precipitation_phase"] = string(precipitation_phase)
+    params["physics_precipitation_phase_held"] = hold_precipitation_phase
     for field in propertynames(mp)
         field in GEMB.DERIVED_PARAMETERS && continue
         params["model_" * string(field)] = getproperty(mp, field)

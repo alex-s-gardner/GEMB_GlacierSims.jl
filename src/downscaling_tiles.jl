@@ -357,7 +357,7 @@ unconditionally.
 - `order = :chunk`: tile visit order; `:chunk` keeps the forcing cache warm across neighbouring
   tiles.
 - `tile_limit = Inf`: stop after this many tiles. Useful for a first pass over a global table.
-- `forcing_loader = climate_forcing`: injectable loader, so a sweep can be exercised with no CDS
+- `forcing_loader = cell_forcing`: injectable loader, so a sweep can be exercised with no CDS
   token.
 - `tile_gate = nothing`: called as `tile_gate(tile, path)` before each tile; a `false` return skips it
   without recording an outcome. This is the hook a parallel launcher uses to run the sweep as N
@@ -402,7 +402,7 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
                                             tile_limit = Inf,
                                             institution = nothing,
                                             references = nothing,
-                                            forcing_loader = climate_forcing,
+                                            forcing_loader = cell_forcing,
                                             tile_gate = nothing)
     tiles = downscaling_tiles(glacier_elevation_classes; tile_size, buffer, area_minimum, order)
     isempty(tiles) && throw(ArgumentError(

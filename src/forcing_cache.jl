@@ -1,4 +1,19 @@
 """
+    cell_forcing(climate_model, lat, lon; time_range, token, cache_path) -> DimStack
+
+One reanalysis cell's forcing, as the band builders load it: `climate_forcing` without the
+`snowfall_fraction` layer (`precipitation_phase = :threshold`). The layer is a function of air
+temperature and humidity, so it is formed once per band from the band's own forcing
+([`gemb_glacier_tile`](@ref)) rather than carried, and recomputed, through every lapse and
+decoupling of every cell to every band.
+
+The default `forcing_loader` of [`elevation_interval_forcing`](@ref),
+[`derive_downscaling_parameters`](@ref) and the sweeps built on them.
+"""
+cell_forcing(climate_model, lat, lon; kwargs...) =
+    climate_forcing(climate_model, lat, lon; precipitation_phase = :threshold, kwargs...)
+
+"""
 A bounded in-memory cache of loaded cell forcing, for sweeps that visit the same cell more than once.
 
 The tiled derivation fits each tile's parameters over a **buffered** neighbourhood so its cross-cell
@@ -30,7 +45,7 @@ Callable with the loader's own signature, so it can be passed straight as the `f
 of [`derive_downscaling_parameter_tiles`](@ref) or [`derive_downscaling_parameters`](@ref):
 
 ```julia
-cached = CachedForcingLoader(climate_forcing; capacity = 4000)
+cached = CachedForcingLoader(cell_forcing; capacity = 4000)
 derive_downscaling_parameter_tiles(:era5land, time_range, table, dir;
                                    token, cache_path, forcing_loader = cached)
 @info "cache" hits=cached.hits[] misses=cached.misses[]
