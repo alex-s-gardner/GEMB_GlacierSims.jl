@@ -287,8 +287,7 @@ function gemb_glacier_tile(tile, applied::AppliedDownscaling, band_forcing, mp::
                            physics_member = nothing,
                            precipitation_phase::Symbol = :jennings2018,
                            hold_precipitation_phase::Bool = precipitation_phase === :jennings2018)
-    precipitation_phase in PRECIPITATION_PHASES || throw(ArgumentError(
-        "precipitation_phase must be one of $(PRECIPITATION_PHASES), got $(repr(precipitation_phase))"))
+    GEMB_ClimateForcing._check_precipitation_phase(precipitation_phase)
     precipitation_phase === :threshold && hold_precipitation_phase && throw(ArgumentError(
         "hold_precipitation_phase needs precipitation_phase = :jennings2018; the threshold partition " *
         "has no snow fraction to hold"))
@@ -644,9 +643,6 @@ end
 # The one definition the band validation and the run share, so a band validated is the band run.
 _perturbed_forcing(forcing, delta, pscale; hold_precipitation_phase::Bool = false) =
     precipitation_adjust(temperature_adjust(forcing, delta; hold_precipitation_phase), pscale)
-
-# The snow–rain partitions `gemb_glacier_tile` offers.
-const PRECIPITATION_PHASES = (:jennings2018, :threshold)
 
 # Which bands can be perturbed into forcing GEMB will accept, and which cannot.
 #
