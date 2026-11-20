@@ -160,7 +160,9 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
 
         # Groups by location; Arctic ice caps are not corrected.
         @test era5land_correction_group(-38.5, 72.6; ice_sheet = true) === :greenland_ice_sheet
-        @test era5land_correction_group(0.0, -75.0; ice_sheet = true) === :antarctic_ice_sheet
+        @test era5land_correction_group(0.0, -75.0; ice_sheet = true, elevation = 2892.0) === :antarctic_ice_sheet
+        @test era5land_correction_group(-161.7, -79.4; ice_sheet = true, elevation = 550.0) === :antarctic_coast
+        @test_throws "needs its elevation" era5land_correction_group(0.0, -75.0; ice_sheet = true)
         @test era5land_correction_group(-80.0, 75.3; ice_sheet = false) === nothing   # Devon Ice Cap
         @test era5land_correction_group(17.4, 78.8; ice_sheet = false) === nothing    # Lomonosovfonna
         @test era5land_correction_group(-16.7, 64.4; ice_sheet = false) === :alpine   # Vatnajökull

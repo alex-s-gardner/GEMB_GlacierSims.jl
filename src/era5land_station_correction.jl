@@ -8,7 +8,9 @@ surface temperature and so the firn temperature below the depth of the seasonal 
 mean of station minus ERA5-Land downward longwave. The groups:
 
 - `:antarctic_ice_sheet`: the Baseline Surface Radiation Network stations South Pole and Concordia
-  (Driemel et al., 2018), on the plateau where the firn cores are;
+  (Driemel et al., 2018), on the plateau; it applies to Antarctic sites at or above 1500 m;
+- `:antarctic_coast`: the BSRN station Neumayer, on the Ekström Ice Shelf; it applies to Antarctic sites below
+  1500 m;
 - `:greenland_ice_sheet`: the PROMICE and GC-Net dry-snow and percolation stations (Fausto et al.,
   2021); it applies to every Greenland ice-sheet site;
 - `:alpine`: the alpine stations and the Icelandic glacier stations; it applies to every glacier
@@ -43,12 +45,15 @@ const ERA5LAND_STATION_CORRECTIONS_TABLE =
     normpath(joinpath(@__DIR__, "..", "data", "era5land_station_corrections.csv"))
 
 # Station groups of the longwave correction.
-const ERA5LAND_CORRECTION_GROUPS = (:antarctic_ice_sheet, :greenland_ice_sheet, :alpine)
+const ERA5LAND_CORRECTION_GROUPS = (:antarctic_ice_sheet, :antarctic_coast, :greenland_ice_sheet, :alpine)
+# Elevation [m] below which an Antarctic site takes the coastal longwave group and the lowest wind group.
+const _ANTARCTIC_COAST_ELEVATION = 1500.0
 # Station groups of the wind correction.
 const ERA5LAND_WIND_CORRECTION_GROUPS = (:antarctic_low, :antarctic_slope, :antarctic_plateau, :greenland_ice_sheet,
                                          :greenland_ablation, :arctic_ice_cap, :alpine)
 # Upper elevation [m] of each Antarctic wind group, lowest first.
-const _ANTARCTIC_WIND_BANDS = ((1500.0, :antarctic_low), (2500.0, :antarctic_slope), (Inf, :antarctic_plateau))
+const _ANTARCTIC_WIND_BANDS = ((_ANTARCTIC_COAST_ELEVATION, :antarctic_low), (2500.0, :antarctic_slope),
+                               (Inf, :antarctic_plateau))
 
 # RGI 7.0 first-order regions of the Arctic ice caps, which are not corrected.
 const _UNCORRECTED_RGI_REGIONS = ("03", "04", "05", "07", "09")
@@ -87,17 +92,24 @@ _era5land_correction_table() = _era5land_correction_tables()["LW"]
 _era5land_wind_correction_table() = _era5land_correction_tables()["U"]
 
 """
-    era5land_correction_group(lon, lat; ice_sheet::Bool) -> Union{Symbol,Nothing}
+    era5land_correction_group(lon, lat; ice_sheet::Bool, elevation = NaN) -> Union{Symbol,Nothing}
 
 The station group of [`era5land_station_correction`](@ref) for a site at (`lon`, `lat`) [degrees], or
-`nothing` for a site that is not corrected. An ice-sheet site (`ice_sheet = true`) is
-`:antarctic_ice_sheet` south of the equator and `:greenland_ice_sheet` north of it. A glacier or ice
-cap is `nothing` in RGI 7.0 first-order regions 03, 04, 05, 07 and 09 (Arctic Canada, the Greenland
-periphery, Svalbard and Jan Mayen, the Russian Arctic; [`rgi_o1_region`](@ref)) and `:alpine`
-everywhere else, Iceland included.
+`nothing` for a site that is not corrected. An Antarctic ice-sheet site (`ice_sheet = true`, south of the equator)
+is `:antarctic_coast` below 1500 m `elevation` and `:antarctic_ice_sheet` at or above it; a Greenland ice-sheet site
+is `:greenland_ice_sheet`. A glacier or ice cap is `nothing` in RGI 7.0 first-order regions 03, 04, 05, 07 and 09
+(Arctic Canada, the Greenland periphery, Svalbard and Jan Mayen, the Russian Arctic; [`rgi_o1_region`](@ref)) and
+`:alpine` everywhere else, Iceland included.
+
+Throws for an Antarctic ice-sheet site without a finite `elevation`.
 """
-function era5land_correction_group(lon::Real, lat::Real; ice_sheet::Bool)
-    ice_sheet && return lat < 0 ? :antarctic_ice_sheet : :greenland_ice_sheet
+function era5land_correction_group(lon::Real, lat::Real; ice_sheet::Bool, elevation::Real = NaN)
+    if ice_sheet && lat < 0
+        isfinite(elevation) || throw(ArgumentError(
+            "an Antarctic ice-sheet site needs its elevation to choose an Antarctic longwave group"))
+        return elevation < _ANTARCTIC_COAST_ELEVATION ? :antarctic_coast : :antarctic_ice_sheet
+    end
+    ice_sheet && return :greenland_ice_sheet
     return rgi_o1_region(lon, lat) in _UNCORRECTED_RGI_REGIONS ? nothing : :alpine
 end
 
