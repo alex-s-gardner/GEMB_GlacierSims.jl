@@ -123,7 +123,7 @@ function correction_group(s, ice_sheet)
         e isa ArgumentError || rethrow()
         true
     end
-    return era5land_correction_group(s.longitude, s.latitude; ice_sheet = sheet)
+    return era5land_correction_group(s.longitude, s.latitude; ice_sheet = sheet, elevation = s.elevation)
 end
 
 # The site's ERA5-Land cell in the glacier elevation-class table, for its `glm`, and its 2° tile.

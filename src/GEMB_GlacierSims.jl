@@ -173,8 +173,8 @@ export reference_forcing_corrections, gvc_reference_ensemble_file,
 
 # ERA5-Land forcing corrected toward on-ice weather stations.
 include("era5land_station_correction.jl")
-export era5land_station_correction, era5land_correction_group
-export ERA5LAND_CORRECTION_GROUPS, ERA5LAND_STATION_CORRECTIONS_TABLE
+export era5land_station_correction, era5land_correction_group, era5land_wind_correction_group
+export ERA5LAND_CORRECTION_GROUPS, ERA5LAND_WIND_CORRECTION_GROUPS, ERA5LAND_STATION_CORRECTIONS_TABLE
 
 # GEMB at a firn-core site with snowfall matched to the core's accumulation, for densification tests.
 include("firn_site_run.jl")
