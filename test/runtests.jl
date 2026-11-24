@@ -3241,6 +3241,36 @@ end
                 f, 2050; default = NaN)
         end
 
+        @testset "resolve_albedo_ice takes the nearest local profile before the default" begin
+            here = bare_ice_albedo_hyps(fill(0.40, 5), fill(1050.0, 5), 0:100:3000)
+            near = bare_ice_albedo_hyps(fill(0.30, 5), fill(2050.0, 5), 0:100:3000)
+            far = bare_ice_albedo_hyps(fill(0.25, 5), fill(2550.0, 5), 0:100:3000)
+            @test resolve_albedo_ice(here, 1050; default = 0.48, neighbors = (near, far)) ==
+                  (0.40, :observed)
+            @test resolve_albedo_ice(here, 2050; default = 0.48, neighbors = (near, far)) ==
+                  (0.30, :neighbor)
+            @test resolve_albedo_ice(here, 2550; default = 0.48, neighbors = (near, far)) ==
+                  (0.25, :neighbor)
+            @test resolve_albedo_ice(nothing, 2050; default = 0.48, neighbors = [near]) ==
+                  (0.30, :neighbor)
+            @test resolve_albedo_ice(here, 2950; default = 0.48, neighbors = (near, far)) ==
+                  (0.48, :default)
+
+            pool = [(; name = "N60_W150.nc", longitude = -149.0, latitude = 61.0, profile = far),
+                    (; name = "N46_E010.nc", longitude = 11.0, latitude = 47.0, profile = near),
+                    (; name = "N60_W148.nc", longitude = -147.0, latitude = 61.0, profile = here)]
+            @test nearest_bare_ice_albedo(pool, -147.0, 61.0; exclude = "N60_W148.nc") == [far, near]
+            @test nearest_bare_ice_albedo(pool, 11.5, 46.5) == [near, here, far]
+        end
+
+        @testset "profile records its glacier-fraction screen" begin
+            f = bare_ice_albedo_hyps(fill(0.40, 5), fill(1050.0, 5), 0:100:3000;
+                                     min_glacier_fraction = 0.95)
+            @test f.sky === :wsa
+            @test f.min_glacier_fraction == 0.95
+            @test isnan(bare_ice_albedo_hyps([0.4], [1.0], 0:100:300).min_glacier_fraction)
+        end
+
         @testset "a tile that owns nothing is a caller error" begin
             empty_tile = (; name = "N00_E000.nc", bounds = tile_bounds((0, 0)),
                           core = DataFrame(longitude = Float64[], latitude = Float64[]))
@@ -3275,7 +3305,7 @@ end
 
             @test with.provenance["downscaling_bare_ice_albedo_product"] ==
                   GEMB_GlacierSims.BARE_ICE_ALBEDO_PRODUCT
-            @test with.provenance["downscaling_bare_ice_albedo_sky"] == "bsa"
+            @test with.provenance["downscaling_bare_ice_albedo_sky"] == "wsa"
             @test with.provenance["downscaling_bare_ice_albedo_n_bins"] == length(profile.albedo)
             @test with.provenance["downscaling_bare_ice_albedo_n_modis_cells_used"] ==
                   profile.n_used

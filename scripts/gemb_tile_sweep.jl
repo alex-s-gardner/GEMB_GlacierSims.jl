@@ -350,6 +350,10 @@ function main()
     claim_dir = joinpath(OUTPUT_DIR, CLAIM_SUBDIR)
     mkpath(claim_dir)
     mp = physics_model_parameters(output_frequency = OUTPUT_FREQUENCY)
+    # Every tile profile with an observed bin, so a band its own tile cannot resolve takes the
+    # nearest local observation rather than the constant default.
+    albedo_pool = bare_ice_albedo_profiles(PARAMETER_DIR)
+    @info "Bare-ice albedo profiles with an observed bin" tiles = length(albedo_pool)
 
     @info "GEMB tile sweep" candidates=length(order) of=length(tiles) block="$TILE_BLOCK/$TILE_BLOCKS" time_range=TIME_RANGE output_frequency=OUTPUT_FREQUENCY perturbations="$(length(DELTA_TEMPERATURES))x$(length(PRECIPITATION_SCALINGS))" threads=Threads.nthreads() output=OUTPUT_DIR
 
@@ -364,7 +368,7 @@ function main()
         t0 = time()
         try
             push!(rows, with_claim_heartbeat(claim_dir, tile.name; interval = CLAIM_HEARTBEAT) do
-                run_tile(i, tile, name, path, mp; token, cache)
+                run_tile(i, tile, name, path, mp; token, cache, albedo_pool)
             end)
         catch e
             e isa InterruptException && rethrow()
@@ -401,7 +405,7 @@ function main()
     return summary
 end
 
-function run_tile(i, tile, name, path, mp; token, cache)
+function run_tile(i, tile, name, path, mp; token, cache, albedo_pool)
     t0 = time()
     parameter_path = joinpath(PARAMETER_DIR, tile.name)
     if !isfile(parameter_path)
@@ -432,7 +436,11 @@ function run_tile(i, tile, name, path, mp; token, cache)
     applied = resolve_downscaling(fit, intervals, probe_time; basis, decoupling_factor_prior = prior,
                                   band_decoupling = band_rule,
                                   wind_scaling = PHYSICS_MEMBER.wind_scaling, wind_correction = wind_rule,
-                                  glacier_correction = GLACIER_CORRECTION)
+                                  glacier_correction = GLACIER_CORRECTION,
+                                  albedo_ice_neighbors = nearest_bare_ice_albedo(
+                                      albedo_pool, (tile.bounds.lon_min + tile.bounds.lon_max) / 2,
+                                      (tile.bounds.lat_min + tile.bounds.lat_max) / 2;
+                                      exclude = tile.name))
     black_carbon = tile_background_black_carbon(tile.core)
     effective = tile_effective_black_carbon(tile.core)
     # Must carry the same settings the run below records, or a file written under one compares as current

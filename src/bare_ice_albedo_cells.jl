@@ -14,11 +14,18 @@ Where a resolved `albedo_ice` came from, in the order [`resolve_albedo_ice`](@re
 - `:fit` — the profile's linear albedo-elevation fit.
 - `:clamped` — one of the above, moved to the nearest edge of [`GEMB_ALBEDO_ICE_RANGE`](@ref).
 - `:default` — no observation resolved for this class, so the caller's own `albedo_ice` stands.
+- `:neighbor` — the tile's own profile does not resolve the class, so the nearest other tile whose
+  profile does supplied it.
 
 Deliberately **not** [`DOWNSCALING_SOURCES`](@ref): that vocabulary describes how a *time series* was
 substituted where a fit was unusable, and has no notion of a value being clamped.
 """
-const BARE_ICE_ALBEDO_SOURCES = (:observed, :hold, :fit, :clamped, :default)
+const BARE_ICE_ALBEDO_SOURCES = (:observed, :hold, :fit, :clamped, :default, :neighbor)
+
+"""
+The least RGI 7.0 glacier fraction an MCD43A3 cell needs to inform a bare-ice albedo profile, `0.95`.
+"""
+const BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION = 0.95
 
 """
 The range GEMB accepts for `albedo_ice`, `(0.2, 0.6)`.
@@ -179,7 +186,8 @@ in it.
 # Keywords
 - `bins = 0:100:10000`: elevation bin edges (m). Pass [`hypsometry_bin_edges`](@ref) of the
   elevation-class table to line the albedo bins up with the glacier-area bins.
-- `sky = :bsa`, `min_cells = 3`, `extrapolate = 0`: passed to `bare_ice_albedo_hyps`.
+- `sky = :wsa`, `min_cells = 3`, `extrapolate = 0`: passed to `bare_ice_albedo_hyps`.
+- `min_glacier_fraction`: as for [`derive_bare_ice_albedo`](@ref).
 - `boundary = :center`: how the tile polygon selects MODIS cells.
 - `cell_size = 0.1`: ERA5-Land grid spacing, in degrees.
 - `dem_fetch_concurrency = 8`: concurrent DEM window reads. GDAL's `/vsicurl` dataset open is not
@@ -199,9 +207,10 @@ is what the forcing loader is keyed on.
 """
 function bare_ice_albedo_tile(tile, dem;
                               bins = 0:100:10000,
-                              sky::Symbol = :bsa,
+                              sky::Symbol = :wsa,
                               min_cells::Integer = 3,
                               extrapolate::Union{Real,Symbol} = 0,
+                              min_glacier_fraction::Real = BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION,
                               boundary::Symbol = :center,
                               cell_size::Real = 0.1,
                               dem_fetch_concurrency::Integer = 8,
@@ -211,16 +220,18 @@ function bare_ice_albedo_tile(tile, dem;
         "tile $(tile.name) owns no cells, so there is nothing to derive"))
 
     s = _bia_sample(core, dem; label = tile.name, cell_size, boundary,
-                    dem_fetch_concurrency, verbose)
+                    dem_fetch_concurrency, verbose, min_glacier_fraction)
+    albedo, n_valid = _bia_sky(s, sky)
 
     # One profile per core cell. The retrieval counts are handed over explicitly because the sliced
     # albedo is a plain vector and carries none — without them a bin resting on three retrievals is
     # indistinguishable from one resting on three thousand.
     edges = collect(Float64, bins)
-    hyps = [bare_ice_albedo_hyps(s.albedo[idx], s.elevation[idx], edges;
-                                 sky, min_cells, extrapolate, n_valid = s.n_valid[idx])
+    hyps = [bare_ice_albedo_hyps(albedo[idx], s.elevation[idx], edges;
+                                 sky, min_cells, extrapolate, n_valid = n_valid[idx],
+                                 min_glacier_fraction)
             for idx in s.points_of_cell]
-    n_valid_of_row = [sum(Int, s.n_valid[idx]; init = 0) for idx in s.points_of_cell]
+    n_valid_of_row = [sum(Int, n_valid[idx]; init = 0) for idx in s.points_of_cell]
 
     per_cell = _bia_per_cell_table(core, hyps, s.points_of_cell, n_valid_of_row)
     per_bin = _bia_per_bin_table(core, hyps)
@@ -262,9 +273,13 @@ with `extrapolate = :hold` (the default here) every class gets a value drawn fro
   cells' own extent with `cache_tiles = true`, which is what a sweep wants — see below.
 - `bins = 0:100:10000`: elevation bin edges (m). Pass [`hypsometry_bin_edges`](@ref) of the
   elevation-class table so albedo bins and glacier-area bins are the same bins.
-- `sky = :bsa`, `min_cells = 3`, `extrapolate = :hold`: passed to `bare_ice_albedo_hyps`.
-  `:hold` carries the end bins outward, so the answer outside the sampled range is still a value
-  some bin measured.
+- `sky = :wsa`, `min_cells = 3`, `extrapolate = :hold`: passed to `bare_ice_albedo_hyps`.
+  White-sky because GEMB applies one `albedo_ice` to all shortwave, diffuse and direct alike, and
+  the MODIS record the runs are compared against is white-sky. `:hold` carries the end bins
+  outward, so the answer outside the sampled range is still a value some bin measured.
+- `min_glacier_fraction = BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION` (0.95): MODIS cells less glacierized
+  than this are dropped before binning. A mixed cell holds rock, debris or water that is darker than
+  ice, and the darkest-percentile statistic selects exactly those retrievals.
 - `boundary = :center`, `cell_size = 0.1`, `dem_fetch_concurrency = 8`, `verbose = true`: as for
   [`bare_ice_albedo_tile`](@ref).
 - `dem_cache_path = nothing`, `dem_cache_tiles = true`: only read when `dem === nothing` and
@@ -289,9 +304,10 @@ given: on the global mosaic it would try to fetch every published tile. A 4°×4
 function derive_bare_ice_albedo(cells;
                                 dem = nothing,
                                 bins = 0:100:10000,
-                                sky::Symbol = :bsa,
+                                sky::Symbol = :wsa,
                                 min_cells::Integer = 3,
                                 extrapolate::Union{Real,Symbol} = :hold,
+                                min_glacier_fraction::Real = BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION,
                                 boundary::Symbol = :center,
                                 cell_size::Real = 0.1,
                                 dem_fetch_concurrency::Integer = 8,
@@ -315,9 +331,11 @@ function derive_bare_ice_albedo(cells;
             copernicus_dem_archive(dem_archive, extent)
     end
 
-    s = _bia_sample(cells, dem; label, cell_size, boundary, dem_fetch_concurrency, verbose)
-    f = bare_ice_albedo_hyps(s.albedo, s.elevation, collect(Float64, bins);
-                             sky, min_cells, extrapolate, n_valid = s.n_valid)
+    s = _bia_sample(cells, dem; label, cell_size, boundary, dem_fetch_concurrency, verbose,
+                    min_glacier_fraction)
+    albedo, n_valid = _bia_sky(s, sky)
+    f = bare_ice_albedo_hyps(albedo, s.elevation, collect(Float64, bins);
+                             sky, min_cells, extrapolate, n_valid, min_glacier_fraction)
     if verbose
         @info "Pooled bare-ice albedo for $(label)" cells = nrow(cells) s.census...
         show(stderr, MIME"text/plain"(), f)
@@ -342,6 +360,9 @@ Resolution, in order:
 
 1. The profile's value for the bin holding `z`, tagged with that bin's own
    [`BARE_ICE_ALBEDO_SOURCES`](@ref) provenance — `:observed`, `:hold` or `:fit`.
+1. Otherwise the first profile in `neighbors` that resolves `z`, tagged `:neighbor`. Pass them
+   nearest first ([`nearest_bare_ice_albedo`](@ref)), so an unobserved class takes the closest
+   local observation rather than `default`.
 2. Clamped into `range`, and if the clamp moved it the source becomes `:clamped`. This is what keeps
    every class runnable: observed bare-ice albedo above the equilibrium line exceeds `0.6`, which
    `GEMB.validate_parameters` refuses.
@@ -362,7 +383,8 @@ end
 ```
 """
 function resolve_albedo_ice(profile, z::Real; default::Real,
-                            range::Tuple{Real,Real} = GEMB_ALBEDO_ICE_RANGE)
+                            range::Tuple{Real,Real} = GEMB_ALBEDO_ICE_RANGE,
+                            neighbors = ())
     lo, hi = Float64(range[1]), Float64(range[2])
     lo < hi || throw(ArgumentError(
         "range must be (low, high) with low < high, got $(range)"))
@@ -376,6 +398,14 @@ function resolve_albedo_ice(profile, z::Real; default::Real,
             value, source = profile.albedo[b], profile.sources[b]
         end
     end
+    if isnan(value)
+        for nb in neighbors
+            b = _bia_hyps_bin(nb, z)
+            (b != 0 && isfinite(nb.albedo[b])) || continue
+            value, source = nb.albedo[b], :neighbor
+            break
+        end
+    end
     isnan(value) && (value = Float64(default))
 
     clamped = clamp(value, lo, hi)
@@ -384,6 +414,50 @@ function resolve_albedo_ice(profile, z::Real; default::Real,
     # how much of the tile the observation actually set.
     clamped == value || (source = :clamped)
     return (clamped, source)
+end
+
+"""
+    bare_ice_albedo_profiles(parameter_dir) -> Vector{NamedTuple}
+
+Every stored tile profile in `parameter_dir` that holds at least one `:observed` bin, as
+`(; name, longitude, latitude, profile)` with the tile centre in degrees (longitude in −180–180).
+
+The pool [`nearest_bare_ice_albedo`](@ref) searches. A profile with no observed bin is left out: its
+values would themselves be fill.
+"""
+function bare_ice_albedo_profiles(parameter_dir::AbstractString)
+    out = NamedTuple{(:name, :longitude, :latitude, :profile),
+                     Tuple{String,Float64,Float64,BareIceAlbedoHyps}}[]
+    for name in sort!(filter(endswith(".nc"), readdir(parameter_dir)))
+        index = parse_tile_index(name)
+        index === nothing && continue
+        path = joinpath(parameter_dir, name)
+        entry = NCDatasets.NCDataset(path, "r") do ds
+            haskey(ds.dim, "bare_ice_albedo_bin") || return nothing
+            haskey(ds.attrib, "tile_size") || error(
+                "$(path) stores a bare-ice albedo profile but no tile_size attribute, so its centre " *
+                "cannot be placed")
+            f = _read_bare_ice_albedo(ds)
+            any(==(:observed), f.sources) || return nothing
+            half = Float64(ds.attrib["tile_size"]) / 2
+            (; name, longitude = index[1] + half, latitude = index[2] + half, profile = f)
+        end
+        entry === nothing || push!(out, entry)
+    end
+    return out
+end
+
+"""
+    nearest_bare_ice_albedo(profiles, longitude, latitude; exclude = "") -> Vector{BareIceAlbedoHyps}
+
+The profiles of [`bare_ice_albedo_profiles`](@ref), nearest tile centre first by great-circle
+distance from (`longitude`, `latitude`), leaving out the tile named `exclude`. Pass the result as
+`resolve_albedo_ice`'s `neighbors`.
+"""
+function nearest_bare_ice_albedo(profiles, longitude::Real, latitude::Real; exclude::AbstractString = "")
+    keep = [p for p in profiles if p.name != exclude]
+    d = [_haversine_km(latitude, longitude, p.latitude, p.longitude) for p in keep]
+    return [keep[i].profile for i in sortperm(d)]
 end
 
 """
@@ -496,7 +570,8 @@ end
 # decompresses a hemisphere-wide table, so per-cell costs three orders of magnitude more for the
 # same cells. Which cell a MODIS centre belongs to is then decided by `era5_land_cell_key`.
 function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
-                     boundary::Symbol, dem_fetch_concurrency::Integer, verbose::Bool)
+                     boundary::Symbol, dem_fetch_concurrency::Integer, verbose::Bool,
+                     min_glacier_fraction::Real)
     box = _bia_cells_box(cells, Float64(cell_size))
     poly = _bia_densified_box(box.xmin, box.xmax, box.ymin, box.ymax, Float64(cell_size))
     verbose && @info "Querying bare-ice albedo for $(label)" cells = nrow(cells) bounds =
@@ -506,7 +581,7 @@ function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
     # A selection with no glacierized MODIS cell at all is a real outcome, not an error: ERA5-Land's
     # glacier mask and the RGI 7.0 outlines do not agree everywhere.
     a = try
-        bare_ice_albedo(poly; boundary)
+        bare_ice_albedo(poly; boundary, min_glacier_fraction)
     catch err
         err isa ArgumentError && occursin("selects no MCD43A3 cell", err.msg) || rethrow()
         @warn "$(label) selects no MCD43A3 cell; every elevation bin is unresolved"
@@ -525,7 +600,8 @@ function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
         lon = parent(a[:longitude])
         lat = parent(a[:latitude])
         # Screened on black-sky albedo whatever `sky` the caller reduces: the two share every
-        # retrieval, so a cell unresolved in one is unresolved in the other.
+        # retrieval, so a cell unresolved in one is unresolved in the other. A cell below
+        # `min_glacier_fraction` arrives here as unresolved.
         alb = parent(a[:albedo_bsa])
         in_product = parent(a[:in_product])
         n_modis_total = length(lon)
@@ -546,7 +622,8 @@ function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
 
     albedo_bsa = isnothing(a) ? Float64[] : Float64.(parent(a[:albedo_bsa])[keep])
     albedo_wsa = isnothing(a) ? Float64[] : Float64.(parent(a[:albedo_wsa])[keep])
-    n_valid = isnothing(a) ? Int[] : Int.(parent(a[:n_valid_bsa])[keep])
+    n_valid_bsa = isnothing(a) ? Int[] : Int.(parent(a[:n_valid_bsa])[keep])
+    n_valid_wsa = isnothing(a) ? Int[] : Int.(parent(a[:n_valid_wsa])[keep])
     elevation = fill(NaN, length(keep))
     n_no_dem = 0
 
@@ -582,7 +659,14 @@ function _bia_sample(cells, dem; label::AbstractString, cell_size::Real,
               modis_outside_cells = n_outside_cells,
               modis_used = length(keep),
               modis_no_dem = n_no_dem)
-    return (; albedo = albedo_bsa, albedo_wsa, n_valid, elevation, points_of_cell, census)
+    return (; albedo_bsa, albedo_wsa, n_valid_bsa, n_valid_wsa, elevation, points_of_cell, census)
+end
+
+# The `_bia_sample` albedo and retrieval-count vectors for one sky.
+function _bia_sky(s, sky::Symbol)
+    sky === :bsa && return (s.albedo_bsa, s.n_valid_bsa)
+    sky === :wsa && return (s.albedo_wsa, s.n_valid_wsa)
+    throw(ArgumentError("sky must be :bsa (black-sky) or :wsa (white-sky), got :$(sky)"))
 end
 
 # Read one 1° DEM window and write the elevations of the points in `idx` into `elevation`.

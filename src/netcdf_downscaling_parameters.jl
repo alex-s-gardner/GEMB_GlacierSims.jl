@@ -547,6 +547,7 @@ function _write_bare_ice_albedo!(ds, f, deflatelevel)
     end
 
     ds.attrib["bare_ice_albedo_sky"] = String(f.sky)
+    ds.attrib["bare_ice_albedo_min_glacier_fraction"] = f.min_glacier_fraction
     ds.attrib["bare_ice_albedo_n_modis_cells_used"] = f.n_used
     ds.attrib["bare_ice_albedo_n_modis_cells_supplied"] = f.n_input
     ds.attrib["bare_ice_albedo_slope_per_km"] = f.fit.slope_per_km
@@ -891,6 +892,7 @@ function _read_bare_ice_albedo(ds)
                              Int.(collect(ds["bare_ice_albedo_n_valid"][:])),
                              sources, fit,
                              Symbol(att("bare_ice_albedo_sky", "bsa")),
+                             Float64(att("bare_ice_albedo_min_glacier_fraction", NaN)),
                              n_input, n_used, n_input - n_used, 0)
 end
 
