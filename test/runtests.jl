@@ -3241,6 +3241,102 @@ end
                 f, 2050; default = NaN)
         end
 
+        @testset "neighbor fill of stored bare-ice albedo profiles" begin
+            # Three tiles on one binning. N60_W150 observes 1000-1100 m only; N60_W148 next door
+            # observes 1000-1200 m; N46_E010 is far away and observes 1000-1300 m. Each tile file
+            # holds only what the fill reads: tile_size and the profile.
+            edges = 0:100:2000
+            prof(z, a) = bare_ice_albedo_hyps(fill(a, 5 * length(z)), repeat(z; inner = 5), edges)
+            dir = mktempdir()
+            for (name, z, a) in (("N60_W150.nc", [1050.0], 0.30),
+                                 ("N60_W148.nc", [1050.0, 1150.0], 0.40),
+                                 ("N46_E010.nc", [1050.0, 1150.0, 1250.0], 0.50))
+                GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, name), "c") do ds
+                    ds.attrib["tile_size"] = 2.0
+                    GEMB_GlacierSims._write_bare_ice_albedo!(ds, prof(z, a), 0;
+                                                            min_glacier_fraction = 0.95)
+                end
+            end
+            read_profile(name) = GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, name), "r") do ds
+                (GEMB_GlacierSims._read_bare_ice_albedo(ds), collect(ds["bare_ice_albedo_donor"][:]))
+            end
+            b(z) = searchsortedlast(collect(edges), z)
+
+            s1 = fill_bare_ice_albedo_neighbors(dir)
+            f, donors = read_profile("N60_W150.nc")
+            # Its own bin is kept; the next one comes from the nearest tile observing it, and the
+            # one after from the only tile that does, however far.
+            @test (f.albedo[b(1050)], f.sources[b(1050)]) == (0.30, :observed)
+            @test (f.albedo[b(1150)], f.sources[b(1150)], donors[b(1150)]) == (0.40, :neighbor, "N60_W148.nc")
+            @test (f.albedo[b(1250)], f.sources[b(1250)], donors[b(1250)]) == (0.50, :neighbor, "N46_E010.nc")
+            # No tile observes 1300 m or above, so those bins stay unresolved.
+            @test f.sources[b(1350)] === :none && isnan(f.albedo[b(1350)])
+            @test donors[b(1050)] == ""
+            # A bin the tile resolves itself is not replaced by a neighbor.
+            g, _ = read_profile("N46_E010.nc")
+            @test count(==(:neighbor), g.sources) == 0
+
+            # Idempotent: filled bins are recomputed from observed bins only, never re-donated.
+            fill_bare_ice_albedo_neighbors(dir)
+            f2, donors2 = read_profile("N60_W150.nc")
+            @test isequal(f2.albedo, f.albedo) && f2.sources == f.sources && donors2 == donors
+            @test only(s1[s1.name .== "N60_W150.nc", :n_bins_filled]) == 2
+
+            # A non-sparse tile whose profile could not be derived gets one, every bin filled.
+            GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, "N62_W150.nc"), "c") do ds
+                ds.attrib["tile_size"] = 2.0
+            end
+            fill_bare_ice_albedo_neighbors(dir)
+            h, hdonors = read_profile("N62_W150.nc")
+            @test (h.albedo[b(1050)], h.sources[b(1050)], hdonors[b(1050)]) == (0.30, :neighbor, "N60_W150.nc")
+            @test h.sky === :wsa && count(==(:observed), h.sources) == 0
+            @test bare_ice_albedo_is_current(joinpath(dir, "N62_W150.nc"))
+            # A sparse tile is left alone.
+            GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, "N70_W150.nc"), "c") do ds
+                ds.attrib["tile_size"] = 2.0
+                ds.attrib["sparse"] = "true"
+            end
+            fill_bare_ice_albedo_neighbors(dir)
+            @test GEMB_GlacierSims.NCDatasets.NCDataset(ds -> !haskey(ds.dim, "bare_ice_albedo_bin"),
+                                                         joinpath(dir, "N70_W150.nc"))
+
+            # The filled value is what a run resolves, tagged as a neighbor.
+            @test resolve_albedo_ice(f, 1150; default = 0.48) == (0.40, :neighbor)
+
+            @test bare_ice_albedo_is_current(joinpath(dir, "N60_W150.nc"))
+            @test !bare_ice_albedo_is_current(joinpath(dir, "N60_W150.nc"); sky = :bsa)
+            @test !bare_ice_albedo_is_current(joinpath(dir, "N60_W150.nc"); min_glacier_fraction = 0.5)
+        end
+
+        @testset "neighbor fill refuses profiles it cannot compare" begin
+            dir = mktempdir()
+            GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, "N60_W150.nc"), "c") do ds
+                ds.attrib["tile_size"] = 2.0
+                GEMB_GlacierSims._write_bare_ice_albedo!(ds,
+                    bare_ice_albedo_hyps(fill(0.3, 5), fill(1050.0, 5), 0:100:2000), 0;
+                    min_glacier_fraction = 0.95)
+            end
+            GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, "N60_W148.nc"), "c") do ds
+                ds.attrib["tile_size"] = 2.0
+                GEMB_GlacierSims._write_bare_ice_albedo!(ds,
+                    bare_ice_albedo_hyps(fill(0.3, 5), fill(1050.0, 5), 0:200:2000), 0;
+                    min_glacier_fraction = 0.95)
+            end
+            @test_throws "the neighbor fill needs every profile on one binning" fill_bare_ice_albedo_neighbors(dir)
+            GEMB_GlacierSims.NCDatasets.NCDataset(joinpath(dir, "N60_W148.nc"), "c") do ds
+                ds.attrib["tile_size"] = 2.0
+                GEMB_GlacierSims._write_bare_ice_albedo!(ds,
+                    bare_ice_albedo_hyps(fill(0.3, 5), fill(1050.0, 5), 0:100:2000; sky = :bsa), 0;
+                    min_glacier_fraction = 0.95)
+            end
+            @test_throws "re-derive every tile" fill_bare_ice_albedo_neighbors(dir)
+            @test_throws "holds an observed bare-ice albedo bin" fill_bare_ice_albedo_neighbors(mktempdir())
+        end
+
+        @testset "profiles default to white-sky" begin
+            @test bare_ice_albedo_hyps(fill(0.40, 5), fill(1050.0, 5), 0:100:3000).sky === :wsa
+        end
+
         @testset "a tile that owns nothing is a caller error" begin
             empty_tile = (; name = "N00_E000.nc", bounds = tile_bounds((0, 0)),
                           core = DataFrame(longitude = Float64[], latitude = Float64[]))
@@ -3275,7 +3371,7 @@ end
 
             @test with.provenance["downscaling_bare_ice_albedo_product"] ==
                   GEMB_GlacierSims.BARE_ICE_ALBEDO_PRODUCT
-            @test with.provenance["downscaling_bare_ice_albedo_sky"] == "bsa"
+            @test with.provenance["downscaling_bare_ice_albedo_sky"] == "wsa"
             @test with.provenance["downscaling_bare_ice_albedo_n_bins"] == length(profile.albedo)
             @test with.provenance["downscaling_bare_ice_albedo_n_modis_cells_used"] ==
                   profile.n_used

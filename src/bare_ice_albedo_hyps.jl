@@ -184,7 +184,7 @@ end
 # ---------------------------------------------------------------------------- construction
 
 """
-    bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000; sky = :bsa, min_cells = 3)
+    bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000; sky = :wsa, min_cells = 3)
         -> BareIceAlbedoHyps
 
 Reduce per-cell bare-ice albedo to a function of elevation.
@@ -203,9 +203,9 @@ elevation `z` in metres, and `f.(zs)` broadcasts.
   bins and area bins line up.
 
 # Keywords
-- `sky = :bsa`: `:bsa` (black-sky, directional-hemispherical) or `:wsa` (white-sky,
-  bihemispherical). Black-sky is the default because that is what a surface energy-balance model
-  wants.
+- `sky = :wsa`: `:wsa` (white-sky, bihemispherical) or `:bsa` (black-sky,
+  directional-hemispherical). White-sky is the default: GEMB applies one `albedo_ice` to diffuse and
+  direct shortwave alike, and over glaciers most melt-season shortwave arrives under cloud.
 - `min_cells = 3`: cells a bin needs before its own mean is used rather than the fit.
 - `extrapolate = 0`: what to do about bins outside the sampled elevation range.
   - `:hold` — freeze the linear fit at the edges of the sampled range: a bin below the lowest
@@ -272,7 +272,7 @@ bare_ice_albedo_table(f)                 # the whole profile, per bin
 See also [`bare_ice_albedo`](@ref) for the per-cell product this reduces.
 """
 function bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000;
-                              sky::Symbol = :bsa, min_cells::Integer = 3,
+                              sky::Symbol = :wsa, min_cells::Integer = 3,
                               extrapolate::Union{Real,Symbol} = 0,
                               n_valid::Union{Nothing,AbstractVector{<:Integer}} = nothing)
     sky in (:bsa, :wsa) || throw(ArgumentError(

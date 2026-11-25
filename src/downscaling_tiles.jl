@@ -501,6 +501,8 @@ function derive_downscaling_parameter_tiles(climate_model::Symbol, time_range,
             write_downscaling_tile_netcdf(path, tile, p; climate_model, time_range,
                                           tile_size, buffer, min_cells, area_minimum,
                                           elevation_intervals = intervals,
+                                          bare_ice_albedo_min_glacier_fraction =
+                                              BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION,
                                           precision, deflatelevel, institution, references)
 
             @info "Wrote tile" tile=i path cells_used=nrow(p.grid_cells) steps=length(p.time) k_fitted=p.provenance["n_decoupling_factor_fitted"]

@@ -9,7 +9,7 @@ const GH = GEMB_ClimateForcing
 # `Dim{:cell}` axis. Built here rather than by calling `bare_ice_albedo` so these tests need no
 # pooled table and no network.
 function _hyps_stack(albedo, n_valid = fill(100, length(albedo)),
-                     in_product = trues(length(albedo)); sky = :bsa)
+                     in_product = trues(length(albedo)); sky = :wsa)
     cell = Dim{:cell}(1:length(albedo))
     return DimStack(NamedTuple((
         Symbol("albedo_", sky) => DimArray(collect(albedo), (cell,)),
@@ -293,7 +293,7 @@ end
             _hyps_stack(a), z, [0.0, 500.0, 500.0, 1000.0])
         # A stack without the requested albedo layer names the layers it does have.
         cell = Dim{:cell}(1:length(z))
-        @test_throws "no :albedo_bsa layer in the albedo input" bare_ice_albedo_hyps(
+        @test_throws "no :albedo_wsa layer in the albedo input" bare_ice_albedo_hyps(
             DimStack((wrong = DimArray(a, (cell,)),)), z)
     end
 
@@ -302,7 +302,7 @@ end
         a = 0.65 .- 0.0002 .* (z .- 2000)
         f = bare_ice_albedo_hyps(_hyps_stack(a), z, 0:100:10000)
         s = sprint(show, MIME"text/plain"(), f)
-        @test occursin("sky = :bsa", s)
+        @test occursin("sky = :wsa", s)
         @test occursin("observed", s)
         @test occursin("per km", s)
         # The unresolved bins are reported, not hidden: most of a 0-10000 m binning is empty here.
