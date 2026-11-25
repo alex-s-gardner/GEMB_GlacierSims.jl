@@ -406,9 +406,6 @@ silently reverting to the climatology.
     `wind_scaling` must then be 1. The rule, the coefficients and the band slopes are recorded as
     `downscaling_wind_correction*` settings; a `:scaling` resolution records none of them, so it
     records exactly the settings of a resolution made before the option existed.
-- `albedo_ice_neighbors = ()`: other tiles' bare-ice albedo profiles, nearest first
-  ([`nearest_bare_ice_albedo`](@ref)). A band this tile's profile does not resolve takes its
-  `albedo_ice` from the first that does, before `albedo_ice_default` is used.
 - `glacier_correction = DEFAULT_GLACIER_CORRECTION` (`:additive`): the form of the donors' glacier
   correction, `:additive` or `:multiplicative`, as above. Recorded as
   `downscaling_glacier_correction` when donors are converted additively; a resolution that records
@@ -437,8 +434,7 @@ function resolve_downscaling(fit, intervals, run_time;
                              wind_correction = (; rule = :scaling),
                              glacier_correction::Symbol = DEFAULT_GLACIER_CORRECTION,
                              albedo_ice_default = _DEFAULT_ALBEDO_ICE,
-                             albedo_ice_range = GEMB_ALBEDO_ICE_RANGE,
-                             albedo_ice_neighbors = ())
+                             albedo_ice_range = GEMB_ALBEDO_ICE_RANGE)
     basis in (:climatology, :fitted) ||
         throw(ArgumentError("basis must be :climatology or :fitted, got :$basis"))
     glacier_correction in GLACIER_CORRECTIONS || throw(ArgumentError(
@@ -528,8 +524,7 @@ function resolve_downscaling(fit, intervals, run_time;
 
         albedo_ice, albedo_ice_source = resolve_albedo_ice(albedo_profile, interval.center;
                                                           default = albedo_ice_default,
-                                                          range = albedo_ice_range,
-                                                          neighbors = albedo_ice_neighbors)
+                                                          range = albedo_ice_range)
 
         (; interval.lo, interval.hi, interval.center,
          decoupling_factor = k.factor,
@@ -734,7 +729,6 @@ function _albedo_provenance(fit, profile)
     prov = Dict{String,Any}(
         "downscaling_bare_ice_albedo_product" => BARE_ICE_ALBEDO_PRODUCT,
         "downscaling_bare_ice_albedo_sky" => String(profile.sky),
-        "downscaling_bare_ice_albedo_min_glacier_fraction" => profile.min_glacier_fraction,
         "downscaling_bare_ice_albedo_n_bins" => length(profile.albedo),
         "downscaling_bare_ice_albedo_n_modis_cells_used" => profile.n_used,
         "downscaling_bare_ice_albedo_n_modis_cells_supplied" => profile.n_input,

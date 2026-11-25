@@ -39,6 +39,9 @@ const _TILE_PARAMETER_KEYS = ("climate_model", "tile_size", "tile_buffer", "min_
 #   1 — the two raw fits, their diagnostics, `fit_usable`, the cell tables, optional interval forcing.
 #   2 — adds `lapse_rate_stderr`, `lapse_rate_r2` and `lapse_rate_residual_sd`, the lapse fit's
 #       conditioning; and replaces the interval fill/clamp counts with per-source provenance counts.
+#
+# The bare-ice albedo profile is not covered by this version: it is rewritten in place by
+# `rederive_bare_ice_albedo_tiles`, which judges it by its own settings (`bare_ice_albedo_is_current`).
 const _TILE_SCHEMA_VERSION = 2
 
 """
@@ -78,6 +81,8 @@ because it is by far the bulk of the output.
   are always Float64 regardless — they are evaluated against elevations up to ~9 km and then divided
   by a thresholded quantity, so truncating them changes `k` far from the reference elevation.
 - `deflatelevel = 4`: zlib level. The fit series are `NaN`-dominated and compress heavily.
+- `bare_ice_albedo_min_glacier_fraction`: the glacier-fraction screen of `p.bare_ice_albedo`'s MODIS
+  cells, recorded beside the profile. Required when `p` carries a profile.
 - `min_cells`, `area_minimum`: recorded as run parameters, so a re-run with different ones re-derives
   rather than reading a file that means something else.
 
@@ -95,6 +100,7 @@ function write_downscaling_tile_netcdf(path::AbstractString, tile, p;
                                        area_minimum::Real = 0.0,
                                        precision::Type = Float32,
                                        deflatelevel::Int = 4,
+                                       bare_ice_albedo_min_glacier_fraction = nothing,
                                        institution = nothing,
                                        references = nothing)
     mkpath(dirname(path))
@@ -117,7 +123,13 @@ function write_downscaling_tile_netcdf(path::AbstractString, tile, p;
         # On its own dimension rather than `elevation_interval`, which exists only when the interval
         # forcing was retained — the albedo profile is ~1.5 kB and must be there either way.
         albedo = hasproperty(p, :bare_ice_albedo) ? p.bare_ice_albedo : nothing
-        albedo === nothing || _write_bare_ice_albedo!(ds, albedo, deflatelevel)
+        if albedo !== nothing
+            bare_ice_albedo_min_glacier_fraction === nothing && throw(ArgumentError(
+                "p carries a bare-ice albedo profile; pass the glacier-fraction screen it was " *
+                "derived under as bare_ice_albedo_min_glacier_fraction"))
+            _write_bare_ice_albedo!(ds, albedo, deflatelevel;
+                                    min_glacier_fraction = bare_ice_albedo_min_glacier_fraction)
+        end
         _write_tile_globals!(ds, tile, p; climate_model, time_range, tile_size, buffer,
                              min_cells, area_minimum,
                              n_intervals = elevation_intervals === nothing ? nothing :
@@ -492,8 +504,8 @@ end
 # Codes for the per-bin provenance of the stored albedo profile. Written as small integers so the
 # variable is a fixed width; `_BARE_ICE_ALBEDO_BIN_SOURCES` is the decoder, and it is the profile's
 # own vocabulary (`BareIceAlbedoHyps.sources`), not the resolved one — `:clamped` and `:default` are
-# decided at the point of use, not here.
-const _BARE_ICE_ALBEDO_BIN_SOURCES = (:observed, :hold, :fit, :none)
+# decided at the point of use, not here. New codes go at the end, so stored codes keep their meaning.
+const _BARE_ICE_ALBEDO_BIN_SOURCES = (:observed, :hold, :fit, :none, :neighbor)
 _bare_ice_albedo_source_code(s::Symbol) =
     Int8(something(findfirst(==(s), _BARE_ICE_ALBEDO_BIN_SOURCES), 0))
 
@@ -503,10 +515,26 @@ _bare_ice_albedo_source_code(s::Symbol) =
 # dimension is written only when the interval forcing was retained, and storing the profile lets a
 # consumer re-resolve it onto a different binning without refetching MODIS. `resolve_albedo_ice` is
 # what turns a bin into the `albedo_ice` a run uses.
-function _write_bare_ice_albedo!(ds, f, deflatelevel)
+#
+# Also rewrites a profile already in `ds` (opened in append mode), provided the bin count matches.
+# `donors` names, per bin, the tile a `:neighbor` bin was filled from (empty elsewhere), and
+# `min_glacier_fraction` is the screen the MODIS cells passed: with `f.sky` these are the settings
+# `bare_ice_albedo_is_current` compares.
+function _write_bare_ice_albedo!(ds, f, deflatelevel; min_glacier_fraction::Real,
+                                 donors::AbstractVector{<:AbstractString} = fill("", length(f.albedo)))
     n = length(f.albedo)
-    NCDatasets.defDim(ds, "bare_ice_albedo_bin", n)
+    length(donors) == n || throw(ArgumentError(
+        "got $(length(donors)) donor names for a profile of $(n) bins"))
+    if haskey(ds.dim, "bare_ice_albedo_bin")
+        ds.dim["bare_ice_albedo_bin"] == n || error(
+            "the stored bare-ice albedo profile has $(ds.dim["bare_ice_albedo_bin"]) bins and the " *
+            "new one $(n); a profile can only be rewritten on the same binning")
+    else
+        NCDatasets.defDim(ds, "bare_ice_albedo_bin", n)
+    end
     deflate = deflatelevel > 0 ? deflatelevel : nothing
+    var!(name, T; kw...) = haskey(ds, name) ? ds[name] :
+                           NCDatasets.defVar(ds, name, T, ("bare_ice_albedo_bin",); kw...)
     lo = f.edges[1:n]
     hi = f.edges[2:n + 1]
 
@@ -522,15 +550,14 @@ function _write_bare_ice_albedo!(ds, f, deflatelevel)
          "that were in it. NaN in an empty bin."),
         ("bare_ice_albedo_lower", lo, "m", "elevation bin lower edge", ""),
         ("bare_ice_albedo_upper", hi, "m", "elevation bin upper edge", ""))
-        v = NCDatasets.defVar(ds, name, Float64, ("bare_ice_albedo_bin",);
-                              deflatelevel = deflate)
+        v = var!(name, Float64; deflatelevel = deflate)
         v.attrib["units"] = units
         v.attrib["long_name"] = long_name
         isempty(comment) || (v.attrib["comment"] = comment)
         v[:] = collect(Float64, values)
     end
 
-    src = NCDatasets.defVar(ds, "bare_ice_albedo_source", Int8, ("bare_ice_albedo_bin",))
+    src = var!("bare_ice_albedo_source", Int8)
     src.attrib["units"] = "1"
     src.attrib["long_name"] = "where this bin's albedo came from"
     src.attrib["flag_values"] = Int8[1:length(_BARE_ICE_ALBEDO_BIN_SOURCES);]
@@ -540,14 +567,19 @@ function _write_bare_ice_albedo!(ds, f, deflatelevel)
     for (name, values, long_name) in (
         ("bare_ice_albedo_n_cells", f.n_cells, "MODIS 463 m cells in this bin"),
         ("bare_ice_albedo_n_valid", f.n_valid, "MCD43A3 retrievals behind those cells"))
-        v = NCDatasets.defVar(ds, name, Int32, ("bare_ice_albedo_bin",); deflatelevel = deflate)
+        v = var!(name, Int32; deflatelevel = deflate)
         v.attrib["units"] = "1"
         v.attrib["long_name"] = long_name
         v[:] = Int32.(collect(values))
     end
 
+    donor = var!("bare_ice_albedo_donor", String)
+    donor.attrib["long_name"] = "tile a neighbor-filled bin took its albedo from"
+    donor.attrib["comment"] = "Empty for every bin whose source is not neighbor."
+    donor[:] = collect(String, donors)
+
     ds.attrib["bare_ice_albedo_sky"] = String(f.sky)
-    ds.attrib["bare_ice_albedo_min_glacier_fraction"] = f.min_glacier_fraction
+    ds.attrib["bare_ice_albedo_min_glacier_fraction"] = Float64(min_glacier_fraction)
     ds.attrib["bare_ice_albedo_n_modis_cells_used"] = f.n_used
     ds.attrib["bare_ice_albedo_n_modis_cells_supplied"] = f.n_input
     ds.attrib["bare_ice_albedo_slope_per_km"] = f.fit.slope_per_km
@@ -892,7 +924,6 @@ function _read_bare_ice_albedo(ds)
                              Int.(collect(ds["bare_ice_albedo_n_valid"][:])),
                              sources, fit,
                              Symbol(att("bare_ice_albedo_sky", "bsa")),
-                             Float64(att("bare_ice_albedo_min_glacier_fraction", NaN)),
                              n_input, n_used, n_input - n_used, 0)
 end
 

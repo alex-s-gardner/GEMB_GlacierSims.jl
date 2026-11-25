@@ -81,7 +81,6 @@ include("bare_ice_albedo_cells.jl")
 export era5_land_cell_polygon, era5_land_cell_key, bare_ice_albedo_tile
 export derive_bare_ice_albedo, resolve_albedo_ice, copernicus_dem_archive
 export BARE_ICE_ALBEDO_SOURCES, GEMB_ALBEDO_ICE_RANGE, BARE_ICE_ALBEDO_MIN_GLACIER_FRACTION
-export bare_ice_albedo_profiles, nearest_bare_ice_albedo
 export bare_ice_albedo_source_code, bare_ice_albedo_source_name
 export bare_ice_albedo, bare_ice_albedo_points, bare_ice_albedo_hyps, BareIceAlbedoHyps
 export AlbedoElevationFit, bare_ice_albedo_source, bare_ice_albedo_table
@@ -127,6 +126,10 @@ export read_downscaling_tile, read_downscaling_tile_status
 
 include("downscaling_tiles.jl")
 export downscaling_tiles, tile_index, tile_bounds, derive_downscaling_parameter_tiles
+
+# Re-derive and neighbor-fill the bare-ice albedo profiles of a directory of tile files.
+include("bare_ice_albedo_tiles.jl")
+export rederive_bare_ice_albedo_tiles, fill_bare_ice_albedo_neighbors, bare_ice_albedo_is_current
 
 # Per-region background snow impurity loading. Before the tile run, which applies it.
 include("background_black_carbon.jl")

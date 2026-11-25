@@ -50,8 +50,6 @@ Fields, all indexed by bin (`bin i` spans `[edges[i], edges[i+1])`):
 - `sources`: `:observed`, `:hold`, `:fit` or `:none`, per bin.
 - `fit`: the [`AlbedoElevationFit`](@ref) over the individual cells.
 - `sky`: `:bsa` or `:wsa`, which albedo this was built from.
-- `min_glacier_fraction`: the least glacier fraction a MODIS cell needed to be included, applied
-  before the cells reached this reduction; `NaN` when not recorded.
 - `n_input`, `n_used`, `n_no_albedo`, `n_no_elevation`: cells supplied, cells that survived, and
   the two reasons for dropping one.
 
@@ -67,7 +65,6 @@ struct BareIceAlbedoHyps
     sources::Vector{Symbol}
     fit::AlbedoElevationFit
     sky::Symbol
-    min_glacier_fraction::Float64
     n_input::Int
     n_used::Int
     n_no_albedo::Int
@@ -222,8 +219,6 @@ elevation `z` in metres, and `f.(zs)` broadcasts.
   linear and unbounded: extending it kilometres past the highest observed cell returns albedos
   outside 0–1, and a negative best estimate is worse than none. Raise it to reach a little past
   the observed span; `fit.elevation_range` is what it is measured from.
-- `min_glacier_fraction = NaN`: the glacier-fraction screen the caller applied to the cells before
-  passing them, recorded on the result; it does not screen anything here.
 - `n_valid = nothing`: retrieval counts per cell, overriding whatever `a` carries. A stack
   supplies its own `:n_valid_*`; pass this when `a` is a plain albedo vector, or the reported
   per-bin counts are zero and there is no way to tell a bin resting on three retrievals from one
@@ -279,7 +274,6 @@ See also [`bare_ice_albedo`](@ref) for the per-cell product this reduces.
 function bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000;
                               sky::Symbol = :wsa, min_cells::Integer = 3,
                               extrapolate::Union{Real,Symbol} = 0,
-                              min_glacier_fraction::Real = NaN,
                               n_valid::Union{Nothing,AbstractVector{<:Integer}} = nothing)
     sky in (:bsa, :wsa) || throw(ArgumentError(
         "sky must be :bsa (black-sky) or :wsa (white-sky), got :$(sky)"))
@@ -384,7 +378,7 @@ function bare_ice_albedo_hyps(a, elevation, bins = 0:100:10000;
     end
 
     return BareIceAlbedoHyps(edges, best, observed, n_cells, sum_valid, sources, fit, sky,
-                             Float64(min_glacier_fraction), n_input, length(fit_z), n_no_albedo, n_no_elevation)
+                             n_input, length(fit_z), n_no_albedo, n_no_elevation)
 end
 
 # ------------------------------------------------------------------------------ evaluation
