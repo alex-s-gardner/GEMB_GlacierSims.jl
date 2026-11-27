@@ -82,6 +82,24 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
                      date = DateTime(2020, 1, 1), accumulation = 400.0, depth = 8.0), forcing, mp)
     end
 
+    @testset "an observed albedo reaches the run and darkens the column" begin
+        forcing = _firn_site_forcing()
+        mp = initialize_parameters(output_frequency = :monthly)
+        site = FirnSite(; record_id = "observed", latitude = 60.0, longitude = -150.0,
+                        elevation = 2000.0, date = DateTime(2009, 6, 15), accumulation = 400.0, depth = 8.0)
+        kw = (; spinup_window = (DateTime(2000), DateTime(2003) - Hour(3)), simulation_years_maximum = 30)
+        n = length(lookup(forcing, Ti))
+        free = firn_site_run(site, forcing, mp; kw...)
+        dark = firn_site_run(site, forcing, mp; kw..., albedo_observed = fill(0.5, n))
+        none = firn_site_run(site, forcing, mp; kw..., albedo_observed = fill(NaN, n))
+        # No observation is the free run; a dark observation absorbs more sunlight and warms the column.
+        @test none.profile.temperature == free.profile.temperature
+        @test sum(dark.profile.temperature) > sum(free.profile.temperature)
+        @test_throws "albedo_observed has 3 values" firn_site_run(site, forcing, mp; kw..., albedo_observed = fill(0.5, 3))
+        @test_throws "albedo_observed values must be in (0, 1)" firn_site_run(site, forcing, mp; kw...,
+                                                                              albedo_observed = fill(1.5, n))
+    end
+
     @testset "a site run without accumulation matching keeps the forcing's snowfall" begin
         forcing = _firn_site_forcing()
         mp = initialize_parameters(output_frequency = :monthly)

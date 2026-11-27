@@ -154,6 +154,9 @@ the factor applied (1 without matching); `snowfall` is the run's mean annual sno
 `site.accumulation` when matched; `spinup` holds the spinup provenance (`cycles`,
 `converged`).
 
+With `albedo_observed`, a broadband albedo per forcing step (NaN where none; GEMB assimilates it, see
+`GEMB.assimilate_albedo!`), the observation enters the spin-up climatology and the run.
+
 With `station_correction`, a group of [`era5land_station_correction`](@ref), the downward longwave of
 the ERA5-Land forcing at the site is corrected toward on-ice weather stations, and with `wind_correction`, a wind
 group of it ([`era5land_wind_correction_group`](@ref)), its wind speed; the result's `station_correction` and
@@ -173,7 +176,8 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
                        drift_window::Int = SPINUP_DRIFT_WINDOW,
                        depth_minimum::Real = firn_site_depth_minimum(site),
                        station_correction::Union{Nothing,Symbol} = nothing,
-                       wind_correction::Union{Nothing,Symbol} = nothing)
+                       wind_correction::Union{Nothing,Symbol} = nothing,
+                       albedo_observed::Union{Nothing,AbstractVector{<:Real}} = nothing)
     forcing_is_complete(forcing) || throw(ForcingUnavailable(
         "forcing for site $(site.record_id) is incomplete (all-NaN or no reference elevation)"))
     times = lookup(forcing, Ti)
@@ -191,11 +195,23 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     if station_correction !== nothing || wind_correction !== nothing
         downscaled = era5land_station_correction(downscaled, station_correction; wind_group = wind_correction)
     end
+    if albedo_observed !== nothing
+        length(albedo_observed) == length(times) || throw(ArgumentError(
+            "albedo_observed has $(length(albedo_observed)) values for $(length(times)) forcing steps"))
+        all(a -> isnan(a) || 0 < a < 1, albedo_observed) || throw(ArgumentError(
+            "albedo_observed values must be in (0, 1), or NaN where there is no observation"))
+    end
     # The profile is read at the last monthly output at or before the drilling date, so the record
     # runs one month past it, and the accumulation is matched over that same span.
     lapsed = downscaled[Ti(first(times) .. min(last(times), site.date + Month(1)))]
     scaling = match_accumulation ? site_snowfall_scaling(lapsed, site.accumulation, mp) : 1.0
     adjusted = _with_impurity_metadata(precipitation_adjust(lapsed, scaling), mp)
+    # Attached after the forcing adjustments: NaN marks a step without an observation, which their
+    # finite-value validation would refuse.
+    if albedo_observed !== nothing
+        keep = findall(t -> first(lookup(adjusted, Ti)) <= t <= last(lookup(adjusted, Ti)), times)
+        adjusted = _with_layer(adjusted, :albedo_observed, Float64.(albedo_observed[keep]))
+    end
 
     window = something(spinup_window, _default_spinup_window(adjusted))
     cf_spinup = _spinup_climatology(initialize_forcing(adjusted), window, mp)
@@ -243,4 +259,10 @@ function firn_profile_on_grid(profile, depths)
         k = searchsortedfirst(bottom, d)
         k > length(bottom) ? NaN : profile.density[k]
     end
+end
+
+# `stack` with layer `name` added (or replaced), on the stack's own time axis and with its metadata.
+function _with_layer(stack::DimStack, name::Symbol, values::AbstractVector)
+    layer = DimArray(values, dims(stack, Ti))
+    return DimStack(merge(NamedTuple(stack), NamedTuple{(name,)}((layer,))); metadata = DimensionalData.metadata(stack))
 end
