@@ -98,6 +98,13 @@ _firn_site_forcing() = _tiny_band_forcing(; years = 10, temperature = 258.15, pr
         @test_throws "albedo_observed has 3 values" firn_site_run(site, forcing, mp; kw..., albedo_observed = fill(0.5, 3))
         @test_throws "albedo_observed values must be in (0, 1)" firn_site_run(site, forcing, mp; kw...,
                                                                               albedo_observed = fill(1.5, n))
+        # A white-sky observation also reaches the run; a step may not carry both kinds.
+        dark_ws = firn_site_run(site, forcing, mp; kw..., albedo_observed_white_sky = fill(0.5, n))
+        @test sum(dark_ws.profile.temperature) > sum(free.profile.temperature)
+        @test_throws "albedo_observed_white_sky has 3 values" firn_site_run(site, forcing, mp; kw...,
+                                                                             albedo_observed_white_sky = fill(0.5, 3))
+        @test_throws "a step may carry albedo_observed or albedo_observed_white_sky, not both" firn_site_run(
+            site, forcing, mp; kw..., albedo_observed = fill(0.5, n), albedo_observed_white_sky = fill(0.5, n))
     end
 
     @testset "a site run without accumulation matching keeps the forcing's snowfall" begin
