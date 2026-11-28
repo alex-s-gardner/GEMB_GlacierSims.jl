@@ -154,8 +154,10 @@ the factor applied (1 without matching); `snowfall` is the run's mean annual sno
 `site.accumulation` when matched; `spinup` holds the spinup provenance (`cycles`,
 `converged`).
 
-With `albedo_observed`, a broadband albedo per forcing step (NaN where none; GEMB assimilates it, see
-`GEMB.assimilate_albedo!`), the observation enters the spin-up climatology and the run.
+With `albedo_observed`, a broadband albedo per forcing step measured under the step's sky (NaN where none;
+GEMB assimilates it, see `GEMB.assimilate_albedo!`), and with `albedo_observed_white_sky`, a satellite white-sky
+albedo per step, which GEMB matches to the snow's clear-sky albedo, the observations enter the spin-up
+climatology and the run. A step may carry only one of the two.
 
 With `station_correction`, a group of [`era5land_station_correction`](@ref), the downward longwave of
 the ERA5-Land forcing at the site is corrected toward on-ice weather stations, and with `wind_correction`, a wind
@@ -177,7 +179,8 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
                        depth_minimum::Real = firn_site_depth_minimum(site),
                        station_correction::Union{Nothing,Symbol} = nothing,
                        wind_correction::Union{Nothing,Symbol} = nothing,
-                       albedo_observed::Union{Nothing,AbstractVector{<:Real}} = nothing)
+                       albedo_observed::Union{Nothing,AbstractVector{<:Real}} = nothing,
+                       albedo_observed_white_sky::Union{Nothing,AbstractVector{<:Real}} = nothing)
     forcing_is_complete(forcing) || throw(ForcingUnavailable(
         "forcing for site $(site.record_id) is incomplete (all-NaN or no reference elevation)"))
     times = lookup(forcing, Ti)
@@ -195,12 +198,16 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     if station_correction !== nothing || wind_correction !== nothing
         downscaled = era5land_station_correction(downscaled, station_correction; wind_group = wind_correction)
     end
-    if albedo_observed !== nothing
-        length(albedo_observed) == length(times) || throw(ArgumentError(
-            "albedo_observed has $(length(albedo_observed)) values for $(length(times)) forcing steps"))
-        all(a -> isnan(a) || 0 < a < 1, albedo_observed) || throw(ArgumentError(
-            "albedo_observed values must be in (0, 1), or NaN where there is no observation"))
+    for (name, obs) in ((:albedo_observed, albedo_observed), (:albedo_observed_white_sky, albedo_observed_white_sky))
+        obs === nothing && continue
+        length(obs) == length(times) || throw(ArgumentError(
+            "$(name) has $(length(obs)) values for $(length(times)) forcing steps"))
+        all(a -> isnan(a) || 0 < a < 1, obs) || throw(ArgumentError(
+            "$(name) values must be in (0, 1), or NaN where there is no observation"))
     end
+    albedo_observed === nothing || albedo_observed_white_sky === nothing ||
+        !any(isfinite(a) && isfinite(w) for (a, w) in zip(albedo_observed, albedo_observed_white_sky)) ||
+        throw(ArgumentError("a step may carry albedo_observed or albedo_observed_white_sky, not both"))
     # The profile is read at the last monthly output at or before the drilling date, so the record
     # runs one month past it, and the accumulation is matched over that same span.
     lapsed = downscaled[Ti(first(times) .. min(last(times), site.date + Month(1)))]
@@ -208,9 +215,9 @@ function firn_site_run(site::FirnSite, forcing, mp::ModelParameters;
     adjusted = _with_impurity_metadata(precipitation_adjust(lapsed, scaling), mp)
     # Attached after the forcing adjustments: NaN marks a step without an observation, which their
     # finite-value validation would refuse.
-    if albedo_observed !== nothing
-        keep = findall(t -> first(lookup(adjusted, Ti)) <= t <= last(lookup(adjusted, Ti)), times)
-        adjusted = _with_layer(adjusted, :albedo_observed, Float64.(albedo_observed[keep]))
+    keep = findall(t -> first(lookup(adjusted, Ti)) <= t <= last(lookup(adjusted, Ti)), times)
+    for (name, obs) in ((:albedo_observed, albedo_observed), (:albedo_observed_white_sky, albedo_observed_white_sky))
+        obs === nothing || (adjusted = _with_layer(adjusted, name, Float64.(obs[keep])))
     end
 
     window = something(spinup_window, _default_spinup_window(adjusted))
